@@ -8,8 +8,9 @@
 .env
 .env.local
 
-# claude worktrees
+# claude worktrees and per-machine settings
 .claude/worktrees/
+.claude/settings.local.json
 
 # rust
 target/

@@ -8,4 +8,5 @@ Legend: ✓ shipped · ⋯ in progress
 
 ### M0 — Local dashboard
 
-- ⋯ ratatui app skeleton: header / sessions placeholder / footer, `q` and Ctrl-C to quit
+- ✓ ratatui app skeleton: header / sessions list / footer, `q` and Ctrl-C to quit
+- ✓ local session discovery: scans `~/.claude/projects/`, reads `cwd` from transcript, uses file mtime as last-activity, renders a sortable list with arrow / `j`/`k` navigation

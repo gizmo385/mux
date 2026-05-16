@@ -8,8 +8,7 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M0 — Local dashboard
 
-- implement Session struct and in-memory SessionCatalog with subscribe/publish for state changes `#m0 #core`
-- implement Claude Code project discovery: scan `~/.claude/projects/` and surface recent transcripts as Sessions `#m0 #discovery`
+- add subscribe/publish to SessionCatalog so the transcript watcher can push updates `#m0 #core`
 - implement local Transcript Watcher: tail JSONL with `notify`, parse entries, emit attention events `#m0 #attention`
 - decide initial attention heuristic ("last entry is assistant + N seconds of stillness → needs-input"); make N configurable later `#m0 #attention`
 - define AttachmentDriver trait; implement TmuxDriver (attach into a tmux window, spawn terminal in cwd) `#m0 #attachment`

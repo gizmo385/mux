@@ -15,7 +15,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### M1 — Session creation + worktree management
 
 - M1 do-not-reproduce checklist (from user, 2026-05-16): (a) switching between worktree-backed sessions must not approach claude-squad's 10+ second cost — design every M1 code path with the "switching never blocks on I/O" discipline in mind; (b) M1 worktree creation must not bake in local-only assumptions that would later need to be unwound for remote session creation (post-M4). `#m1 #design`
-- minimal Config loader: read `~/.config/agent-mux/config.toml` at startup, expose `workspace_folders: Vec<PathBuf>`, expand `~` and env vars, tolerate missing file (empty list). Schema kept tiny — full M4 surface (themes / keybinds / reload-on-edit) stays deferred. `#m1 #config`
 - Repo Registry: scan each workspace folder one level deep at boot, identify children that contain `.git/` (treating both directories and gitfile pointers as valid), cache in-memory `Vec<Repo>` keyed by absolute path. Expose synchronous read for the new-session picker; expose a refresh entrypoint that re-scans when called. `#m1 #repo`
 - new-session UI flow in dashboard: keybind (`n`?) opens a modal with three stages — pick a repo from the Registry, name a task, confirm/override the base branch (pre-filled via `worktree::resolve_default_base_branch`). Submit dispatches `WorktreeManager::create` + `AttachmentDriver::spawn_session` on a background task (the UI thread must not block on `git worktree add`); modal shows a "creating worktree…" state while in flight. Errors surface in the dashboard status line. New session is *not* eagerly registered in the catalog — the transcript watcher picks it up naturally. `#m1 #ui`
 - add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (post-M4 discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#m1 #worktree`
@@ -38,8 +37,9 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 - design TOML schema for themes (named colours → ratatui Style) `#m4 #config`
 - design TOML schema for keybinds (action name → key combo) `#m4 #config`
-- implement config load at startup with sane defaults if absent `#m4 #config`
+- extend Config (M1 minimal already shipped) with the full M4 surface; sane defaults if absent `#m4 #config`
 - reload-on-edit (watch config file, re-apply) `#m4 #config`
+- env-var expansion in `workspace_folders` (e.g. `$HOME/work`, `$WORK_DIR/repos`). M1 ships tilde expansion only; env vars deferred. `#m4 #config`
 
 ### Cross-cutting / deferred decisions
 

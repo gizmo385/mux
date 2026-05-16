@@ -15,6 +15,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use agent_mux::attachment::{AttachmentDriver, TmuxDriver};
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::discovery::{claude_projects_dir, discover_local};
 use agent_mux::session::{Attention, Host, Session};
@@ -58,6 +59,8 @@ struct App {
     home: Option<PathBuf>,
     _watcher: TranscriptWatcher,
     updates: Receiver<AttentionUpdate>,
+    driver: TmuxDriver,
+    status: Option<String>,
 }
 
 impl App {
@@ -87,6 +90,8 @@ impl App {
             home: dirs::home_dir(),
             _watcher: watcher,
             updates,
+            driver: TmuxDriver::new(),
+            status: None,
         })
     }
 
@@ -94,6 +99,39 @@ impl App {
         while let Ok(update) = self.updates.try_recv() {
             self.catalog.update_attention(&update.id, update.attention);
         }
+    }
+
+    fn attach_selected(&mut self) {
+        let result = {
+            let Some(idx) = self.list_state.selected() else {
+                return;
+            };
+            let Some(session) = self.catalog.sessions().get(idx) else {
+                return;
+            };
+            self.driver.attach(session)
+        };
+        self.status = match result {
+            Ok(()) => None,
+            Err(e) => Some(format!("attach: {e}")),
+        };
+    }
+
+    fn spawn_terminal_selected(&mut self) {
+        let result = {
+            let Some(idx) = self.list_state.selected() else {
+                return;
+            };
+            let Some(session) = self.catalog.sessions().get(idx) else {
+                return;
+            };
+            let cwd = session.project_dir.clone();
+            (self.driver.spawn_terminal(session), cwd)
+        };
+        self.status = match result {
+            (Ok(()), cwd) => Some(format!("opened terminal in {}", cwd.display())),
+            (Err(e), _) => Some(format!("terminal: {e}")),
+        };
     }
 
     fn next(&mut self) {
@@ -129,6 +167,8 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 Some(Action::Quit) => return Ok(()),
                 Some(Action::Next) => app.next(),
                 Some(Action::Prev) => app.prev(),
+                Some(Action::Attach) => app.attach_selected(),
+                Some(Action::SpawnTerminal) => app.spawn_terminal_selected(),
                 None => {}
             }
         }
@@ -139,6 +179,8 @@ enum Action {
     Quit,
     Next,
     Prev,
+    Attach,
+    SpawnTerminal,
 }
 
 fn action_for(key: KeyEvent) -> Option<Action> {
@@ -150,6 +192,8 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Next),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Prev),
+        KeyCode::Enter => Some(Action::Attach),
+        KeyCode::Char('t') => Some(Action::SpawnTerminal),
         _ => None,
     }
 }
@@ -181,10 +225,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, layout[1], &mut app.list_state);
 
-    let footer_text = if app.catalog.is_empty() {
-        " no sessions discovered · q: quit "
-    } else {
-        " ↑/↓ or j/k: move · q: quit "
+    let footer_text = match (&app.status, app.catalog.is_empty()) {
+        (Some(s), _) => format!(" {s} "),
+        (None, true) => " no sessions discovered · q: quit ".to_string(),
+        (None, false) => " ↑/↓ or j/k: move · ⏎: attach · t: terminal · q: quit ".to_string(),
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,

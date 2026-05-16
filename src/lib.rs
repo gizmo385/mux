@@ -1,3 +1,4 @@
+pub mod attachment;
 pub mod catalog;
 pub mod discovery;
 pub mod session;

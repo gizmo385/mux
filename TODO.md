@@ -9,10 +9,8 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### M0 — Local dashboard
 
 - tune attention heuristic after dogfooding (current rules: assistant → needs-input, user/tool result → working, mtime > 1h → idle); make thresholds configurable in M4 `#m0 #attention`
-- define AttachmentDriver trait; implement TmuxDriver (attach into a tmux window, spawn terminal in cwd) `#m0 #attachment`
-- wire Dashboard render: list view with project, host, attention state, time-since-last-event `#m0 #ui`
-- wire Dashboard input: arrow keys, Enter to attach, `t` to spawn terminal, `q` to quit `#m0 #ui`
 - dogfood M0 for a week; record friction notes for M1 / M2 scoping `#m0 #dogfood`
+- add "resume" action for sessions with no matching tmux pane (spawn new tmux window running `claude --resume <session-id>`) `#post-m0 #attachment` — surfaced by M0 attach failing with NotFound
 
 ### M1 — Session creation + worktree management
 

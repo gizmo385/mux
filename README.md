@@ -4,7 +4,12 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-M0 in progress. The dashboard runs (`cargo run`), discovers local Claude Code sessions from `~/.claude/projects/`, navigates with arrows / `j`/`k`, and shows live attention state (needs-input ●, working ◐, idle ○) driven by a `notify`-based transcript watcher. Next: tmux attach + spawn-terminal.
+M0 complete (dogfooding phase). The dashboard runs (`cargo run` from inside tmux), discovers local Claude Code sessions, shows live attention state (● needs-input, ◐ working, ○ idle), and:
+
+- `↑`/`↓` or `j`/`k` — navigate the list
+- `Enter` — switch into the tmux pane running the selected session
+- `t` — open a new tmux window in the session's working directory
+- `q` / Ctrl-C — quit
 
 ## Setup
 

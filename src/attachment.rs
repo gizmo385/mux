@@ -59,6 +59,18 @@ pub trait AttachmentDriver {
     /// (No error when running outside tmux — that path drops into `$SHELL`
     /// without consulting tmux at all.)
     fn spawn_terminal(&self, session: &Session) -> Result<AttachOutcome, AttachError>;
+
+    /// Launch a fresh `claude` process in a new tmux window at `cwd`, and
+    /// switch focus to it. Used by the new-session flow after the
+    /// `WorktreeManager` has created the worktree.
+    ///
+    /// The resulting Claude Code session will surface in the dashboard
+    /// shortly after via the existing transcript-discovery pipeline — this
+    /// method does not return a `SessionId`.
+    ///
+    /// # Errors
+    /// Returns `AttachError::TmuxCommandFailed` if tmux returns non-zero.
+    fn spawn_session(&self, cwd: &Path) -> Result<AttachOutcome, AttachError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -79,11 +91,16 @@ impl AttachmentDriver for TmuxDriver {
         // No live pane (either tmux says NotFound, or there's no tmux server
         // at all and list-panes failed). Resume the transcript in a fresh
         // claude process, in the session's recorded cwd.
-        Self::resume_transcript(session)
+        let cmd = format!("claude --resume {}", session.id.0);
+        Self::launch_in_new_window(&session.project_dir, &cmd)
     }
 
     fn spawn_terminal(&self, session: &Session) -> Result<AttachOutcome, AttachError> {
         Self::spawn_terminal_impl(session)
+    }
+
+    fn spawn_session(&self, cwd: &Path) -> Result<AttachOutcome, AttachError> {
+        Self::launch_in_new_window(cwd, "claude")
     }
 }
 
@@ -101,18 +118,19 @@ impl TmuxDriver {
         }
     }
 
-    fn resume_transcript(session: &Session) -> Result<AttachOutcome, AttachError> {
-        let cwd = session.project_dir.to_string_lossy().into_owned();
-        let resume_cmd = format!("claude --resume {}", session.id.0);
+    /// Launch `command` in a fresh tmux window at `cwd`. Inside tmux this is
+    /// `tmux new-window -c <cwd> <command>` (which tmux focuses
+    /// automatically); outside tmux it's `tmux new-session -c <cwd>
+    /// <command>`, which both creates the server and attaches the client.
+    fn launch_in_new_window(cwd: &Path, command: &str) -> Result<AttachOutcome, AttachError> {
+        let cwd_str = cwd.to_string_lossy().into_owned();
         if in_tmux() {
-            run_tmux(&["new-window", "-c", &cwd, &resume_cmd])?;
+            run_tmux(&["new-window", "-c", &cwd_str, command])?;
             Ok(AttachOutcome::Done)
         } else {
-            Ok(AttachOutcome::SuspendAndRun(SuspendCommand {
-                program: "tmux".to_string(),
-                args: vec!["new-session".to_string(), "-c".to_string(), cwd, resume_cmd],
-                cwd: None,
-            }))
+            Ok(AttachOutcome::SuspendAndRun(build_new_session_command(
+                &cwd_str, command,
+            )))
         }
     }
 
@@ -137,6 +155,19 @@ impl TmuxDriver {
                 cwd: Some(session.project_dir.clone()),
             }))
         }
+    }
+}
+
+fn build_new_session_command(cwd: &str, command: &str) -> SuspendCommand {
+    SuspendCommand {
+        program: "tmux".to_string(),
+        args: vec![
+            "new-session".to_string(),
+            "-c".to_string(),
+            cwd.to_string(),
+            command.to_string(),
+        ],
+        cwd: None,
     }
 }
 
@@ -230,5 +261,35 @@ mod tests {
              b:1.0 /home/u/proj\n";
         let got = parse_pane_match(out, Path::new("/home/u/proj"));
         assert_eq!(got, Some("a:0.0".to_string()));
+    }
+
+    #[test]
+    fn build_new_session_command_for_spawn_session() {
+        let got = build_new_session_command("/work/agent-mux-fix-bug", "claude");
+        assert_eq!(got.program, "tmux");
+        assert_eq!(
+            got.args,
+            vec![
+                "new-session".to_string(),
+                "-c".to_string(),
+                "/work/agent-mux-fix-bug".to_string(),
+                "claude".to_string(),
+            ]
+        );
+        assert!(got.cwd.is_none());
+    }
+
+    #[test]
+    fn build_new_session_command_for_resume() {
+        let got = build_new_session_command("/work/proj", "claude --resume abc-123");
+        assert_eq!(
+            got.args,
+            vec![
+                "new-session".to_string(),
+                "-c".to_string(),
+                "/work/proj".to_string(),
+                "claude --resume abc-123".to_string(),
+            ]
+        );
     }
 }

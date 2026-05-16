@@ -15,7 +15,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### M1 — Session creation + worktree management
 
 - M1 do-not-reproduce checklist (from user, 2026-05-16): (a) switching between worktree-backed sessions must not approach claude-squad's 10+ second cost — design every M1 code path with the "switching never blocks on I/O" discipline in mind; (b) M1 worktree creation must not bake in local-only assumptions that would later need to be unwound for remote session creation (post-M4). `#m1 #design`
-- extend AttachmentDriver trait with `spawn_session(cwd) -> SessionId`; wire TmuxDriver to launch `claude` in the new worktree's tmux window `#m1 #attachment`
 - new-session UI flow in dashboard: keybind (`n`?) opens a small modal/prompt, captures task name + (pre-filled) base branch via `worktree::resolve_default_base_branch`, dispatches to `WorktreeManager::create` + AttachmentDriver, registers the new session in the catalog `#m1 #ui`
 - add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (post-M4 discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#m1 #worktree`
 - add a positive-path test for `worktree::resolve_default_base_branch` that exercises the `origin/HEAD` resolver (requires a bare-remote fixture in the test). Current coverage only hits the `main`/`master` fallback and the empty-result negative case. `#m1 #test`

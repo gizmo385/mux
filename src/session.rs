@@ -26,4 +26,9 @@ pub struct Session {
     pub transcript_path: PathBuf,
     pub last_activity: SystemTime,
     pub attention: Attention,
+    /// Human-readable label. Resolved in `discovery` from (in precedence)
+    /// `.agent-mux/task.toml` → transcript `ai-title` entries → `None`.
+    /// `None` means "no signal beyond the cwd" and the UI falls back to cwd
+    /// alone.
+    pub title: Option<String>,
 }

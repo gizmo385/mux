@@ -432,16 +432,21 @@ fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {
     let host = host_label(session.host);
     let project = display_path(&session.project_dir, home);
     let age = humanize_elapsed(session.last_activity);
+    let dim = Style::new().add_modifier(Modifier::DIM);
 
-    Line::from(vec![
-        Span::raw(glyph),
-        Span::raw(" "),
-        Span::raw(project),
-        Span::raw("  "),
-        Span::styled(host, Style::new().add_modifier(Modifier::DIM)),
-        Span::raw("  "),
-        Span::styled(age, Style::new().add_modifier(Modifier::DIM)),
-    ])
+    let mut spans = vec![Span::raw(glyph), Span::raw(" ")];
+    if let Some(title) = &session.title {
+        spans.push(Span::raw(title.clone()));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(project, dim));
+    } else {
+        spans.push(Span::raw(project));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(host, dim));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(age, dim));
+    Line::from(spans)
 }
 
 fn effective_attention(session: &Session) -> Attention {

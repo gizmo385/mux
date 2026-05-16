@@ -4,12 +4,23 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-M0 complete (dogfooding phase). The dashboard runs (`cargo run`), discovers local Claude Code sessions, shows live attention state (● needs-input, ◐ working, ○ idle), and:
+M1 complete (dogfooding phase). The dashboard runs (`cargo run`), discovers local Claude Code sessions, labels each one with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to cwd), shows live attention state (● needs-input, ◐ working, ○ idle), and:
 
 - `↑`/`↓` or `j`/`k` — navigate the list
 - `Enter` — switch into the tmux pane running the selected session; if there is no live pane, resume the conversation in a fresh `claude --resume` in the session's recorded cwd
 - `t` — open a new tmux window in the session's cwd (or, outside tmux, drop into `$SHELL` in the cwd)
+- `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created alongside the parent repo and `claude` is launched in it.
 - `q` / Ctrl-C — quit
+
+## Configuration
+
+Optional `~/.config/agent-mux/config.toml`:
+
+```toml
+workspace_folders = ["~/workspace", "~/code"]
+```
+
+The `n` keybind picks from repos found in these folders (depth-1 scan; tilde expansion only — env vars not yet supported).
 
 ## Setup
 

@@ -6,4 +6,4 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ## Backlog
 
-<!-- Phase 7 of contractify will add the first real entry here. Add others as ideas surface. -->
+- flesh out `agent-mux-review` Layer 2 categories as project-specific rules emerge in `ARCHITECTURE.md` `#review #setup`

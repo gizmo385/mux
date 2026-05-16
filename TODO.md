@@ -8,7 +8,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M0 — Local dashboard
 
-- scaffold ratatui app skeleton with crossterm backend, event loop, and a single static placeholder view `#m0 #ui`
 - implement Session struct and in-memory SessionCatalog with subscribe/publish for state changes `#m0 #core`
 - implement Claude Code project discovery: scan `~/.claude/projects/` and surface recent transcripts as Sessions `#m0 #discovery`
 - implement local Transcript Watcher: tail JSONL with `notify`, parse entries, emit attention events `#m0 #attention`

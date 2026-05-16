@@ -6,4 +6,6 @@ Legend: ✓ shipped · ⋯ in progress
 
 ## Milestone — initial work
 
-<!-- Add feature entries as they ship or move to in-progress. -->
+### M0 — Local dashboard
+
+- ⋯ ratatui app skeleton: header / sessions placeholder / footer, `q` and Ctrl-C to quit

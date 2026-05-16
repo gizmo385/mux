@@ -4,7 +4,7 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-<!-- One sentence on what works today and what's next. -->
+M0 in progress — the dashboard skeleton runs (`cargo run` opens it, `q` quits). No session discovery yet.
 
 ## Setup
 

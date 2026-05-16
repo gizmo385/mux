@@ -11,7 +11,7 @@ Greenfield. The product shape is decided (Shape A — tmux-aware dashboard, evol
 - **Language.** Rust, edition 2024.
 - **Package manager.** cargo.
 - **TUI framework.** `ratatui` with the `crossterm` backend. The de facto choice; no serious alternative in Rust.
-- **Async runtime.** `tokio`. One runtime for the whole process; no blocking shell-outs that hold up the UI thread.
+- **Concurrency.** A simple event loop drives the UI on the main thread. Background work (transcript watching, SSH, tmux commands) communicates back via channels. `tokio` is the planned async runtime once concurrent I/O is in play; the M0 skeleton starts synchronous and adopts it when the first concurrent subsystem lands.
 - **Filesystem watching.** `notify` (debounced) for local transcript files.
 - **SSH.** Shell out to the system `ssh` binary with `ControlMaster` for connection reuse, rather than a Rust-native SSH client. Rationale: the user's `~/.ssh/config` aliases, agent forwarding, keys, jump hosts, and per-host quirks come for free. The cost — parsing CLI output — is small compared to re-implementing all of that.
 - **Process control.** Shell out to `tmux` likewise; tmux's CLI is stable, scriptable, and the right interface.
@@ -64,7 +64,7 @@ Architectural rules. Each one stated as a constraint with a reason. These are th
 - **Sessions are host-agnostic on the API surface.** A `Session` carries a `Host` field, but operations on it (read transcript, attach, spawn terminal) go through the Host Abstraction. No `if session.host == Local` branches outside that module. Reason: keeps remote and local in lockstep; a feature that works for one works for both by construction.
 - **Transcript content is the source of truth for attention.** Attention state is *derived* by the Transcript Watcher from transcript events; nothing else writes attention state into the catalog. Reason: state derived from a single source can't drift. State written from multiple sources will.
 - **One filesystem watcher process.** A single `notify` runtime watches all local transcript files. No per-session threads or ad-hoc filesystem polling outside the Transcript Watcher. Reason: avoid resource bloat as the session count grows, and keep file-event ordering centralized for debugging.
-- **One async runtime.** A single `tokio` runtime for the whole process. No nested runtimes, no `block_on` inside spawned tasks, no synchronous shell-outs from the UI thread. Reason: predictable scheduling; debuggability.
+- **One event loop, no nested complexity.** A single event loop on the main thread drives the UI. Background subsystems live on their own threads or tokio tasks (when tokio is introduced) and talk to the UI via channels. No nested runtimes, no `block_on` inside spawned tasks, no synchronous shell-outs from the UI thread. Reason: predictable scheduling; debuggability.
 - **No unsafe.** Enforced at compile time by `unsafe_code = "forbid"` in `Cargo.toml`. There is no scenario in this project where `unsafe` is justified.
 - **Errors travel up; the UI decides.** Lower layers return `Result<T, E>` with informative error types. The Dashboard decides how to surface a failure (status bar, modal, log). Panicking is reserved for genuine invariant violations.
 - **Tests live where the behaviour does.** Component logic gets unit tests in-tree. Cross-component behaviour goes in `tests/` as integration tests. UI smoke tests use ratatui's test backend so they run headless in CI.

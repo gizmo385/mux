@@ -1,0 +1,16 @@
+[package]
+name = "agent-mux"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, terminal-first multiplexer for managing multiple Claude Code conversations across local and remote hosts."
+license = "MIT"
+authors = ["gizmo385"]
+
+[dependencies]
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"

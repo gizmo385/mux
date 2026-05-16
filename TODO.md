@@ -10,18 +10,15 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 - tune attention heuristic after dogfooding (current rules: assistant → needs-input, user/tool result → working, mtime > 1h → idle); make thresholds configurable in M4 `#m0 #attention`
 - dogfood M0 for a week; record friction notes for M1 / M2 scoping `#m0 #dogfood`
+- add a switch-latency smoke test (or criterion benchmark) that fails if a focus-change round trip exceeds a budget (target: ≤ 50ms against an in-memory catalog populated with N sessions). Reason: claude-squad's 10+ second switching is the empirical failure mode we exist to avoid; make regressions visible in CI rather than catching them only in dogfooding. `#m0 #perf`
 
 ### M1 — Session creation + worktree management
 
-- ask user what specifically didn't work in claude-squad; turn answers into a "do-not-reproduce" checklist for M1 design `#m1 #design`
-- decide worktree directory layout (alongside-repo vs in-repo `.agent-mux/worktrees/` vs global `~/.local/state/agent-mux/worktrees/`) `#m1 #design`
-- decide worktree fate on session close (keep / prompt / auto-clean if unmodified / auto-clean always) `#m1 #design`
-- decide task metadata format (plain text file vs TOML with structured fields) `#m1 #design`
-- decide base-branch resolution policy (default `main` / current branch / always prompt) `#m1 #design`
-- implement WorktreeManager: `create(repo, base_branch, task) -> PathBuf`, `list()`, `remove(path)` via `git worktree` shell-out `#m1 #worktree`
+- M1 do-not-reproduce checklist (from user, 2026-05-16): (a) switching between worktree-backed sessions must not approach claude-squad's 10+ second cost — design every M1 code path with the "switching never blocks on I/O" discipline in mind; (b) M1 worktree creation must not bake in local-only assumptions that would later need to be unwound for remote session creation (post-M4). `#m1 #design`
 - extend AttachmentDriver trait with `spawn_session(cwd) -> SessionId`; wire TmuxDriver to launch `claude` in the new worktree's tmux window `#m1 #attachment`
-- new-session UI flow in dashboard: keybind opens a small modal/prompt, captures task name + base branch, dispatches to WorktreeManager + AttachmentDriver, registers the new session in the catalog `#m1 #ui`
-- persist task metadata in the new worktree (format TBD per above) `#m1 #worktree`
+- new-session UI flow in dashboard: keybind (`n`?) opens a small modal/prompt, captures task name + (pre-filled) base branch via `worktree::resolve_default_base_branch`, dispatches to `WorktreeManager::create` + AttachmentDriver, registers the new session in the catalog `#m1 #ui`
+- add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (post-M4 discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#m1 #worktree`
+- add a positive-path test for `worktree::resolve_default_base_branch` that exercises the `origin/HEAD` resolver (requires a bare-remote fixture in the test). Current coverage only hits the `main`/`master` fallback and the empty-result negative case. `#m1 #test`
 
 ### M2 — Remote hosts
 

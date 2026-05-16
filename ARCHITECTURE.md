@@ -72,6 +72,7 @@ Architectural rules. Each one stated as a constraint with a reason. These are th
 - **Errors travel up; the UI decides.** Lower layers return `Result<T, E>` with informative error types. The Dashboard decides how to surface a failure (status bar, modal, log). Panicking is reserved for genuine invariant violations.
 - **Tests live where the behaviour does.** Component logic gets unit tests in-tree. Cross-component behaviour goes in `tests/` as integration tests. UI smoke tests use ratatui's test backend so they run headless in CI.
 - **Worktrees are created via `git worktree`, never by directory copy.** Reason: worktrees share the `.git/` database; copies are silently divergent. The Worktree Manager is the only module that runs `git` commands; all other components receive a `PathBuf` and don't think about the worktree mechanism.
+- **Session switching never blocks on I/O.** Switching focus to a session is a UI state change against in-memory data — no filesystem reads, no network calls, no process spawns, no tmux queries for state we should have cached. All such work happens asynchronously in background subsystems (the Transcript Watcher, the Host Abstraction) and lands in the catalog before the user asks for it. Reason: switching latency is the project's load-bearing differentiator from claude-squad; a switch-time I/O bug is a regression, not a minor issue.
 
 ## Open questions
 

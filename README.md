@@ -8,7 +8,7 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## How to run
 
-Run `make install` to set up dependencies, then `make dev` to start the dev environment. Run `make` (no target) for the full list of commands.
+`cargo run` to start the binary. `cargo build --release` for an optimised build. `cargo test` for the test suite. See `PROCESS.md` for the canonical-commands list.
 
 ## Documents
 

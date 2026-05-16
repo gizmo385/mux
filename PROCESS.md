@@ -9,9 +9,15 @@ Companion to `SPEC.md` and `ARCHITECTURE.md`. Captures development discipline. T
 
 ## Canonical commands
 
-A `Makefile` at the repository root names the common workflows: `install`, `dev`, `build`, the umbrella `check`, the unit and end-to-end test suites. The principle is that every routine workflow has a single named entrypoint that is stable across language and tooling churn — contributors and agents do not memorise the current package manager's invocation, they call `make test`. The underlying tool may change; the names do not.
+The Rust toolchain provides the canonical commands directly via `cargo`. The principle of "every routine workflow has a single named entrypoint" still applies; for a Rust-only project the entrypoints are `cargo` subcommands rather than a Makefile gateway.
 
-Run `make` (no target) for the list.
+- `cargo build` / `cargo build --release` — compile.
+- `cargo run` — run the binary.
+- `cargo test` — unit + integration tests.
+- `cargo fmt` — auto-format. `cargo fmt --all -- --check` verifies without writing.
+- `cargo clippy --all-targets --all-features -- -D warnings` — lint with warnings as errors.
+
+The composite "check" gate (format-check + lint + tests) is enforced by the pre-commit hook and CI. Any other composite operations live as small scripts under `scripts/`.
 
 ## Living documents
 

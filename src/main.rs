@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime};
 
@@ -15,7 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use agent_mux::attachment::{AttachmentDriver, TmuxDriver};
+use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::discovery::{claude_projects_dir, discover_local};
 use agent_mux::session::{Attention, Host, Session};
@@ -39,18 +40,47 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn setup_terminal() -> io::Result<Tui> {
+fn enter_screen() -> io::Result<()> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    Ok(())
+}
+
+fn leave_screen() -> io::Result<()> {
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    Ok(())
+}
+
+fn setup_terminal() -> io::Result<Tui> {
+    enter_screen()?;
+    Terminal::new(CrosstermBackend::new(io::stdout()))
 }
 
 fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    leave_screen()?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Release the alt-screen and raw mode so a foreground subprocess can use
+/// the terminal, run it, then re-enter and force a redraw. Used when the
+/// attachment driver hands a command off (e.g. `tmux attach` from outside
+/// tmux, or `$SHELL` for an outside-tmux spawn-terminal).
+fn suspend_and_run(terminal: &mut Tui, cmd: &SuspendCommand) -> io::Result<Option<String>> {
+    leave_screen()?;
+    let mut process = Command::new(&cmd.program);
+    process.args(&cmd.args);
+    if let Some(cwd) = &cmd.cwd {
+        process.current_dir(cwd);
+    }
+    let status = process.status();
+    enter_screen()?;
+    terminal.clear()?;
+    match status {
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(format!("{}: {e}", cmd.program))),
+    }
 }
 
 struct App {
@@ -101,37 +131,49 @@ impl App {
         }
     }
 
-    fn attach_selected(&mut self) {
+    fn attach_selected(&mut self) -> Option<SuspendCommand> {
         let result = {
-            let Some(idx) = self.list_state.selected() else {
-                return;
-            };
-            let Some(session) = self.catalog.sessions().get(idx) else {
-                return;
-            };
+            let idx = self.list_state.selected()?;
+            let session = self.catalog.sessions().get(idx)?;
             self.driver.attach(session)
         };
-        self.status = match result {
-            Ok(()) => None,
-            Err(e) => Some(format!("attach: {e}")),
-        };
+        match result {
+            Ok(AttachOutcome::Done) => {
+                self.status = None;
+                None
+            }
+            Ok(AttachOutcome::SuspendAndRun(cmd)) => {
+                self.status = None;
+                Some(cmd)
+            }
+            Err(e) => {
+                self.status = Some(format!("attach: {e}"));
+                None
+            }
+        }
     }
 
-    fn spawn_terminal_selected(&mut self) {
+    fn spawn_terminal_selected(&mut self) -> Option<SuspendCommand> {
         let result = {
-            let Some(idx) = self.list_state.selected() else {
-                return;
-            };
-            let Some(session) = self.catalog.sessions().get(idx) else {
-                return;
-            };
+            let idx = self.list_state.selected()?;
+            let session = self.catalog.sessions().get(idx)?;
             let cwd = session.project_dir.clone();
             (self.driver.spawn_terminal(session), cwd)
         };
-        self.status = match result {
-            (Ok(()), cwd) => Some(format!("opened terminal in {}", cwd.display())),
-            (Err(e), _) => Some(format!("terminal: {e}")),
-        };
+        match result {
+            (Ok(AttachOutcome::Done), cwd) => {
+                self.status = Some(format!("opened terminal in {}", cwd.display()));
+                None
+            }
+            (Ok(AttachOutcome::SuspendAndRun(cmd)), _) => {
+                self.status = None;
+                Some(cmd)
+            }
+            (Err(e), _) => {
+                self.status = Some(format!("terminal: {e}"));
+                None
+            }
+        }
     }
 
     fn next(&mut self) {
@@ -163,13 +205,24 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         let has_event = event::poll(TICK)?;
         app.drain_updates();
         if has_event && let Event::Key(key) = event::read()? {
-            match action_for(key) {
+            let pending = match action_for(key) {
                 Some(Action::Quit) => return Ok(()),
-                Some(Action::Next) => app.next(),
-                Some(Action::Prev) => app.prev(),
+                Some(Action::Next) => {
+                    app.next();
+                    None
+                }
+                Some(Action::Prev) => {
+                    app.prev();
+                    None
+                }
                 Some(Action::Attach) => app.attach_selected(),
                 Some(Action::SpawnTerminal) => app.spawn_terminal_selected(),
-                None => {}
+                None => None,
+            };
+            if let Some(cmd) = pending
+                && let Some(err) = suspend_and_run(terminal, &cmd)?
+            {
+                app.status = Some(err);
             }
         }
     }

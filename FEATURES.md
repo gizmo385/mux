@@ -12,3 +12,4 @@ Legend: ✓ shipped · ⋯ in progress
 - ✓ local session discovery: scans `~/.claude/projects/`, reads `cwd` from transcript, uses file mtime as last-activity, renders a sortable list with arrow / `j`/`k` navigation
 - ✓ live attention state: `notify`-driven transcript watcher derives state from JSONL tail (assistant → needs-input, user/tool result → working), with a 1h idle threshold applied in the UI layer
 - ✓ tmux attach: `Enter` switches to the tmux pane whose cwd matches the selected session; `t` opens a new tmux window in that cwd; failures surface in a dashboard status line
+- ✓ outside-tmux fallback: when run outside tmux, `Enter` suspends the TUI to run `tmux attach -t <target>` as a foreground subprocess; `t` drops into `$SHELL` in the cwd. TUI resumes when the subprocess exits.

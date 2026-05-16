@@ -1,7 +1,7 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -21,9 +21,10 @@ use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
 use agent_mux::discovery::{claude_projects_dir, discover_local};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
-use agent_mux::repo::RepoRegistry;
+use agent_mux::repo::{Repo, RepoRegistry};
 use agent_mux::session::{Attention, Host, Session};
 use agent_mux::watcher::{AttentionUpdate, TranscriptWatcher};
+use agent_mux::worktree::WorktreeManager;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -96,6 +97,22 @@ struct App {
     status: Option<String>,
     registry: RepoRegistry,
     modal: Option<NewSessionModal>,
+    create_tx: Sender<NewSessionResult>,
+    create_rx: Receiver<NewSessionResult>,
+    creating: Option<CreatingSession>,
+}
+
+/// Lives in `App.creating` while a worktree-create is in flight, so the
+/// footer can show "creating worktree for X in Y…".
+struct CreatingSession {
+    repo_name: String,
+    task: String,
+}
+
+/// Result from the background create thread. Drained on every tick.
+enum NewSessionResult {
+    Created(PathBuf),
+    Failed(String),
 }
 
 impl App {
@@ -121,6 +138,7 @@ impl App {
 
         let config = Config::load().unwrap_or_default();
         let registry = RepoRegistry::from_config(&config);
+        let (create_tx, create_rx) = channel();
 
         Ok(Self {
             catalog,
@@ -132,6 +150,9 @@ impl App {
             status: None,
             registry,
             modal: None,
+            create_tx,
+            create_rx,
+            creating: None,
         })
     }
 
@@ -158,16 +179,59 @@ impl App {
                 repo,
                 task,
                 base_branch,
-            } => {
-                // Stub for this slice. The next slice wires this submit to
-                // WorktreeManager::create + AttachmentDriver::spawn_session
-                // on a background task.
-                self.status = Some(format!(
-                    "would create: repo={} task={task:?} branch={base_branch}",
-                    repo.name
-                ));
+            } => self.start_creating(repo, task, base_branch),
+        }
+    }
+
+    /// Dispatch a worktree creation on a background thread. The "switching
+    /// never blocks on I/O" discipline applies to *any* user action, not
+    /// just session-switching — `git worktree add` can take seconds on a
+    /// large repo, and that must not stall the dashboard.
+    fn start_creating(&mut self, repo: Repo, task: String, base_branch: String) {
+        self.creating = Some(CreatingSession {
+            repo_name: repo.name.clone(),
+            task: task.clone(),
+        });
+        self.status = None;
+        let tx = self.create_tx.clone();
+        std::thread::spawn(move || {
+            let outcome = match WorktreeManager.create(&repo.path, &base_branch, &task) {
+                Ok(path) => NewSessionResult::Created(path),
+                Err(e) => NewSessionResult::Failed(format!("create worktree: {e}")),
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Drain any finished creates. Returns a `SuspendCommand` if a successful
+    /// create's `spawn_session` needs to hand the terminal off (outside-tmux
+    /// case). Stops at the first such command — the remaining results stay
+    /// queued for the next tick, since the caller can only suspend once.
+    fn drain_creates(&mut self) -> Option<SuspendCommand> {
+        while let Ok(result) = self.create_rx.try_recv() {
+            self.creating = None;
+            match result {
+                NewSessionResult::Created(path) => match self.driver.spawn_session(&path) {
+                    Ok(AttachOutcome::Done) => {
+                        self.status = Some(format!("started new session in {}", path.display()));
+                    }
+                    Ok(AttachOutcome::SuspendAndRun(cmd)) => {
+                        self.status = None;
+                        return Some(cmd);
+                    }
+                    Err(e) => {
+                        self.status = Some(format!(
+                            "worktree created at {} but spawn failed: {e}",
+                            path.display()
+                        ));
+                    }
+                },
+                NewSessionResult::Failed(msg) => {
+                    self.status = Some(msg);
+                }
             }
         }
+        None
     }
 
     fn drain_updates(&mut self) {
@@ -249,6 +313,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         terminal.draw(|frame| draw(frame, app))?;
         let has_event = event::poll(TICK)?;
         app.drain_updates();
+        if let Some(cmd) = app.drain_creates()
+            && let Some(err) = suspend_and_run(terminal, &cmd)?
+        {
+            app.status = Some(err);
+        }
         if has_event && let Event::Key(key) = event::read()? {
             // Ctrl-C quits unconditionally, even when the modal is open.
             // Everything else routes to the modal when one is up.
@@ -336,11 +405,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, layout[1], &mut app.list_state);
 
-    let footer_text = match (&app.status, app.catalog.is_empty()) {
-        (Some(s), _) => format!(" {s} "),
-        (None, true) => " no sessions discovered · n: new · q: quit ".to_string(),
-        (None, false) => {
-            " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit ".to_string()
+    let footer_text = if let Some(c) = &app.creating {
+        format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name)
+    } else {
+        match (&app.status, app.catalog.is_empty()) {
+            (Some(s), _) => format!(" {s} "),
+            (None, true) => " no sessions discovered · n: new · q: quit ".to_string(),
+            (None, false) => {
+                " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit ".to_string()
+            }
         }
     };
     let footer = Paragraph::new(Line::from(Span::styled(

@@ -13,7 +13,9 @@ The target user is a single developer who already lives in the terminal, already
 ## Glossary
 
 - **Session** — one ongoing Claude Code conversation. Each session has an id, a project (working directory), a host, an optional task description, and an on-disk transcript.
-- **Project** — the working directory Claude Code runs in for a session. Usually a git repository root or a worktree.
+- **Project** — the working directory Claude Code runs in for a session. For sessions agent-mux created (M1+) this is a worktree of a known Repo. For sessions started externally, it can be any directory.
+- **Repo** — a git repository discovered by scanning workspace folders. The unit of organisation for agent-mux-created sessions: every such session lives in a worktree of exactly one Repo. Sessions whose `project_dir` does not match any known Repo are still rendered, just without a repo label.
+- **Workspace folder** — a directory the user has designated as containing one or more git repos. agent-mux scans these to populate the Repo Registry. Configured in `~/.config/agent-mux/config.toml` (`workspace_folders = [...]`).
 - **Worktree** — a git worktree dedicated to one session. From M1 onward, agent-mux creates and manages worktrees for sessions it spawns; sessions started externally may use any working directory.
 - **Task** — the human-readable description of what a session is for ("refactor the parser"). Optional, persisted alongside the worktree for sessions agent-mux created.
 - **Host** — where a session physically runs. Either `local` or a user-configured SSH target (an entry in `~/.ssh/config` or an explicit `user@host`).
@@ -28,7 +30,8 @@ What agent-mux does, in user-observable terms.
 
 - **Dashboard view.** Lists all known sessions with project, host, attention state, and time since last activity. Sessions needing input are visually prominent.
 - **Session discovery.** On startup, scans Claude Code's transcript directory for existing sessions and populates the dashboard. The user does not have to register sessions manually.
-- **Spawn a new session (M1).** From the dashboard, the user names a task and picks a base branch; agent-mux creates a git worktree, starts `claude` inside it in a new tmux window, and registers the resulting session. The user is in the new session immediately.
+- **Repo discovery (M1).** At startup, agent-mux scans each configured workspace folder one level deep for git repositories and caches the result in the Repo Registry. The new-session picker reads from this cache rather than re-scanning on every keystroke.
+- **Spawn a new session (M1).** From the dashboard, the user picks a repo from the registry, names a task, and picks a base branch; agent-mux creates a git worktree, starts `claude` inside it in a new tmux window, and registers the resulting session. The user is in the new session immediately. Dashboard *grouping* by repo is a planned post-M1 polish item; for M1, sessions appear in a flat list as before, simply augmented with a repo label where one applies.
 - **Attach.** Pressing Enter on a session takes the user into that session's tmux window — they are now in the real Claude Code TUI and can type, paste, use slash commands, anything Claude Code supports. Detaching from tmux returns them to the dashboard.
 - **Spawn terminal in session cwd.** A keybind opens a new tmux window in the session's working directory, so the user can run shell commands alongside Claude Code without leaving agent-mux's mental model.
 - **Remote sessions (M2).** Sessions on configured SSH hosts appear in the same dashboard. Attaching SSH-tunnels into the remote tmux. Attention state for remote sessions is detected the same way as local — by watching the remote transcript file — over the existing SSH connection.
@@ -52,8 +55,8 @@ Out of scope for M0: session *creation* from inside agent-mux (user starts Claud
 
 **M1 — Session creation + worktree management.**
 Goal: spawn new Claude Code sessions from inside agent-mux, each in its own git worktree. This is the capability that turns the dashboard from a *catalog* into an *orchestrator* and is the defining differentiator from M0's purely-passive dashboard.
-Scope: new-session flow (task name, base branch, worktree location); Worktree Manager that creates and registers worktrees via `git worktree`; task metadata persisted in the worktree; tmux integration for launching `claude` inside the new worktree; lifecycle handling when a session is closed (worktree fate — to be decided in design).
-Out of scope for M1: diff viewing, merge/discard workflow, remote session creation.
+Scope: minimal workspace-folders config (`~/.config/agent-mux/config.toml` with `workspace_folders = [...]`); Repo Registry that scans those folders at startup and caches the result in memory; new-session flow (pick repo → task name → base branch); Worktree Manager that creates and registers worktrees via `git worktree`; task metadata persisted in the worktree; tmux integration for launching `claude` inside the new worktree; lifecycle handling when a session is closed (worktree fate — to be decided in design).
+Out of scope for M1: diff viewing, merge/discard workflow, remote session creation, dashboard grouping by repo, the broader M4 config surface (themes, keybinds, reload-on-edit).
 
 **M2 — Remote hosts.**
 Goal: same dashboard experience for sessions on SSH targets. (Spawning new sessions on remote hosts is post-M2.)

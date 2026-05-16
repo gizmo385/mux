@@ -15,7 +15,9 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### M1 — Session creation + worktree management
 
 - M1 do-not-reproduce checklist (from user, 2026-05-16): (a) switching between worktree-backed sessions must not approach claude-squad's 10+ second cost — design every M1 code path with the "switching never blocks on I/O" discipline in mind; (b) M1 worktree creation must not bake in local-only assumptions that would later need to be unwound for remote session creation (post-M4). `#m1 #design`
-- new-session UI flow in dashboard: keybind (`n`?) opens a small modal/prompt, captures task name + (pre-filled) base branch via `worktree::resolve_default_base_branch`, dispatches to `WorktreeManager::create` + AttachmentDriver, registers the new session in the catalog `#m1 #ui`
+- minimal Config loader: read `~/.config/agent-mux/config.toml` at startup, expose `workspace_folders: Vec<PathBuf>`, expand `~` and env vars, tolerate missing file (empty list). Schema kept tiny — full M4 surface (themes / keybinds / reload-on-edit) stays deferred. `#m1 #config`
+- Repo Registry: scan each workspace folder one level deep at boot, identify children that contain `.git/` (treating both directories and gitfile pointers as valid), cache in-memory `Vec<Repo>` keyed by absolute path. Expose synchronous read for the new-session picker; expose a refresh entrypoint that re-scans when called. `#m1 #repo`
+- new-session UI flow in dashboard: keybind (`n`?) opens a modal with three stages — pick a repo from the Registry, name a task, confirm/override the base branch (pre-filled via `worktree::resolve_default_base_branch`). Submit dispatches `WorktreeManager::create` + `AttachmentDriver::spawn_session` on a background task (the UI thread must not block on `git worktree add`); modal shows a "creating worktree…" state while in flight. Errors surface in the dashboard status line. New session is *not* eagerly registered in the catalog — the transcript watcher picks it up naturally. `#m1 #ui`
 - add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (post-M4 discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#m1 #worktree`
 - add a positive-path test for `worktree::resolve_default_base_branch` that exercises the `origin/HEAD` resolver (requires a bare-remote fixture in the test). Current coverage only hits the `main`/`master` fallback and the empty-result negative case. `#m1 #test`
 
@@ -47,5 +49,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 - post-M4: diff view (what an agent has changed against the base branch) `#post-m4 #review`
 - post-M4: merge / discard workflow for completed sessions `#post-m4 #worktree`
 - post-M4: remote session *creation* (spawning new sessions on SSH hosts, not just attaching to existing ones) `#post-m4 #remote`
+- post-M1 polish: dashboard grouping by repo — sessions render under their parent repo headers, with collapsing per-repo. Deferred until the flat-list rendering of M1 is dogfooded; we may not need grouping if labels are enough. `#post-m1 #ui`
 - decide UX when agent-mux is launched from inside an existing tmux session vs from a bare shell `#m0 #ui`
 - flesh out `agent-mux-review` Layer 2 categories as project-specific rules emerge in `ARCHITECTURE.md` `#review #setup`

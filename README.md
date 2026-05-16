@@ -6,6 +6,10 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 <!-- One sentence on what works today and what's next. -->
 
+## Setup
+
+After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hook (fmt-check + clippy + tests).
+
 ## How to run
 
 `cargo run` to start the binary. `cargo build --release` for an optimised build. `cargo test` for the test suite. See `PROCESS.md` for the canonical-commands list.

@@ -1,0 +1,15 @@
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# environment files
+.env
+.env.local
+
+# claude worktrees
+.claude/worktrees/
+
+# rust
+target/

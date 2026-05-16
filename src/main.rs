@@ -18,7 +18,10 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::catalog::SessionCatalog;
+use agent_mux::config::Config;
 use agent_mux::discovery::{claude_projects_dir, discover_local};
+use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
+use agent_mux::repo::RepoRegistry;
 use agent_mux::session::{Attention, Host, Session};
 use agent_mux::watcher::{AttentionUpdate, TranscriptWatcher};
 
@@ -91,6 +94,8 @@ struct App {
     updates: Receiver<AttentionUpdate>,
     driver: TmuxDriver,
     status: Option<String>,
+    registry: RepoRegistry,
+    modal: Option<NewSessionModal>,
 }
 
 impl App {
@@ -114,6 +119,9 @@ impl App {
             list_state.select(Some(0));
         }
 
+        let config = Config::load().unwrap_or_default();
+        let registry = RepoRegistry::from_config(&config);
+
         Ok(Self {
             catalog,
             list_state,
@@ -122,7 +130,44 @@ impl App {
             updates,
             driver: TmuxDriver::new(),
             status: None,
+            registry,
+            modal: None,
         })
+    }
+
+    fn open_new_session(&mut self) {
+        if self.registry.is_empty() {
+            self.status = Some(
+                "no repos found. add workspace_folders to ~/.config/agent-mux/config.toml"
+                    .to_string(),
+            );
+            return;
+        }
+        self.modal = Some(NewSessionModal::new(self.registry.repos().to_vec()));
+        self.status = None;
+    }
+
+    fn handle_modal_key(&mut self, key: KeyEvent) {
+        let Some(mut modal) = self.modal.take() else {
+            return;
+        };
+        match modal.handle_key(key) {
+            KeyOutcome::Handled => self.modal = Some(modal),
+            KeyOutcome::Cancel => {}
+            KeyOutcome::Submit {
+                repo,
+                task,
+                base_branch,
+            } => {
+                // Stub for this slice. The next slice wires this submit to
+                // WorktreeManager::create + AttachmentDriver::spawn_session
+                // on a background task.
+                self.status = Some(format!(
+                    "would create: repo={} task={task:?} branch={base_branch}",
+                    repo.name
+                ));
+            }
+        }
     }
 
     fn drain_updates(&mut self) {
@@ -205,6 +250,17 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         let has_event = event::poll(TICK)?;
         app.drain_updates();
         if has_event && let Event::Key(key) = event::read()? {
+            // Ctrl-C quits unconditionally, even when the modal is open.
+            // Everything else routes to the modal when one is up.
+            let ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl_c {
+                return Ok(());
+            }
+            if app.modal.is_some() {
+                app.handle_modal_key(key);
+                continue;
+            }
             let pending = match action_for(key) {
                 Some(Action::Quit) => return Ok(()),
                 Some(Action::Next) => {
@@ -217,6 +273,10 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 }
                 Some(Action::Attach) => app.attach_selected(),
                 Some(Action::SpawnTerminal) => app.spawn_terminal_selected(),
+                Some(Action::NewSession) => {
+                    app.open_new_session();
+                    None
+                }
                 None => None,
             };
             if let Some(cmd) = pending
@@ -234,19 +294,17 @@ enum Action {
     Prev,
     Attach,
     SpawnTerminal,
+    NewSession,
 }
 
 fn action_for(key: KeyEvent) -> Option<Action> {
-    let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-    if ctrl_c {
-        return Some(Action::Quit);
-    }
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Next),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Prev),
         KeyCode::Enter => Some(Action::Attach),
         KeyCode::Char('t') => Some(Action::SpawnTerminal),
+        KeyCode::Char('n') => Some(Action::NewSession),
         _ => None,
     }
 }
@@ -280,14 +338,20 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let footer_text = match (&app.status, app.catalog.is_empty()) {
         (Some(s), _) => format!(" {s} "),
-        (None, true) => " no sessions discovered · q: quit ".to_string(),
-        (None, false) => " ↑/↓ or j/k: move · ⏎: attach · t: terminal · q: quit ".to_string(),
+        (None, true) => " no sessions discovered · n: new · q: quit ".to_string(),
+        (None, false) => {
+            " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit ".to_string()
+        }
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
         Style::new().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(footer, layout[2]);
+
+    if let Some(modal) = app.modal.as_mut() {
+        modal.draw(frame);
+    }
 }
 
 fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {

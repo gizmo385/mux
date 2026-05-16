@@ -8,9 +8,7 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M0 — Local dashboard
 
-- add subscribe/publish to SessionCatalog so the transcript watcher can push updates `#m0 #core`
-- implement local Transcript Watcher: tail JSONL with `notify`, parse entries, emit attention events `#m0 #attention`
-- decide initial attention heuristic ("last entry is assistant + N seconds of stillness → needs-input"); make N configurable later `#m0 #attention`
+- tune attention heuristic after dogfooding (current rules: assistant → needs-input, user/tool result → working, mtime > 1h → idle); make thresholds configurable in M4 `#m0 #attention`
 - define AttachmentDriver trait; implement TmuxDriver (attach into a tmux window, spawn terminal in cwd) `#m0 #attachment`
 - wire Dashboard render: list view with project, host, attention state, time-since-last-event `#m0 #ui`
 - wire Dashboard input: arrow keys, Enter to attach, `t` to spawn terminal, `q` to quit `#m0 #ui`

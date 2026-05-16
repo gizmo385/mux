@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -17,11 +18,20 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::discovery::{claude_projects_dir, discover_local};
 use agent_mux::session::{Attention, Host, Session};
+use agent_mux::watcher::{AttentionUpdate, TranscriptWatcher};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// Sessions older than this are shown as Idle regardless of transcript
+/// content. M0 default; will become configurable in M4.
+const IDLE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
+
+/// Event-loop tick. Bounds the latency between an attention update arriving
+/// in the channel and the dashboard re-rendering it.
+const TICK: Duration = Duration::from_millis(100);
+
 fn main() -> io::Result<()> {
-    let mut app = App::new();
+    let mut app = App::new()?;
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
@@ -46,24 +56,43 @@ struct App {
     catalog: SessionCatalog,
     list_state: ListState,
     home: Option<PathBuf>,
+    _watcher: TranscriptWatcher,
+    updates: Receiver<AttentionUpdate>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new() -> io::Result<Self> {
         let mut catalog = SessionCatalog::new();
         if let Some(root) = claude_projects_dir()
             && let Ok(sessions) = discover_local(&root)
         {
             catalog.replace_all(sessions);
         }
+
+        let targets: Vec<_> = catalog
+            .sessions()
+            .iter()
+            .map(|s| (s.id.clone(), s.transcript_path.clone()))
+            .collect();
+        let (watcher, updates) = TranscriptWatcher::start(targets).map_err(io::Error::other)?;
+
         let mut list_state = ListState::default();
         if !catalog.is_empty() {
             list_state.select(Some(0));
         }
-        Self {
+
+        Ok(Self {
             catalog,
             list_state,
             home: dirs::home_dir(),
+            _watcher: watcher,
+            updates,
+        })
+    }
+
+    fn drain_updates(&mut self) {
+        while let Ok(update) = self.updates.try_recv() {
+            self.catalog.update_attention(&update.id, update.attention);
         }
     }
 
@@ -93,9 +122,9 @@ impl App {
 fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-        {
+        let has_event = event::poll(TICK)?;
+        app.drain_updates();
+        if has_event && let Event::Key(key) = event::read()? {
             match action_for(key) {
                 Some(Action::Quit) => return Ok(()),
                 Some(Action::Next) => app.next(),
@@ -165,7 +194,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 }
 
 fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {
-    let glyph = attention_glyph(session.attention);
+    let glyph = attention_glyph(effective_attention(session));
     let host = host_label(session.host);
     let project = display_path(&session.project_dir, home);
     let age = humanize_elapsed(session.last_activity);
@@ -179,6 +208,15 @@ fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {
         Span::raw("  "),
         Span::styled(age, Style::new().add_modifier(Modifier::DIM)),
     ])
+}
+
+fn effective_attention(session: &Session) -> Attention {
+    if let Ok(elapsed) = session.last_activity.elapsed()
+        && elapsed > IDLE_THRESHOLD
+    {
+        return Attention::Idle;
+    }
+    session.attention
 }
 
 fn attention_glyph(a: Attention) -> &'static str {

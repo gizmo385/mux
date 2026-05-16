@@ -1,4 +1,4 @@
-use crate::session::Session;
+use crate::session::{Attention, Session, SessionId};
 
 #[derive(Debug, Default)]
 pub struct SessionCatalog {
@@ -14,6 +14,18 @@ impl SessionCatalog {
     pub fn replace_all(&mut self, mut sessions: Vec<Session>) {
         sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
         self.sessions = sessions;
+    }
+
+    /// Update the attention state of a session by id. Returns `true` if the
+    /// session was found and updated.
+    pub fn update_attention(&mut self, id: &SessionId, attention: Attention) -> bool {
+        for session in &mut self.sessions {
+            if session.id == *id {
+                session.attention = attention;
+                return true;
+            }
+        }
+        false
     }
 
     #[must_use]

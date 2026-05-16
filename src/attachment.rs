@@ -73,20 +73,50 @@ impl TmuxDriver {
 
 impl AttachmentDriver for TmuxDriver {
     fn attach(&self, session: &Session) -> Result<AttachOutcome, AttachError> {
-        let target = find_pane(&session.project_dir)?;
+        if let Ok(target) = find_pane(&session.project_dir) {
+            return Self::switch_to_live(&target);
+        }
+        // No live pane (either tmux says NotFound, or there's no tmux server
+        // at all and list-panes failed). Resume the transcript in a fresh
+        // claude process, in the session's recorded cwd.
+        Self::resume_transcript(session)
+    }
+
+    fn spawn_terminal(&self, session: &Session) -> Result<AttachOutcome, AttachError> {
+        Self::spawn_terminal_impl(session)
+    }
+}
+
+impl TmuxDriver {
+    fn switch_to_live(target: &str) -> Result<AttachOutcome, AttachError> {
         if in_tmux() {
-            run_tmux(&["switch-client", "-t", &target])?;
+            run_tmux(&["switch-client", "-t", target])?;
             Ok(AttachOutcome::Done)
         } else {
             Ok(AttachOutcome::SuspendAndRun(SuspendCommand {
                 program: "tmux".to_string(),
-                args: vec!["attach".to_string(), "-t".to_string(), target],
+                args: vec!["attach".to_string(), "-t".to_string(), target.to_string()],
                 cwd: None,
             }))
         }
     }
 
-    fn spawn_terminal(&self, session: &Session) -> Result<AttachOutcome, AttachError> {
+    fn resume_transcript(session: &Session) -> Result<AttachOutcome, AttachError> {
+        let cwd = session.project_dir.to_string_lossy().into_owned();
+        let resume_cmd = format!("claude --resume {}", session.id.0);
+        if in_tmux() {
+            run_tmux(&["new-window", "-c", &cwd, &resume_cmd])?;
+            Ok(AttachOutcome::Done)
+        } else {
+            Ok(AttachOutcome::SuspendAndRun(SuspendCommand {
+                program: "tmux".to_string(),
+                args: vec!["new-session".to_string(), "-c".to_string(), cwd, resume_cmd],
+                cwd: None,
+            }))
+        }
+    }
+
+    fn spawn_terminal_impl(session: &Session) -> Result<AttachOutcome, AttachError> {
         if in_tmux() {
             let output = Command::new("tmux")
                 .arg("new-window")

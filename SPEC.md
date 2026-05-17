@@ -22,7 +22,7 @@ The target user is a single developer who already lives in the terminal, already
 - **Dashboard** — the agent-mux TUI: the list of all known sessions and their states.
 - **Transcript** — the JSONL file Claude Code writes for each conversation (under `~/.claude/projects/<hash>/<conversation-id>.jsonl`). Source of truth for what a session is doing.
 - **Attention state** — a session's current status, derived from its transcript: `needs-input`, `working`, or `idle`.
-- **Attachment** — the mechanism by which the user interacts with a session. For M0–M4 this is a `tmux` window; the abstraction allows for other backends later.
+- **Attachment** — the mechanism by which the user interacts with a session. For M0–M5 this is a `tmux` window; the abstraction allows for other backends later.
 
 ## Functionality
 
@@ -56,7 +56,7 @@ Out of scope for M0: session *creation* from inside agent-mux (user starts Claud
 **M1 — Session creation + worktree management.**
 Goal: spawn new Claude Code sessions from inside agent-mux, each in its own git worktree. This is the capability that turns the dashboard from a *catalog* into an *orchestrator* and is the defining differentiator from M0's purely-passive dashboard.
 Scope: minimal workspace-folders config (`~/.config/agent-mux/config.toml` with `workspace_folders = [...]`); Repo Registry that scans those folders at startup and caches the result in memory; new-session flow (pick repo → task name → base branch); Worktree Manager that creates and registers worktrees via `git worktree`; task metadata persisted in the worktree; tmux integration for launching `claude` inside the new worktree; lifecycle handling when a session is closed (worktree fate — to be decided in design).
-Out of scope for M1: diff viewing, merge/discard workflow, remote session creation, dashboard grouping by repo, the broader M4 config surface (themes, keybinds, reload-on-edit).
+Out of scope for M1: diff viewing, merge/discard workflow, remote session creation, dashboard grouping by repo, the broader M5 config surface (themes, keybinds, reload-on-edit).
 
 **M2 — Remote hosts.**
 Goal: same dashboard experience for sessions on SSH targets. (Spawning new sessions on remote hosts is post-M2.)
@@ -66,16 +66,21 @@ Scope: host configuration file; SSH ControlMaster lifecycle; remote transcript p
 Goal: see recent transcript activity per session without entering. This is also the experiment that tells us whether richer chat rendering (Shape B/D) is worth pursuing. If reading a transcript line-by-line in the dashboard turns out to be the thing the user actually wants, that's signal to lean toward B.
 Scope: transcript renderer (parses Claude Code JSONL into compact display lines); preview pane or per-row preview; configuration for preview verbosity.
 
-**M4 — Customization.**
-Goal: themes and custom keybinds.
-Scope: TOML config schema for themes and keybindings; reload-on-edit; documented defaults.
+**M4 — Attention notifications.**
+Goal: surface a session transitioning into `needs-input` even when agent-mux isn't on screen. Closes the promise in this document's Functionality section ("(eventually) the user receives an OS-level notification").
+Scope: cross-platform OS notifications (Linux libnotify, macOS NSUserNotification) via `notify-rust`, triggered at the catalog's attention-update boundary when the previous state was `Working`/`Idle`/`Unknown` and the new state is `NeedsInput`; one notification per transition carrying the session's title and host label; minimal in-process suppression at implementation time — debounce against rapid attention flapping, and a per-session "I've seen this, hush" so the notification doesn't re-fire on every transition while the user is mid-decision.
+Out of scope for M4: detection of agent-mux's terminal having focus (defer to dogfooding — may not be reliably detectable across terminal emulators); user-facing config knobs (on/off, sound, quiet hours, per-host suppression) which belong in M5's broader config surface alongside themes and keybinds.
 
-**Post-M4.** Direction depends on M3 findings and dogfooding signal. Likely candidates: diff view (what an agent has changed against the base branch), merge / discard workflow for completed sessions, remote session creation, Claude Code hooks integration for richer attention signals. If the M3 preview experiment suggests a full chat surface is worth building, also plan a Shape B/D transition. The order will follow what M0–M4 dogfooding surfaces.
+**M5 — Customization.**
+Goal: themes and custom keybinds.
+Scope: TOML config schema for themes and keybindings; reload-on-edit; documented defaults. Also exposes the previously-hardcoded thresholds (idle threshold, remote poll interval) and the M4 notification suppression knobs (on/off, sound, quiet hours, per-host suppression).
+
+**Post-M5.** Direction depends on M3 findings and dogfooding signal. Likely candidates: diff view (what an agent has changed against the base branch), merge / discard workflow for completed sessions, remote session creation, Claude Code hooks integration for richer attention signals. If the M3 preview experiment suggests a full chat surface is worth building, also plan a Shape B/D transition. The order will follow what M0–M5 dogfooding surfaces.
 
 ## Out of scope
 
-- **Replacing tmux.** agent-mux runs on top of tmux through M4. A future post-M4 milestone might add an alternative backend, but tmux is the only attachment in scope for the foreseeable plan.
-- **Replacing Claude Code.** agent-mux does not implement a chat UI in M0–M4. The user always interacts with the real Claude Code. agent-mux *spawns* Claude Code sessions in M1 but does not configure or update Claude Code itself.
+- **Replacing tmux.** agent-mux runs on top of tmux through M5. A future post-M5 milestone might add an alternative backend, but tmux is the only attachment in scope for the foreseeable plan.
+- **Replacing Claude Code.** agent-mux does not implement a chat UI in M0–M5. The user always interacts with the real Claude Code. agent-mux *spawns* Claude Code sessions in M1 but does not configure or update Claude Code itself.
 - **Other agents.** Cursor, Aider, generic-LLM CLIs — none of these are in scope. Claude Code only.
 - **Windows-native.** Targets Linux and macOS terminals. WSL is the only supported Windows path.
 - **Collaboration features.** Single user, single dashboard instance. No shared state across users or machines (other than the user logging in to their own remote hosts).

@@ -82,7 +82,7 @@ pub trait AttachmentDriver {
     /// method does not return a `SessionId`.
     ///
     /// Local-only in M2: remote session *creation* (the new-session flow
-    /// running against an SSH host) is post-M4.
+    /// running against an SSH host) is post-M5.
     ///
     /// # Errors
     /// Returns `AttachError::TmuxCommandFailed` if tmux returns non-zero.

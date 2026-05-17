@@ -38,7 +38,7 @@ use agent_mux::worktree::WorktreeManager;
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Sessions older than this are shown as Idle regardless of transcript
-/// content. M0 default; will become configurable in M4.
+/// content. M0 default; will become configurable in M5.
 const IDLE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 
 /// Event-loop tick. Bounds the latency between an attention update arriving

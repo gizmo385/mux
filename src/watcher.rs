@@ -20,7 +20,7 @@ const TAIL_BYTES: u64 = 32 * 1024;
 /// Default interval between remote transcript polls. Low enough that
 /// needs-input feels live (a few seconds end-to-end), high enough that
 /// an idle ten-session host isn't generating continuous SSH round-trips.
-/// Becomes configurable in M4.
+/// Becomes configurable in M5.
 pub const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]

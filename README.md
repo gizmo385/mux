@@ -4,7 +4,7 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-M1 complete. M2 (remote hosts) substantially shipped: with `[hosts.<name>]` entries in the config, the dashboard surfaces sessions from SSH-reachable machines at startup, attention updates stream live (every 3s, over each host's existing `ControlMaster` connection), and `Enter` / `t` attach into the remote tmux. Remote portability and post-M4 remote session *creation* remain in `TODO.md`.
+M1 complete. M2 (remote hosts) substantially shipped: with `[hosts.<name>]` entries in the config, the dashboard surfaces sessions from SSH-reachable machines at startup, attention updates stream live (every 3s, over each host's existing `ControlMaster` connection), and `Enter` / `t` attach into the remote tmux. Remote portability and post-M5 remote session *creation* remain in `TODO.md`.
 
 The dashboard runs (`cargo run`), discovers local Claude Code sessions, groups them under host headers (`── local ──`, then any configured SSH hosts alphabetical) with dim project sub-headers beneath each host, labels each row with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to a short session-id suffix), shows live attention state (● needs-input, ◐ working, ○ idle), dims the title when no live tmux pane matches the session (Enter will spin up a fresh `claude --resume` rather than fast-switch into an existing pane), and:
 

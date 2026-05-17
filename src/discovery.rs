@@ -47,10 +47,17 @@ pub fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
 /// mid-run, so both startup discovery and live discovery produce
 /// identically-shaped sessions.
 ///
+/// Returns `Ok(None)` for transcripts that aren't usable as live
+/// sessions: missing file stem (no derivable id), or a `project_dir`
+/// that isn't an existing directory on disk (the worktree was deleted,
+/// or the transcript predates having `cwd` metadata and we fell back to
+/// the `<unknown>` literal). Either way, the user can't attach to or
+/// resume such a session, so showing it in the dashboard would only
+/// generate failed-attach noise.
+///
 /// # Errors
 /// Returns `io::Error` if metadata or the transcript itself cannot be
-/// read. Returns `Ok(None)` when the path has no usable file stem (i.e.
-/// no derivable session id).
+/// read.
 pub fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
     let id = match transcript_path.file_stem().and_then(|s| s.to_str()) {
         Some(s) => SessionId(s.to_string()),
@@ -62,6 +69,9 @@ pub fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
     let project_dir = transcript_meta
         .cwd
         .unwrap_or_else(|| fallback_dir(transcript_path));
+    if !project_dir.is_dir() {
+        return Ok(None);
+    }
     let title = task_toml_title(&project_dir).or(transcript_meta.ai_title);
     Ok(Some(Session {
         id,
@@ -128,33 +138,70 @@ mod tests {
     use super::*;
     use std::fs::create_dir_all;
 
-    #[test]
-    fn discovers_session_with_cwd_from_jsonl() {
+    /// Build the standard "real cwd + project entry" scaffolding under a
+    /// fresh tempdir. Returns `(tempdir, projects_root, real_cwd)` so the
+    /// tempdir's lifetime extends to the end of the test.
+    fn setup_with_real_cwd() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-home-test-proj");
-        create_dir_all(&proj).unwrap();
-        fs::write(
-            proj.join("abc-123.jsonl"),
-            "{\"type\":\"user\",\"cwd\":\"/home/test/proj\"}\n",
-        )
-        .unwrap();
-
-        let sessions = discover_local(tmp.path()).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id.0, "abc-123");
-        assert_eq!(sessions[0].project_dir, PathBuf::from("/home/test/proj"));
+        let projects = tmp.path().join("projects");
+        let cwd = tmp.path().join("real-cwd");
+        create_dir_all(&projects).unwrap();
+        create_dir_all(&cwd).unwrap();
+        (tmp, projects, cwd)
     }
 
     #[test]
-    fn falls_back_to_decoded_dir_name_when_no_cwd_in_transcript() {
+    fn discovers_session_with_cwd_from_jsonl() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc-123.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id.0, "abc-123");
+        assert_eq!(sessions[0].project_dir, cwd);
+    }
+
+    #[test]
+    fn stale_cwd_session_is_filtered_out() {
+        // The user's scenario: a transcript whose recorded cwd points at a
+        // worktree that has since been deleted. The session is no longer
+        // resumable, so it should not appear in the dashboard.
         let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-home-test-proj");
+        let projects = tmp.path().join("projects");
+        let entry = projects.join("-deleted");
+        create_dir_all(&entry).unwrap();
+        let gone = tmp.path().join("deleted-worktree");
+        // Note: we never `create_dir_all(&gone)`.
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", gone.display()),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert!(sessions.is_empty(), "got: {sessions:?}");
+    }
+
+    #[test]
+    fn session_with_no_cwd_metadata_and_no_real_fallback_is_filtered() {
+        // When the transcript has no cwd, build_session falls back to the
+        // decoded project-dir-name (`-home-test-proj` → `/home/test/proj`).
+        // The fallback path is unlikely to exist on a CI worker, so the
+        // session is filtered. This is by design — such transcripts are
+        // pre-cwd-metadata legacy entries that we can't attach to anyway.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-this-path-does-not-exist-anywhere-xyz");
         create_dir_all(&proj).unwrap();
         fs::write(proj.join("xyz.jsonl"), "{\"type\":\"system\"}\n").unwrap();
 
         let sessions = discover_local(tmp.path()).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].project_dir, PathBuf::from("/home/test/proj"));
+        assert!(sessions.is_empty(), "got: {sessions:?}");
     }
 
     #[test]
@@ -167,34 +214,40 @@ mod tests {
 
     #[test]
     fn extracts_ai_title_from_transcript() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-x");
-        create_dir_all(&proj).unwrap();
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
         fs::write(
-            proj.join("abc.jsonl"),
-            "{\"type\":\"user\",\"cwd\":\"/x\"}\n\
-             {\"type\":\"ai-title\",\"aiTitle\":\"Wire up the parser\"}\n",
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n\
+                 {{\"type\":\"ai-title\",\"aiTitle\":\"Wire up the parser\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
 
-        let sessions = discover_local(tmp.path()).unwrap();
+        let sessions = discover_local(&projects).unwrap();
         assert_eq!(sessions[0].title.as_deref(), Some("Wire up the parser"));
     }
 
     #[test]
     fn ai_title_uses_latest_entry_when_multiple() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-x");
-        create_dir_all(&proj).unwrap();
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
         fs::write(
-            proj.join("abc.jsonl"),
-            "{\"type\":\"user\",\"cwd\":\"/x\"}\n\
-             {\"type\":\"ai-title\",\"aiTitle\":\"early guess\"}\n\
-             {\"type\":\"ai-title\",\"aiTitle\":\"refined title\"}\n",
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n\
+                 {{\"type\":\"ai-title\",\"aiTitle\":\"early guess\"}}\n\
+                 {{\"type\":\"ai-title\",\"aiTitle\":\"refined title\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
 
-        let sessions = discover_local(tmp.path()).unwrap();
+        let sessions = discover_local(&projects).unwrap();
         assert_eq!(sessions[0].title.as_deref(), Some("refined title"));
     }
 
@@ -233,28 +286,32 @@ mod tests {
 
     #[test]
     fn title_is_none_when_no_signal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-x");
-        create_dir_all(&proj).unwrap();
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
         fs::write(
-            proj.join("abc.jsonl"),
-            "{\"type\":\"user\",\"cwd\":\"/x\"}\n",
+            entry.join("abc.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
         )
         .unwrap();
 
-        let sessions = discover_local(tmp.path()).unwrap();
+        let sessions = discover_local(&projects).unwrap();
         assert!(sessions[0].title.is_none());
     }
 
     #[test]
     fn ignores_non_jsonl_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-x");
-        create_dir_all(&proj).unwrap();
-        fs::write(proj.join("memory"), "not a session").unwrap();
-        fs::write(proj.join("real.jsonl"), "{\"cwd\":\"/x\"}\n").unwrap();
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(entry.join("memory"), "not a session").unwrap();
+        fs::write(
+            entry.join("real.jsonl"),
+            format!("{{\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
 
-        let sessions = discover_local(tmp.path()).unwrap();
+        let sessions = discover_local(&projects).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id.0, "real");
     }

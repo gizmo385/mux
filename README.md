@@ -29,6 +29,15 @@ workspace_folders = ["~/workspace", "~/code"]
 [hosts.alpenglow]
 ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 # transcript_root = "~/.claude/projects"  # default; tilde-expanded
+
+# Notification behaviour (M5). Every field has a default; the whole
+# section is optional. Master toggle, audible cue, and per-host
+# suppression are the M5-shipped knobs; quiet hours and customizable
+# sound files are post-M5.
+[notifications]
+enabled = true          # master on/off
+sound = false           # play the OS "default" notification sound
+disabled_hosts = []     # host labels to silence entirely
 ```
 
 The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; tilde expansion only — env vars not yet supported).

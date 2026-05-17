@@ -319,6 +319,11 @@ impl App {
 
         let (preview_tx, preview_rx) = channel();
 
+        // Extract before the struct literal moves `config` — Rust
+        // evaluates struct fields in source order, so `notifier:` (last)
+        // can't borrow `config` after `config:` (earlier) has taken it.
+        let notifier = Notifier::new(Box::new(LibNotifyDispatcher), config.notifications.clone());
+
         Ok(Self {
             catalog,
             list_state,
@@ -343,7 +348,7 @@ impl App {
             preview_cache: HashMap::new(),
             preview_tx,
             preview_rx,
-            notifier: Notifier::new(Box::new(LibNotifyDispatcher)),
+            notifier,
         })
     }
 

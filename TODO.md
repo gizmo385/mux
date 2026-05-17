@@ -42,11 +42,14 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 - design TOML schema for themes (named colours → ratatui Style) `#m5 #config`
 - design TOML schema for keybinds (action name → key combo) `#m5 #config`
-- extend Config (M1 minimal already shipped) with the full M5 surface; sane defaults if absent `#m5 #config`
 - reload-on-edit (watch config file, re-apply) `#m5 #config`
 - env-var expansion in `workspace_folders` (e.g. `$HOME/work`, `$WORK_DIR/repos`). M1 ships tilde expansion only; env vars deferred. `#m5 #config`
 - expose previously-hardcoded thresholds: idle threshold (`IDLE_THRESHOLD` in `main.rs`, default 1h) and remote poll interval (`REMOTE_POLL_INTERVAL` in `watcher.rs`, default 3s). Both flagged in code comments as M5 work. `#m5 #config`
-- expose M4 notification knobs (on/off, sound, quiet hours, per-host suppression). Deferred from M4 deliberately — M4 ships with sane in-process suppression only; M5 adds the user-facing surface. `#m5 #config #notifications`
+- quiet hours for notifications: a `[notifications]` field like `quiet_hours = ["22:00-07:00"]` to suppress dispatch during a user-defined window. Deferred from the M5 notifications slice because timezone-aware time parsing adds scope; the on/off toggle and per-host suppression already cover the common case. `#m5 #notifications`
+
+### Post-M5
+
+- customizable notification sounds: today's M5 surface exposes a single `sound = true/false` flag mapping to the OS "default" sound. Real customization would mean per-host or per-event sound selection (different sound for needs-input vs. attention-flap; one host gets a chime, another gets a buzz). Wait for dogfooding to surface whether the binary toggle is enough; revisit if not. `#post-m5 #notifications #config`
 
 ### Cross-cutting / deferred decisions
 

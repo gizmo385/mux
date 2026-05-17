@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use crate::config::NotificationsConfig;
 use crate::session::{Attention, HostId, SessionId};
 
 /// Same-session re-fire window. Notifications for the same `SessionId`
@@ -47,6 +48,11 @@ pub const DEBOUNCE_WINDOW: Duration = Duration::from_secs(5);
 pub struct Payload {
     pub title: String,
     pub body: String,
+    /// Whether to request an audible cue from the OS notification
+    /// system. Plumbed through the payload so the dispatcher can stay
+    /// stateless — config decisions live with the [`Notifier`], not
+    /// the backend.
+    pub sound: bool,
 }
 
 /// Pluggable notification backend. Tests use a recorder to capture
@@ -74,11 +80,17 @@ pub struct LibNotifyDispatcher;
 impl Dispatcher for LibNotifyDispatcher {
     fn dispatch(&self, payload: Payload) -> Result<(), String> {
         std::thread::spawn(move || {
-            let _ = notify_rust::Notification::new()
-                .summary(&payload.title)
+            let mut n = notify_rust::Notification::new();
+            n.summary(&payload.title)
                 .body(&payload.body)
-                .appname("agent-mux")
-                .show();
+                .appname("agent-mux");
+            if payload.sound {
+                // Freedesktop "default" sound on Linux; AppleScript
+                // honours the same name string on macOS. Picking a
+                // specific named sound is a post-M5 follow-up.
+                n.sound_name("default");
+            }
+            let _ = n.show();
         });
         Ok(())
     }
@@ -93,15 +105,25 @@ struct SessionState {
 pub struct Notifier {
     dispatcher: Box<dyn Dispatcher>,
     state: HashMap<SessionId, SessionState>,
+    config: NotificationsConfig,
 }
 
 impl Notifier {
     #[must_use]
-    pub fn new(dispatcher: Box<dyn Dispatcher>) -> Self {
+    pub fn new(dispatcher: Box<dyn Dispatcher>, config: NotificationsConfig) -> Self {
         Self {
             dispatcher,
             state: HashMap::new(),
+            config,
         }
+    }
+
+    /// Replace the live notification config. Used by the M5
+    /// reload-on-edit path so a config change takes effect without a
+    /// restart. Suppression state is intentionally preserved — a
+    /// reload should not re-fire already-acknowledged notifications.
+    pub fn update_config(&mut self, config: NotificationsConfig) {
+        self.config = config;
     }
 
     /// Drop bookkeeping for a session that no longer exists. The main
@@ -124,6 +146,9 @@ impl Notifier {
     /// `now` is passed in (rather than fetched here) so tests can drive
     /// the time-window logic deterministically.
     pub fn on_attention_update(&mut self, t: &Transition<'_>, now: SystemTime) {
+        // Leaving-NeedsInput bookkeeping runs even when the master
+        // toggle is off: turning notifications back on later should
+        // not see a stale "still in episode" flag from before the toggle.
         if t.new != Attention::NeedsInput {
             if t.prev == Attention::NeedsInput
                 && let Some(s) = self.state.get_mut(t.id)
@@ -133,6 +158,17 @@ impl Notifier {
             return;
         }
         if t.prev == Attention::NeedsInput {
+            return;
+        }
+        if !self.config.enabled {
+            return;
+        }
+        if self
+            .config
+            .disabled_hosts
+            .iter()
+            .any(|h| h == t.host.as_str())
+        {
             return;
         }
         let entry = self.state.entry(t.id.clone()).or_default();
@@ -150,6 +186,7 @@ impl Notifier {
         let payload = Payload {
             title: format!("agent-mux: {}", t.title),
             body: format!("{} · {}", t.host, t.project.display()),
+            sound: self.config.sound,
         };
         if self.dispatcher.dispatch(payload).is_ok() {
             entry.last_fired = Some(now);
@@ -226,11 +263,21 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    /// Helper: build a `Notifier` and return the dispatcher's log handle
+    /// Helper: build a `Notifier` with default (enabled, no sound, no
+    /// host disables) config and return the dispatcher's log handle
     /// alongside it so each test can inspect the dispatches directly.
     fn notifier_with_log() -> (Notifier, std::sync::Arc<RecorderDispatcher>) {
+        notifier_with_log_and_config(NotificationsConfig::default())
+    }
+
+    fn notifier_with_log_and_config(
+        config: NotificationsConfig,
+    ) -> (Notifier, std::sync::Arc<RecorderDispatcher>) {
         let rec = std::sync::Arc::new(RecorderDispatcher::default());
-        let notifier = Notifier::new(Box::new(SharedRecorder(std::sync::Arc::clone(&rec))));
+        let notifier = Notifier::new(
+            Box::new(SharedRecorder(std::sync::Arc::clone(&rec))),
+            config,
+        );
         (notifier, rec)
     }
 
@@ -564,7 +611,7 @@ mod tests {
         // this by failing once, then succeeding: the second attempt
         // should fire even though the first appeared to "fire" from
         // the caller's perspective.
-        let mut n = Notifier::new(Box::new(FailingDispatcher));
+        let mut n = Notifier::new(Box::new(FailingDispatcher), NotificationsConfig::default());
         fire(
             &mut n,
             &sid("a"),
@@ -593,6 +640,143 @@ mod tests {
             at(0),
         );
         assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn does_not_fire_when_master_toggle_is_disabled() {
+        let cfg = NotificationsConfig {
+            enabled: false,
+            ..NotificationsConfig::default()
+        };
+        let (mut n, rec) = notifier_with_log_and_config(cfg);
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert!(rec.log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn does_not_fire_for_a_disabled_host() {
+        let cfg = NotificationsConfig {
+            disabled_hosts: vec!["alpenglow".to_string()],
+            ..NotificationsConfig::default()
+        };
+        let (mut n, rec) = notifier_with_log_and_config(cfg);
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &HostId("alpenglow".to_string()),
+            Path::new("/p"),
+            at(0),
+        );
+        // Different host on the same notifier still fires.
+        fire(
+            &mut n,
+            &sid("b"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "y",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        let log = rec.log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].title, "agent-mux: y");
+    }
+
+    #[test]
+    fn payload_carries_sound_flag_from_config() {
+        let cfg = NotificationsConfig {
+            sound: true,
+            ..NotificationsConfig::default()
+        };
+        let (mut n, rec) = notifier_with_log_and_config(cfg);
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert!(rec.log.lock().unwrap()[0].sound);
+    }
+
+    #[test]
+    fn payload_sound_defaults_to_false() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert!(!rec.log.lock().unwrap()[0].sound);
+    }
+
+    #[test]
+    fn update_config_replaces_live_config_without_resetting_state() {
+        // Start enabled, fire once → flag set. Disable via reload.
+        // The leaving-NeedsInput bookkeeping should still clear the
+        // flag so when the user re-enables later, a fresh episode
+        // notifies. (Disabling doesn't reset suppression state.)
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+        n.update_config(NotificationsConfig {
+            enabled: false,
+            ..NotificationsConfig::default()
+        });
+        // Bookkeeping still runs while disabled.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(60),
+        );
+        // Re-enable, then a new transition INTO NeedsInput must fire.
+        n.update_config(NotificationsConfig::default());
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(120),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 2);
     }
 
     #[test]

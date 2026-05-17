@@ -56,6 +56,43 @@ pub struct Config {
     pub workspace_folders: Vec<PathBuf>,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+/// User-tunable notification behaviour, surfaced under `[notifications]`
+/// in `config.toml`. Missing section, missing keys, and a fully absent
+/// config file all collapse to [`NotificationsConfig::default`] — every
+/// knob has a sensible default so an empty config still behaves like
+/// pre-M5 agent-mux.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Master on/off. When `false`, the notifier short-circuits on every
+    /// transition and dispatches nothing. Default `true`: the M4 ship
+    /// already produced notifications, and turning that off should be
+    /// an explicit choice, not a silent regression after a config bump.
+    pub enabled: bool,
+    /// Whether the dispatcher requests an audible cue from the OS
+    /// notification system (libnotify's `sound-name` / `AppleScript`'s
+    /// `sound name`). Default `false` to preserve the pre-M5 silent
+    /// behaviour; users opt in.
+    pub sound: bool,
+    /// Host labels for which notifications are suppressed entirely
+    /// (matches against the `[hosts.<name>]` table key, or the literal
+    /// `local`). Default empty. Use case: silence chatty CI/dev boxes
+    /// while keeping pings for one specific host.
+    pub disabled_hosts: Vec<String>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sound: false,
+            disabled_hosts: Vec::new(),
+        }
+    }
 }
 
 impl Config {
@@ -336,6 +373,58 @@ ssh = "anything"
             matches!(err, ConfigError::ReservedHostName(_)),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn load_from_omitting_notifications_section_uses_defaults() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "").expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert!(cfg.notifications.enabled, "default is enabled=true");
+        assert!(!cfg.notifications.sound, "default is sound=false");
+        assert!(cfg.notifications.disabled_hosts.is_empty());
+    }
+
+    #[test]
+    fn load_from_parses_notifications_section() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[notifications]
+enabled = false
+sound = true
+disabled_hosts = ["alpenglow", "gpu-1"]
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert!(!cfg.notifications.enabled);
+        assert!(cfg.notifications.sound);
+        assert_eq!(
+            cfg.notifications.disabled_hosts,
+            vec!["alpenglow".to_string(), "gpu-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_from_partial_notifications_section_uses_defaults_for_missing_keys() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r"
+[notifications]
+sound = true
+",
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        // `enabled` defaults to true even though only `sound` is set.
+        assert!(cfg.notifications.enabled);
+        assert!(cfg.notifications.sound);
     }
 
     #[test]

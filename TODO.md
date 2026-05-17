@@ -18,9 +18,10 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M2 — Remote hosts
 
-- implement `SshHost`: shell out to system `ssh` with `ControlMaster` for connection reuse; drop-guard runs `ssh -O exit` on shutdown. The `Host` trait + `LocalHost` shipped in chunk 1. `#m2 #remote`
+- wire `SshHost` into discovery + the catalog: instantiate one `SshHost` per `[hosts.<name>]` config entry at startup, run discovery against each host's `transcript_root`, and feed the resulting `Session`s (with the right `HostId`) into the catalog. The `Host` trait + `LocalHost` (chunk 1) and `SshHost` itself (chunk 2) shipped; this chunk is the wire-up. `#m2 #remote`
 - extend Transcript Watcher to poll remote transcript files at configurable interval over the host's SSH channel `#m2 #attention #remote`
 - extend TmuxDriver to attach into remote tmux via a persistent local tmux window running `ssh -t host tmux attach` `#m2 #attachment #remote`
+- `SshHost` assumes a GNU `find` on the remote (uses `-printf '%T@ %p\0'`). macOS remotes need Homebrew `findutils` or a BSD-stat fallback. Defer until a macOS remote actually surfaces. `#m2 #remote #portability`
 
 ### M3 — Inline preview
 

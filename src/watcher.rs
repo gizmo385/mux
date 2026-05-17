@@ -258,6 +258,15 @@ impl TranscriptWatcher {
     ///
     /// The thread terminates cleanly when the event receiver drops
     /// (i.e. the dashboard exits). No explicit shutdown handle.
+    ///
+    /// **Lifecycle note (see ARCHITECTURE.md / Process lifecycle):**
+    /// this thread holds a clone of `Arc<dyn Host>`. If the process
+    /// exits while the thread is mid-`thread::sleep`, the runtime
+    /// kills the thread before its Arc reference drops — meaning
+    /// `SshHost::Drop` does not run for that host. The remote
+    /// `ControlMaster` is then reaped by `ControlPersist=600` (10 min)
+    /// rather than the explicit `ssh -O exit`. That's the intended
+    /// safety net; do not assume Drop fires on every shutdown path.
     pub fn start_polling_host(
         &self,
         host: Arc<dyn Host>,
@@ -296,6 +305,10 @@ impl TranscriptWatcher {
     /// this host has no live pane".
     ///
     /// Thread terminates cleanly when the event receiver drops.
+    /// Same SIGKILL/mid-sleep caveat as [`Self::start_polling_host`]:
+    /// the `Arc<dyn Host>` clone held by this thread may not be
+    /// released on a hard process exit, so `SshHost::Drop` is
+    /// best-effort and `ControlPersist` is the safety net.
     pub fn start_pane_polling_host(&self, host: Arc<dyn Host>, interval: Duration) {
         let tx = self.event_tx.clone();
         thread::spawn(move || {

@@ -716,6 +716,129 @@ mod tests {
         assert!(host.ssh_argv(true, &["tmux", "ls"]).is_none());
     }
 
+    // ---- shutdown audit: SshHost lifecycle ----
+    //
+    // SshHost owns a remote `ssh -fNM` master process; its Drop is the
+    // best-effort teardown. These tests use a mock `ssh` binary (a
+    // shell script that appends its argv to a log file) so we can
+    // assert the *exact* commands SshHost issues across its lifetime
+    // — both the connect-time master spawn and the Drop-time
+    // `-O exit`. Without an end-to-end test like this, a refactor
+    // that silently dropped the `-O exit` call would leak remote
+    // master processes for ControlPersist's full 10-minute window
+    // before they self-terminated.
+
+    #[cfg(unix)]
+    fn write_executable_mock_ssh(log_path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        // Bash is available on every supported platform (Linux + macOS
+        // per SPEC.md). Each invocation appends `<argv>\n` to the log
+        // and exits 0 so the connect succeeds.
+        let dir = log_path.parent().expect("log path has parent");
+        let mock = dir.join("mock-ssh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            log_path.display()
+        );
+        write_file(&mock, &script);
+        let mut perms = fs::metadata(&mock).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock, perms).unwrap();
+        mock
+    }
+
+    #[cfg(unix)]
+    fn read_log_lines(log_path: &Path) -> Vec<String> {
+        if !log_path.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_lifecycle_invokes_connect_then_drop_with_matching_socket() {
+        // Pins three lifecycle contracts in one sequential test
+        // (split-into-three failed CI with `ExecutableFileBusy`: a
+        // parallel test's `fork()` briefly held a write fd to a
+        // mock-ssh script and the child's exec raced it):
+        //
+        // 1. Connect uses `-fN -M`, `ControlPersist=600`, and
+        //    `ConnectTimeout=5`. Losing any of these breaks the
+        //    operational guarantees agent-mux relies on (background
+        //    master, idle timeout for the SIGKILL-mid-sleep case,
+        //    bounded startup latency for unreachable hosts).
+        //
+        // 2. Drop runs `ssh -O exit`. Losing this strands remote
+        //    masters for ControlPersist's full 10-minute window
+        //    after agent-mux quits.
+        //
+        // 3. The `-S <path>` argument matches between connect and
+        //    teardown. Mismatched socket paths cause `-O exit` to
+        //    silently no-op against the wrong (or missing) master.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh(&log);
+
+        {
+            let _host =
+                SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock)
+                    .unwrap();
+            // Drop fires at end of scope.
+        }
+
+        let lines = read_log_lines(&log);
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected connect + drop calls, got: {lines:?}"
+        );
+
+        // (1) Connect-time invariants.
+        let connect = &lines[0];
+        assert!(connect.contains("-fN"), "got: {connect}");
+        assert!(connect.contains("-M"), "got: {connect}");
+        assert!(
+            connect.contains("ControlPersist=600"),
+            "ControlPersist=600 is the safety net for thread-leak \
+             scenarios where Drop never fires; losing it would \
+             strand masters forever. got: {connect}"
+        );
+        assert!(
+            connect.contains("ConnectTimeout=5"),
+            "ConnectTimeout caps a wedged-host connect — without it \
+             a single unreachable host can stall startup. got: {connect}"
+        );
+        assert!(connect.contains("devbox"), "target missing: {connect}");
+
+        // (2) Drop-time invariants.
+        let teardown = &lines[1];
+        assert!(
+            teardown.contains("-O") && teardown.contains("exit"),
+            "drop must run `-O exit`. got: {teardown}"
+        );
+        assert!(
+            teardown.contains("devbox"),
+            "teardown must target the same host. got: {teardown}"
+        );
+
+        // (3) Socket path matches between connect and drop.
+        let socket_path = control_socket_path(&HostId("devbox".into()));
+        let socket_str = socket_path.to_string_lossy().into_owned();
+        assert!(
+            connect.contains(&socket_str),
+            "connect omitted socket path: {connect}"
+        );
+        assert!(
+            teardown.contains(&socket_str),
+            "drop omitted socket path: {teardown}"
+        );
+    }
+
     fn devbox() -> SshHost {
         SshHost {
             id: HostId("devbox".into()),

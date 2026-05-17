@@ -94,6 +94,36 @@ Architectural rules. Each one stated as a constraint with a reason. These are th
 - **Repo discovery is a startup concern, not a keystroke concern.** The Repo Registry is populated once at boot by scanning workspace folders. The new-session picker reads from the cache; opening the picker MUST NOT trigger a filesystem walk on the hot path. A re-scan may run when the picker opens *and* the cached snapshot is older than a TTL, but the picker renders from cache first and refreshes asynchronously. Reason: the same "switching never blocks on I/O" rationale applies to the first frame of any modal — a picker that takes a beat to appear is the same failure mode dressed differently.
 - **Workspace folder scanning is depth-1.** A workspace folder's direct children are checked for `.git/`; the scanner does not recurse into subdirectories. Reason: predictable cost, predictable result, no surprises from deeply-nested repos. If the user keeps repos nested deeper (e.g. `~/work/clients/<client>/<repo>`), they list the deeper directory as its own workspace folder.
 
+## Process lifecycle
+
+What agent-mux owns at runtime, and what happens to each piece of state across the three shutdown paths: a clean quit (`q` / Ctrl-C), a panic in a background thread, and a process kill (SIGKILL / power loss). The contract here is "no quiet leaks under the common cases; ControlPersist as the safety net for everything else."
+
+### State agent-mux owns
+
+- **SSH `ControlMaster` sockets** — one per configured remote host, at `$TMPDIR/agent-mux-ssh-<host>-<pid>.sock`. PID-namespaced so concurrent agent-mux processes don't collide. Created in `SshHost::connect`, destroyed by `SshHost::Drop` running `ssh -O exit`. Pinned by integration tests in `src/host.rs::tests` so a refactor can't silently break either end.
+- **Local tmux windows hosting `ssh -t target tmux attach`** — created on remote attach when running inside local tmux. The window's foreground process is the ssh; when ssh exits (user detaches from remote tmux), the window self-closes via tmux's default `remain-on-exit off`. We rely on the user's tmux config here.
+- **Remote `agent-mux-<conv-id>` tmux sessions** — created by the resume fallback inside the *remote* tmux. **Deliberately persistent**: the `-A` flag on `tmux new-session` makes a second attempt re-attach to the same session, which is what makes `claude --resume` idempotent. agent-mux does not clean these up; the README documents `tmux kill-session -t agent-mux-<id>` for the user. A discard affordance is filed in TODO.
+- **Background threads** — one notify-driven local watcher, one transcript poller per connected remote host, one pane poller per host (local + each remote), plus one short-lived per-host SSH discovery thread at startup and one per-worktree-create thread. Each holds clones of the same event-channel `Sender`; the catch-all teardown signal is "receiver drops, next `send` errors, thread returns."
+
+### Across the shutdown paths
+
+| Path | SSH master | Local tmux windows | Remote `agent-mux-<id>` | Threads |
+| --- | --- | --- | --- | --- |
+| `q` / Ctrl-C | `ssh -O exit` if poller-thread Arc drops in time; else ControlPersist (10 min) | Self-close when ssh exits | **Survive** (intentional) | Killed on process exit |
+| Background-thread panic | Other hosts unaffected (Arcs not shared across hosts); panicking host's Arc drops on unwind, Drop fires | Unaffected | **Survive** (intentional) | Other threads continue |
+| SIGKILL / power loss | ControlPersist (10 min) | Survive (no parent to die), ssh master eventually times out and the window's ssh exits | **Survive** (intentional) | Killed |
+
+### Load-bearing properties
+
+- **ControlPersist=600 is not optional.** A polling thread holding an `Arc<SshHost>` may be mid-`thread::sleep` at process exit, in which case the runtime kills it before the last Arc reference drops and `SshHost::Drop` therefore never runs. The remote master would then linger forever without the timeout. The connect-time test pins `ControlPersist=600` for this reason.
+- **PID-namespaced socket paths.** Two concurrent agent-mux processes must not collide on a control socket. They also must not be able to "steal" each other's master. PID-in-path achieves both.
+- **The remote `agent-mux-<id>` lifecycle is the user's concern.** Cleaning them up automatically would break the idempotent-resume contract. They are explicitly excluded from any future shutdown sweep.
+
+### Known intentional leaks
+
+- **Stale socket files on disk.** When a previous agent-mux process is killed mid-sleep, its `agent-mux-ssh-<host>-<pid>.sock` file may persist in `$TMPDIR` even after the remote master has timed out. Harmless (a fresh PID gets a fresh path) but it accumulates until `$TMPDIR` is cleaned. A pre-`connect` sweep of stale sockets is filed in TODO.
+- **Disk-cache files for removed hosts.** `~/.cache/agent-mux/sessions/<host>.json` is never deleted when the user removes `[hosts.<host>]` from config. Harmless (we only load cache for hosts in current config) but leaks bytes. Filed in TODO.
+
 ## Open questions
 
 Decisions deferred. Each with a brief reason for the deferral.

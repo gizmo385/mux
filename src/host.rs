@@ -186,6 +186,10 @@ impl SshHost {
         // ControlPersist=600 = if our Drop guard never fires (SIGKILL,
         // panic during unwind), the remote-side master self-terminates
         // after ten minutes of idleness rather than lingering forever.
+        // ConnectTimeout=5 caps a wedged-host connect at 5s so a single
+        // unreachable host can't stall the dashboard's startup discovery
+        // (which we run in parallel threads, but each thread still needs
+        // a bounded worst case).
         let status = Command::new(&ssh_binary)
             .arg("-fN")
             .arg("-M")
@@ -193,6 +197,8 @@ impl SshHost {
             .arg(&control_path)
             .arg("-o")
             .arg("ControlPersist=600")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
             .arg(&ssh_target)
             .status()?;
         if !status.success() {

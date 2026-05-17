@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,11 +22,11 @@ use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, Tmu
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
-use agent_mux::host::{Host, LocalHost};
+use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::repo::{Repo, RepoRegistry};
-use agent_mux::session::{Attention, Session};
-use agent_mux::watcher::{TranscriptWatcher, WatcherEvent};
+use agent_mux::session::{Attention, HostId, Session};
+use agent_mux::watcher::{TranscriptWatcher, WatcherEvent, derive_attention};
 use agent_mux::worktree::WorktreeManager;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -99,11 +100,11 @@ struct App {
     catalog: SessionCatalog,
     list_state: ListState,
     home: Option<PathBuf>,
-    /// Local Host backend, also handed to the watcher for tail reads.
-    /// Held as `Arc<dyn Host>` so adding remote hosts in the next chunk
-    /// is a matter of plumbing additional entries, not changing the shape
-    /// of this field.
-    local_host: Arc<dyn Host>,
+    /// All known Host backends keyed by `HostId`. Populated synchronously
+    /// with `LocalHost` at startup; remote `SshHost`s land here as their
+    /// background connect threads succeed. Lifetime-extends each `SshHost`
+    /// so its `Drop` (which runs `ssh -O exit`) fires on app teardown.
+    hosts: HashMap<HostId, Arc<dyn Host>>,
     watcher: TranscriptWatcher,
     updates: Receiver<WatcherEvent>,
     driver: TmuxDriver,
@@ -114,6 +115,15 @@ struct App {
     create_tx: Sender<NewSessionResult>,
     create_rx: Receiver<NewSessionResult>,
     creating: Option<CreatingSession>,
+    /// Background SSH discovery results stream in here for the lifetime of
+    /// the app — one message per configured host (success or failure).
+    /// Drained each tick; once every configured host has reported, the
+    /// channel goes quiet but stays open in case future chunks reconnect.
+    remote_rx: Receiver<RemoteDiscoveryResult>,
+    /// How many configured SSH hosts have not yet reported. Used by the
+    /// footer to show "connecting to N host(s)…" while at least one is
+    /// outstanding.
+    pending_hosts: usize,
     /// Captured at startup: `$TMUX` set means we attach via `tmux
     /// switch-client` (no parent/child relationship to break), so the return
     /// hint differs from the outside-tmux case where we suspend and run
@@ -132,6 +142,24 @@ struct CreatingSession {
 enum NewSessionResult {
     Created(PathBuf),
     Failed(String),
+}
+
+/// Payload from a background SSH-discovery thread. `Ready` carries the
+/// connected `SshHost` (wrapped in `Arc` for trait-object insertion into
+/// `App.hosts`) and the sessions found on it, each with its initial
+/// attention already computed against the remote transcript tail.
+/// `Failed` carries the host's dashboard label and a one-line error so
+/// the footer can show why a host is missing from the catalog.
+enum RemoteDiscoveryResult {
+    Ready {
+        host_id: HostId,
+        host: Arc<dyn Host>,
+        sessions: Vec<Session>,
+    },
+    Failed {
+        host_id: HostId,
+        error: String,
+    },
 }
 
 impl App {
@@ -163,11 +191,32 @@ impl App {
         let registry = RepoRegistry::from_config(&config);
         let (create_tx, create_rx) = channel();
 
+        let mut hosts: HashMap<HostId, Arc<dyn Host>> = HashMap::new();
+        hosts.insert(local_host.id().clone(), Arc::clone(&local_host));
+
+        let (remote_tx, remote_rx) = channel();
+        let pending_hosts = config.hosts.len();
+        for (name, host_config) in &config.hosts {
+            let host_id = HostId(name.clone());
+            let ssh_target = host_config.ssh.clone();
+            let transcript_root = host_config.transcript_root.clone();
+            let tx = remote_tx.clone();
+            std::thread::spawn(move || {
+                let result = connect_and_discover(host_id.clone(), ssh_target, &transcript_root);
+                let _ = tx.send(result);
+            });
+        }
+        // The original Sender is held by App so the channel stays open
+        // for the lifetime of the dashboard; per-thread clones drop as
+        // each background thread finishes.
+        drop(remote_tx);
+        let remote_rx_outer = remote_rx;
+
         Ok(Self {
             catalog,
             list_state,
             home: dirs::home_dir(),
-            local_host,
+            hosts,
             watcher,
             updates,
             driver: TmuxDriver::new(),
@@ -178,8 +227,35 @@ impl App {
             create_tx,
             create_rx,
             creating: None,
+            remote_rx: remote_rx_outer,
+            pending_hosts,
             in_tmux: std::env::var_os("TMUX").is_some(),
         })
+    }
+
+    fn drain_remote_discoveries(&mut self) {
+        while let Ok(result) = self.remote_rx.try_recv() {
+            self.pending_hosts = self.pending_hosts.saturating_sub(1);
+            match result {
+                RemoteDiscoveryResult::Ready {
+                    host_id,
+                    host,
+                    sessions,
+                } => {
+                    self.hosts.insert(host_id, host);
+                    let first_insert = self.catalog.is_empty();
+                    for session in sessions {
+                        self.catalog.add(session);
+                    }
+                    if first_insert && !self.catalog.is_empty() {
+                        self.list_state.select(Some(0));
+                    }
+                }
+                RemoteDiscoveryResult::Failed { host_id, error } => {
+                    self.status = Some(format!("connect {host_id}: {error}"));
+                }
+            }
+        }
     }
 
     fn open_new_session(&mut self) {
@@ -287,7 +363,12 @@ impl App {
         let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
             return;
         };
-        let Ok(Some(session)) = build_session(self.local_host.as_ref(), path, mtime) else {
+        // NewTranscript only fires for the local recursive watch, so
+        // the local Host is the right backend to interpret the file.
+        let Some(local_host) = self.hosts.get(&HostId::local()) else {
+            return;
+        };
+        let Ok(Some(session)) = build_session(local_host.as_ref(), path, mtime) else {
             return;
         };
         let id = session.id.clone();
@@ -376,6 +457,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         terminal.draw(|frame| draw(frame, app))?;
         let has_event = event::poll(TICK)?;
         app.drain_updates();
+        app.drain_remote_discoveries();
         if let Some(cmd) = app.drain_creates()
             && let Some(err) = suspend_and_run(terminal, &cmd)?
         {
@@ -417,6 +499,52 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 app.status = Some(err);
             }
         }
+    }
+}
+
+/// Off-thread: open a `ControlMaster` to `ssh_target`, run discovery
+/// against `transcript_root`, and pre-compute initial attention per
+/// session against the same connection. Returns a payload the main
+/// thread can apply directly to the catalog. Done off the UI thread so
+/// the dashboard appears immediately on local sessions while remote
+/// hosts (which can take seconds to handshake) stream in as they're
+/// ready — the "session switching never blocks on I/O" discipline
+/// applies to startup latency too.
+fn connect_and_discover(
+    host_id: HostId,
+    ssh_target: String,
+    transcript_root: &Path,
+) -> RemoteDiscoveryResult {
+    let ssh = match SshHost::connect(host_id.clone(), ssh_target) {
+        Ok(h) => h,
+        Err(e) => {
+            return RemoteDiscoveryResult::Failed {
+                host_id,
+                error: e.to_string(),
+            };
+        }
+    };
+    let host: Arc<dyn Host> = Arc::new(ssh);
+    let mut sessions = match discover(host.as_ref(), transcript_root) {
+        Ok(s) => s,
+        Err(e) => {
+            return RemoteDiscoveryResult::Failed {
+                host_id,
+                error: format!("discovery: {e}"),
+            };
+        }
+    };
+    // Pre-compute attention on the discovery thread so the row shows
+    // real state on first render. The watcher does not yet poll remote
+    // transcripts (next M2 chunk), so without this every remote session
+    // would sit at `Unknown` indefinitely.
+    for session in &mut sessions {
+        session.attention = derive_attention(host.as_ref(), &session.transcript_path);
+    }
+    RemoteDiscoveryResult::Ready {
+        host_id,
+        host,
+        sessions,
     }
 }
 
@@ -473,6 +601,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.status.as_deref(),
         app.catalog.is_empty(),
         app.in_tmux,
+        app.pending_hosts,
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -487,13 +616,16 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
 /// Pure footer composition so the keybind/return hint logic is unit-testable
 /// without standing up a ratatui frame. Precedence: in-flight create > status
-/// message > empty catalog > keybind line. The return hint is mode-aware
-/// because attach takes two different code paths (see `App.in_tmux`).
+/// message > empty catalog > keybind line. The keybind line gets a
+/// trailing "· connecting to N host(s)…" suffix while remote SSH
+/// discovery is still pending. The return hint is mode-aware because
+/// attach takes two different code paths (see `App.in_tmux`).
 fn compose_footer(
     creating: Option<&CreatingSession>,
     status: Option<&str>,
     catalog_empty: bool,
     in_tmux: bool,
+    pending_hosts: usize,
 ) -> String {
     if let Some(c) = creating {
         return format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name);
@@ -502,11 +634,19 @@ fn compose_footer(
         return format!(" {s} ");
     }
     if catalog_empty {
+        if pending_hosts > 0 {
+            return format!(" connecting to {pending_hosts} host(s)… · n: new · q: quit ");
+        }
         return " no sessions discovered · n: new · q: quit ".to_string();
     }
     let return_hint = if in_tmux { "prefix+s" } else { "prefix+d" };
+    let suffix = if pending_hosts > 0 {
+        format!("  ·  connecting to {pending_hosts} host(s)…")
+    } else {
+        String::new()
+    };
     format!(
-        " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit  ·  return: {return_hint} "
+        " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit  ·  return: {return_hint}{suffix} "
     )
 }
 
@@ -581,28 +721,28 @@ mod tests {
 
     #[test]
     fn footer_keybind_line_shows_in_tmux_return_hint() {
-        let s = compose_footer(None, None, false, true);
+        let s = compose_footer(None, None, false, true, 0);
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(!s.contains("prefix+d"), "got: {s}");
     }
 
     #[test]
     fn footer_keybind_line_shows_outside_tmux_return_hint() {
-        let s = compose_footer(None, None, false, false);
+        let s = compose_footer(None, None, false, false, 0);
         assert!(s.contains("return: prefix+d"), "got: {s}");
         assert!(!s.contains("prefix+s"), "got: {s}");
     }
 
     #[test]
     fn footer_empty_catalog_omits_return_hint() {
-        let s = compose_footer(None, None, true, true);
+        let s = compose_footer(None, None, true, true, 0);
         assert!(!s.contains("return:"), "got: {s}");
         assert!(s.contains("no sessions"), "got: {s}");
     }
 
     #[test]
     fn footer_status_takes_precedence_over_keybinds() {
-        let s = compose_footer(None, Some("attach: boom"), false, true);
+        let s = compose_footer(None, Some("attach: boom"), false, true, 0);
         assert!(s.contains("attach: boom"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
     }
@@ -613,9 +753,32 @@ mod tests {
             repo_name: "agent-mux".into(),
             task: "refactor".into(),
         };
-        let s = compose_footer(Some(&creating), Some("ignored"), false, true);
+        let s = compose_footer(Some(&creating), Some("ignored"), false, true, 0);
         assert!(s.contains("creating worktree"), "got: {s}");
         assert!(s.contains("agent-mux"), "got: {s}");
         assert!(!s.contains("ignored"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_keybind_line_appends_connecting_suffix_when_hosts_pending() {
+        let s = compose_footer(None, None, false, true, 2);
+        assert!(s.contains("return: prefix+s"), "got: {s}");
+        assert!(s.contains("connecting to 2 host(s)"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_empty_catalog_swaps_no_sessions_for_connecting_when_hosts_pending() {
+        // First impression matters: when the catalog is empty *and*
+        // remote discovery is still in flight, "no sessions discovered"
+        // would mis-imply we're done.
+        let s = compose_footer(None, None, true, true, 1);
+        assert!(s.contains("connecting to 1 host(s)"), "got: {s}");
+        assert!(!s.contains("no sessions"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_connecting_suffix_disappears_once_all_hosts_have_reported() {
+        let s = compose_footer(None, None, false, true, 0);
+        assert!(!s.contains("connecting to"), "got: {s}");
     }
 }

@@ -72,7 +72,9 @@ pub fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
     if !project_dir.is_dir() {
         return Ok(None);
     }
-    let title = task_toml_title(&project_dir).or(transcript_meta.ai_title);
+    let title = task_toml_title(&project_dir)
+        .or(transcript_meta.ai_title)
+        .or(transcript_meta.first_user_message);
     Ok(Some(Session {
         id,
         host: Host::Local,
@@ -88,11 +90,24 @@ pub fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
 struct TranscriptMeta {
     cwd: Option<PathBuf>,
     ai_title: Option<String>,
+    /// Normalized + truncated text of the first non-empty user-authored
+    /// message in the transcript. Used as a title fallback for sessions
+    /// where `ai-title` hasn't surfaced yet and no `task.toml` exists —
+    /// better than just the directory name when several sessions share
+    /// a cwd.
+    first_user_message: Option<String>,
 }
 
-/// Single-pass scan: take cwd from the first line that has one, and
-/// ai-title from the *last* `{"type":"ai-title",...}` entry (titles get
-/// refined as the session grows). Malformed JSON lines are skipped.
+/// Max display length (in chars, not bytes) for the first-user-message
+/// title fallback. Long enough to be useful on a 100-col terminal next
+/// to the dimmed cwd/host/age trailing spans; short enough that a
+/// rambling first message doesn't dominate the row.
+const FIRST_USER_MSG_MAX_CHARS: usize = 60;
+
+/// Single-pass scan: take cwd from the first line that has one,
+/// ai-title from the *last* `{"type":"ai-title",...}` entry (titles
+/// refine as the session grows), and the first non-empty user message
+/// for the title-fallback path. Malformed JSON lines are skipped.
 fn read_transcript_meta(transcript_path: &Path) -> io::Result<TranscriptMeta> {
     let file = File::open(transcript_path)?;
     let reader = BufReader::new(file);
@@ -112,8 +127,64 @@ fn read_transcript_meta(transcript_path: &Path) -> io::Result<TranscriptMeta> {
         {
             meta.ai_title = Some(title.to_string());
         }
+        if meta.first_user_message.is_none()
+            && value.get("type").and_then(serde_json::Value::as_str) == Some("user")
+            && value.get("toolUseResult").is_none()
+            && let Some(text) = extract_user_text(&value)
+            && !text.trim().is_empty()
+        {
+            meta.first_user_message = Some(normalize_for_title(&text));
+        }
     }
     Ok(meta)
+}
+
+/// Pull the human-authored text out of a `{"type":"user", ...}` entry.
+/// Accepts the three shapes seen in practice: `message` as a plain
+/// string, `message.content` as a string, or `message.content` as an
+/// array of `{"type":"text", "text":"..."}` blocks (with non-text
+/// blocks silently skipped). Returns `None` for shapes we don't
+/// recognise rather than guessing.
+fn extract_user_text(entry: &serde_json::Value) -> Option<String> {
+    let message = entry.get("message")?;
+    if let Some(s) = message.as_str() {
+        return Some(s.to_string());
+    }
+    let content = message.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        let mut buf = String::new();
+        for block in arr {
+            if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                && let Some(text) = block.get("text").and_then(serde_json::Value::as_str)
+            {
+                if !buf.is_empty() {
+                    buf.push(' ');
+                }
+                buf.push_str(text);
+            }
+        }
+        if !buf.is_empty() {
+            return Some(buf);
+        }
+    }
+    None
+}
+
+/// Collapse all-whitespace runs to a single space, trim, and truncate
+/// to `FIRST_USER_MSG_MAX_CHARS` chars (not bytes) with an ellipsis
+/// suffix when shortened. The list row renders on a single line, so a
+/// multi-line first message has to be flattened before it lands there.
+fn normalize_for_title(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut iter = collapsed.chars();
+    let mut taken: String = iter.by_ref().take(FIRST_USER_MSG_MAX_CHARS).collect();
+    if iter.next().is_some() {
+        taken.push('…');
+    }
+    taken
 }
 
 fn task_toml_title(project_dir: &Path) -> Option<String> {
@@ -314,5 +385,160 @@ mod tests {
         let sessions = discover_local(&projects).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id.0, "real");
+    }
+
+    #[test]
+    fn first_user_message_is_used_when_no_ai_title() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"refactor the parser\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("refactor the parser"));
+    }
+
+    #[test]
+    fn ai_title_takes_precedence_over_first_user_message() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n\
+                 {{\"type\":\"ai-title\",\"aiTitle\":\"Wire the parser\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("Wire the parser"));
+    }
+
+    #[test]
+    fn first_user_message_extracts_from_content_string_shape() {
+        // The schema Claude Code writes in practice: message is an object
+        // with role + content, content is a plain string.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"do the thing\"}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn first_user_message_extracts_from_content_block_array() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}},{{\"type\":\"text\",\"text\":\"world\"}}]}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn first_user_message_is_truncated_with_ellipsis() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        let long: String = "a".repeat(200);
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"{long}\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        let title = sessions[0].title.as_deref().unwrap();
+        assert!(title.ends_with('…'), "got: {title}");
+        assert_eq!(title.chars().count(), FIRST_USER_MSG_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn first_user_message_collapses_whitespace() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"line one\\n\\nline two\\t\\ttabbed\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(
+            sessions[0].title.as_deref(),
+            Some("line one line two tabbed")
+        );
+    }
+
+    #[test]
+    fn tool_result_user_entries_do_not_count_as_first_user_message() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"toolUseResult\":{{\"stdout\":\"ok\"}}}}\n\
+                 {{\"type\":\"user\",\"message\":\"the real first prompt\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("the real first prompt"));
+    }
+
+    #[test]
+    fn empty_user_message_is_skipped() {
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"   \"}}\n\
+                 {{\"type\":\"user\",\"message\":\"second message\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("second message"));
     }
 }

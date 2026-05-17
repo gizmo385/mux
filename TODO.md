@@ -16,7 +16,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 - add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (post-M4 discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#m1 #worktree`
 - add a positive-path test for `worktree::resolve_default_base_branch` that exercises the `origin/HEAD` resolver (requires a bare-remote fixture in the test). Current coverage only hits the `main`/`master` fallback and the empty-result negative case. `#m1 #test`
 - larger move on return-to-dashboard discoverability: in inside-tmux mode, name the agent-mux window predictably (e.g. `agent-mux`) so the hint can become "switch-client -t agent-mux" instead of the generic "prefix+s" picker. Deferred — the footer hint shipped first to see whether it's enough in dogfooding before introducing a window-naming convention. `#m1 #ui #attachment`
-- title fallback (3): use first user message, truncated, when neither `task.toml` nor `ai-title` is present. Rare in practice — a session with no ai-title typically also has no messages — so deferred until dogfooding shows it bites. `#m1 #ui #discovery`
 
 ### M2 — Remote hosts
 

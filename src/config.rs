@@ -95,7 +95,9 @@ impl Config {
             if host.ssh.trim().is_empty() {
                 return Err(ConfigError::EmptySshTarget(name.clone()));
             }
-            host.transcript_root = expand(&host.transcript_root);
+            // No tilde expansion here: a remote host's `~/.claude/projects`
+            // means the *remote* user's home, not ours. `SshHost` passes
+            // the tilde through to the remote shell via `shell_quote_path`.
         }
         Ok(cfg)
     }
@@ -227,8 +229,9 @@ ssh = "devbox"
         let cfg = Config::load_from(&path).expect("parse");
         let host = cfg.hosts.get("devbox").expect("devbox host");
         assert_eq!(host.ssh, "devbox");
-        let home = dirs::home_dir().expect("home");
-        assert_eq!(host.transcript_root, home.join(".claude/projects"));
+        // Default is `~/.claude/projects`, kept as-is — the tilde must
+        // resolve against the *remote* user's home, not ours.
+        assert_eq!(host.transcript_root, PathBuf::from("~/.claude/projects"));
     }
 
     #[test]
@@ -251,7 +254,11 @@ transcript_root = "/srv/claude/projects"
     }
 
     #[test]
-    fn load_from_expands_tilde_in_transcript_root() {
+    fn load_from_leaves_tilde_unexpanded_in_remote_transcript_root() {
+        // Regression: tilde in a remote-host `transcript_root` must
+        // resolve against the *remote* home, not the local user's. The
+        // config layer keeps it as a literal `~/…`; SshHost passes it
+        // through to the remote shell intact.
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("config.toml");
         fs::write(
@@ -265,8 +272,7 @@ transcript_root = "~/scratch/claude"
         .expect("write");
         let cfg = Config::load_from(&path).expect("parse");
         let host = cfg.hosts.get("devbox").expect("devbox host");
-        let home = dirs::home_dir().expect("home");
-        assert_eq!(host.transcript_root, home.join("scratch/claude"));
+        assert_eq!(host.transcript_root, PathBuf::from("~/scratch/claude"));
     }
 
     #[test]

@@ -265,7 +265,7 @@ impl Host for SshHost {
         // GNU extension; macOS hosts need `findutils` from Homebrew. We
         // assume Linux remotes for now — a portability item is filed in
         // TODO if a macOS remote ever surfaces.
-        let quoted = shell_single_quote(&root.to_string_lossy());
+        let quoted = shell_quote_path(&root.to_string_lossy());
         let cmd = format!(
             "if [ -d {quoted} ]; then \
                 find {quoted} -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
@@ -277,19 +277,19 @@ impl Host for SshHost {
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        let quoted = shell_single_quote(&path.to_string_lossy());
+        let quoted = shell_quote_path(&path.to_string_lossy());
         let stdout = self.run(&format!("cat {quoted}"))?;
         String::from_utf8(stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn read_tail(&self, path: &Path, n_bytes: u64) -> io::Result<String> {
-        let quoted = shell_single_quote(&path.to_string_lossy());
+        let quoted = shell_quote_path(&path.to_string_lossy());
         let stdout = self.run(&format!("tail -c {n_bytes} {quoted}"))?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
     fn is_dir(&self, path: &Path) -> bool {
-        let quoted = shell_single_quote(&path.to_string_lossy());
+        let quoted = shell_quote_path(&path.to_string_lossy());
         let status = self
             .ssh_command()
             .arg(format!("test -d {quoted}"))
@@ -299,6 +299,25 @@ impl Host for SshHost {
             .status();
         matches!(status, Ok(s) if s.success())
     }
+}
+
+/// Shell-quote a path for inclusion in a remote command, preserving
+/// tilde expansion. POSIX shells expand a *leading* `~` only when it
+/// is unquoted; once we wrap it in single quotes, `'~/foo'` becomes a
+/// literal path with a tilde character. For remote-host paths
+/// (`transcript_root` defaults to `~/.claude/projects`, meaning the
+/// remote user's home), we want the remote shell to do the expansion.
+/// Strategy: leave a leading `~/` (or bare `~`) unquoted; single-quote
+/// the rest. Paths without a leading tilde fall through to the
+/// standard single-quote escape.
+fn shell_quote_path(s: &str) -> String {
+    if s == "~" {
+        return "~".to_string();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return format!("~/{}", shell_single_quote(rest));
+    }
+    shell_single_quote(s)
 }
 
 /// POSIX single-quote escape: wrap in `'…'`, splitting on any embedded
@@ -507,6 +526,41 @@ mod tests {
     fn shell_single_quote_escapes_embedded_single_quote() {
         // The POSIX idiom: close-quote, backslash-quote, re-open.
         assert_eq!(super::shell_single_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_quote_path_leaves_tilde_unquoted_so_remote_shell_expands_it() {
+        // The bug this guards against: wrapping `~/.claude/projects` in
+        // single quotes makes the remote shell read it as a literal
+        // tilde character, and `test -d '~/.claude/projects'` fails.
+        // Strategy: leading `~/` stays outside the quotes; the rest is
+        // single-quoted so embedded oddities still escape safely.
+        assert_eq!(
+            super::shell_quote_path("~/.claude/projects"),
+            "~/'.claude/projects'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_path_handles_bare_tilde() {
+        assert_eq!(super::shell_quote_path("~"), "~");
+    }
+
+    #[test]
+    fn shell_quote_path_falls_through_for_absolute_paths() {
+        assert_eq!(
+            super::shell_quote_path("/services/attic"),
+            "'/services/attic'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_path_only_treats_leading_tilde_specially() {
+        // `~user` (no slash) and an embedded tilde are not tilde-prefix
+        // expansion — they should be fully single-quoted so they reach
+        // the remote shell as literal characters.
+        assert_eq!(super::shell_quote_path("~chris/x"), "'~chris/x'");
+        assert_eq!(super::shell_quote_path("/tmp/~"), "'/tmp/~'");
     }
 
     #[test]

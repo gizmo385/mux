@@ -28,8 +28,7 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M3 — Inline preview
 
-- implement transcript renderer: parse Claude Code JSONL entries (user/assistant/tool_use/tool_result) into compact display lines `#m3 #preview`
-- add per-row preview pane to Dashboard (last N entries, default configurable later) `#m3 #ui`
+- add preview pane to Dashboard (toggleable side pane showing last N parsed entries for the selected session; renderer already in `src/preview.rs`) `#m3 #ui`
 - record observations: does seeing inline preview change which sessions the user attaches to? Does the user want richer chat? This is the Shape B pivot decision input. `#m3 #dogfood`
 
 ### M4 — Attention notifications

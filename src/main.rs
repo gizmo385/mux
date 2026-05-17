@@ -19,11 +19,11 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
-use agent_mux::discovery::{claude_projects_dir, discover_local};
+use agent_mux::discovery::{build_session, claude_projects_dir, discover_local};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::repo::{Repo, RepoRegistry};
 use agent_mux::session::{Attention, Host, Session};
-use agent_mux::watcher::{AttentionUpdate, TranscriptWatcher};
+use agent_mux::watcher::{TranscriptWatcher, WatcherEvent};
 use agent_mux::worktree::WorktreeManager;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -97,8 +97,8 @@ struct App {
     catalog: SessionCatalog,
     list_state: ListState,
     home: Option<PathBuf>,
-    _watcher: TranscriptWatcher,
-    updates: Receiver<AttentionUpdate>,
+    watcher: TranscriptWatcher,
+    updates: Receiver<WatcherEvent>,
     driver: TmuxDriver,
     status: Option<String>,
     config: Config,
@@ -129,9 +129,10 @@ enum NewSessionResult {
 
 impl App {
     fn new() -> io::Result<Self> {
+        let projects_root = claude_projects_dir();
         let mut catalog = SessionCatalog::new();
-        if let Some(root) = claude_projects_dir()
-            && let Ok(sessions) = discover_local(&root)
+        if let Some(root) = projects_root.as_ref()
+            && let Ok(sessions) = discover_local(root)
         {
             catalog.replace_all(sessions);
         }
@@ -141,7 +142,8 @@ impl App {
             .iter()
             .map(|s| (s.id.clone(), s.transcript_path.clone()))
             .collect();
-        let (watcher, updates) = TranscriptWatcher::start(targets).map_err(io::Error::other)?;
+        let (watcher, updates) = TranscriptWatcher::start(targets, projects_root.as_deref())
+            .map_err(io::Error::other)?;
 
         let mut list_state = ListState::default();
         if !catalog.is_empty() {
@@ -156,7 +158,7 @@ impl App {
             catalog,
             list_state,
             home: dirs::home_dir(),
-            _watcher: watcher,
+            watcher,
             updates,
             driver: TmuxDriver::new(),
             status: None,
@@ -251,8 +253,36 @@ impl App {
     }
 
     fn drain_updates(&mut self) {
-        while let Ok(update) = self.updates.try_recv() {
-            self.catalog.update_attention(&update.id, update.attention);
+        while let Ok(event) = self.updates.try_recv() {
+            match event {
+                WatcherEvent::Attention(update) => {
+                    self.catalog.update_attention(&update.id, update.attention);
+                }
+                WatcherEvent::NewTranscript(path) => self.handle_new_transcript(&path),
+            }
+        }
+    }
+
+    /// React to a watcher-emitted "previously-unknown transcript appeared"
+    /// event. The file may be only partially written on the first event,
+    /// in which case `build_session` returns `Ok(None)` (no usable cwd
+    /// yet) and we silently drop it — the next Modify event re-fires
+    /// `NewTranscript` and we retry until the file has enough content to
+    /// build a session from.
+    fn handle_new_transcript(&mut self, path: &Path) {
+        let Ok(Some(session)) = build_session(path) else {
+            return;
+        };
+        let id = session.id.clone();
+        let transcript_path = session.transcript_path.clone();
+        if !self.catalog.add(session) {
+            return;
+        }
+        if self.list_state.selected().is_none() {
+            self.list_state.select(Some(0));
+        }
+        if let Err(e) = self.watcher.add_target(id, transcript_path) {
+            self.status = Some(format!("watch new transcript: {e}"));
         }
     }
 

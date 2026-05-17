@@ -42,7 +42,16 @@ pub fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
     Ok(sessions)
 }
 
-fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
+/// Build a `Session` from a single transcript path. Reused by the
+/// transcript watcher's discovery flow when a new `.jsonl` appears
+/// mid-run, so both startup discovery and live discovery produce
+/// identically-shaped sessions.
+///
+/// # Errors
+/// Returns `io::Error` if metadata or the transcript itself cannot be
+/// read. Returns `Ok(None)` when the path has no usable file stem (i.e.
+/// no derivable session id).
+pub fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
     let id = match transcript_path.file_stem().and_then(|s| s.to_str()) {
         Some(s) => SessionId(s.to_string()),
         None => return Ok(None),

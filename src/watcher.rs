@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -20,63 +21,151 @@ pub struct AttentionUpdate {
     pub attention: Attention,
 }
 
+/// Events emitted by the watcher. `Attention` flows from filesystem events
+/// against transcripts already registered with the watcher. `NewTranscript`
+/// flows when a previously-unknown `.jsonl` appears under the discovery
+/// root, so the dashboard can pull it into the catalog without a restart.
+#[derive(Debug)]
+pub enum WatcherEvent {
+    Attention(AttentionUpdate),
+    NewTranscript(PathBuf),
+}
+
 pub struct TranscriptWatcher {
-    _watcher: notify::RecommendedWatcher,
+    /// Kept alive for the lifetime of the dashboard; dropping it tears
+    /// the notify backend down. We also call `.watch` on it from
+    /// `add_target` in the no-recursive-root fallback path.
+    watcher: notify::RecommendedWatcher,
+    targets: Arc<Mutex<HashMap<PathBuf, SessionId>>>,
+    event_tx: Sender<WatcherEvent>,
+    /// True when a recursive watch on the projects root is active. When
+    /// false, `add_target` falls back to per-file watches so the watcher
+    /// still works in the degenerate no-discovery-root case.
+    has_recursive_root: bool,
 }
 
 impl TranscriptWatcher {
-    /// Start watching `sessions` for filesystem events and derive attention
-    /// state in a background thread. Emits an initial `AttentionUpdate` for
-    /// each session synchronously before the watcher thread starts, so the
-    /// UI never has to display `Unknown` for a session that has on-disk
-    /// content.
+    /// Start watching for transcript events.
+    ///
+    /// When `discovery_root` is `Some` and watchable, a single recursive
+    /// watch covers every transcript under it — both attention updates
+    /// for known files and discovery of new ones. When it is `None`, or
+    /// the recursive watch fails (e.g. the dir is on a filesystem that
+    /// can't be recursively watched), the watcher falls back to per-file
+    /// watches for the `initial` set and `NewTranscript` events will not
+    /// fire.
+    ///
+    /// Emits an initial `Attention` update for each session in `initial`
+    /// synchronously before the watcher thread starts, so the UI never
+    /// has to display `Unknown` for a session that has on-disk content.
     ///
     /// # Errors
-    /// Returns `notify::Error` if the platform watcher cannot be created or
-    /// any of the transcript paths cannot be watched.
+    /// Returns `notify::Error` if the platform watcher cannot be created
+    /// or, in the per-file fallback, if any of the initial paths cannot
+    /// be watched.
     pub fn start(
-        sessions: Vec<(SessionId, PathBuf)>,
-    ) -> notify::Result<(Self, Receiver<AttentionUpdate>)> {
-        let (update_tx, update_rx) = mpsc::channel::<AttentionUpdate>();
+        initial: Vec<(SessionId, PathBuf)>,
+        discovery_root: Option<&Path>,
+    ) -> notify::Result<(Self, Receiver<WatcherEvent>)> {
+        let (event_tx, event_rx) = mpsc::channel::<WatcherEvent>();
         let (notify_tx, notify_rx) = mpsc::channel();
 
         let mut watcher = notify::recommended_watcher(notify_tx)?;
-        for (_, path) in &sessions {
-            watcher.watch(path, RecursiveMode::NonRecursive)?;
+
+        let has_recursive_root = match discovery_root {
+            Some(root) => {
+                // Ensure the dir exists so the watch attaches on first-run
+                // (claude code would create it on its own eventually, but
+                // we'd miss the discovery window).
+                let _ = fs::create_dir_all(root);
+                watcher.watch(root, RecursiveMode::Recursive).is_ok()
+            }
+            None => false,
+        };
+
+        if !has_recursive_root {
+            for (_, path) in &initial {
+                watcher.watch(path, RecursiveMode::NonRecursive)?;
+            }
         }
 
         // Prime initial state so the UI shows real attention from frame one.
-        for (id, path) in &sessions {
-            let _ = update_tx.send(AttentionUpdate {
+        for (id, path) in &initial {
+            let _ = event_tx.send(WatcherEvent::Attention(AttentionUpdate {
                 id: id.clone(),
                 attention: derive_attention(path),
-            });
+            }));
         }
 
-        let id_by_path: HashMap<PathBuf, SessionId> =
-            sessions.into_iter().map(|(id, p)| (p, id)).collect();
+        let targets: Arc<Mutex<HashMap<PathBuf, SessionId>>> = Arc::new(Mutex::new(
+            initial.into_iter().map(|(id, p)| (p, id)).collect(),
+        ));
 
+        let targets_for_thread = Arc::clone(&targets);
+        let event_tx_for_thread = event_tx.clone();
         thread::spawn(move || {
             for res in notify_rx {
                 let Ok(event) = res else { continue };
-                if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                let is_create = matches!(event.kind, EventKind::Create(_));
+                let is_modify = matches!(event.kind, EventKind::Modify(_));
+                if !is_create && !is_modify {
                     continue;
                 }
-                for path in &event.paths {
-                    if let Some(id) = id_by_path.get(path) {
-                        let update = AttentionUpdate {
-                            id: id.clone(),
-                            attention: derive_attention(path),
-                        };
-                        if update_tx.send(update).is_err() {
-                            return;
-                        }
+                for path in event.paths {
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let known_id = targets_for_thread
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&path).cloned());
+                    let outgoing = match known_id {
+                        Some(id) => WatcherEvent::Attention(AttentionUpdate {
+                            id,
+                            attention: derive_attention(&path),
+                        }),
+                        None => WatcherEvent::NewTranscript(path),
+                    };
+                    if event_tx_for_thread.send(outgoing).is_err() {
+                        return;
                     }
                 }
             }
         });
 
-        Ok((Self { _watcher: watcher }, update_rx))
+        Ok((
+            Self {
+                watcher,
+                targets,
+                event_tx,
+                has_recursive_root,
+            },
+            event_rx,
+        ))
+    }
+
+    /// Register a newly-discovered transcript so future filesystem events
+    /// against it become `Attention` updates rather than further
+    /// `NewTranscript` emissions. Also emits an immediate initial
+    /// `Attention` update so the dashboard reflects the session's current
+    /// state without waiting for the next file write.
+    ///
+    /// # Errors
+    /// In the no-recursive-root fallback path, returns `notify::Error` if
+    /// the per-file watch cannot be installed. With a recursive root in
+    /// place, this never fails.
+    pub fn add_target(&mut self, id: SessionId, path: PathBuf) -> notify::Result<()> {
+        if !self.has_recursive_root {
+            self.watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        }
+        let attention = derive_attention(&path);
+        if let Ok(mut targets) = self.targets.lock() {
+            targets.insert(path, id.clone());
+        }
+        let _ = self
+            .event_tx
+            .send(WatcherEvent::Attention(AttentionUpdate { id, attention }));
+        Ok(())
     }
 }
 

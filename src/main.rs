@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
+use agent_mux::cli;
 use agent_mux::config::{Config, Theme};
 use agent_mux::dashboard::{
     DisplayRow, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
@@ -65,11 +66,39 @@ const PREVIEW_BYTES: u64 = 64 * 1024;
 const PREVIEW_LIMIT: usize = 20;
 
 fn main() -> io::Result<()> {
+    // `args().skip(1)` drops argv[0] (program path). Anything left is
+    // a subcommand. No subcommand → launch the TUI; that's the
+    // original behaviour and the common case.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut stdout = io::stdout();
+    match argv.first().map(String::as_str) {
+        None => run_tui(),
+        Some("themes") => cli::print_themes(&mut stdout, stdout_is_terminal()),
+        Some("config") => cli::print_config(&mut stdout),
+        Some("help" | "--help" | "-h") => cli::print_help(&mut stdout),
+        Some(other) => {
+            let mut stderr = io::stderr();
+            writeln!(stderr, "agent-mux: unknown subcommand {other:?}\n")?;
+            cli::print_help(&mut stderr)?;
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_tui() -> io::Result<()> {
     let mut app = App::new()?;
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
     result
+}
+
+/// Whether to emit ANSI escapes from non-TUI subcommands. When stdout
+/// is a real terminal we want the colour swatch; piped into a file or
+/// pager that doesn't strip escapes we want plain text.
+fn stdout_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    io::stdout().is_terminal()
 }
 
 fn enter_screen() -> io::Result<()> {

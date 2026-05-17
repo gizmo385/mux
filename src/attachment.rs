@@ -283,6 +283,58 @@ impl TmuxDriver {
     }
 }
 
+/// List the `pane_current_path` of every live tmux pane on `host`.
+/// Returns an empty Vec on any failure — no tmux server, ssh hiccup,
+/// non-zero exit, parse error. The dashboard's pane-presence indicator
+/// is strictly advisory (the attach path's `claude --resume` fallback
+/// covers stale state), so failures must not surface as errors.
+///
+/// Dispatches by host: local invokes `tmux` directly, remote shells
+/// out via `host.ssh_argv(false, ...)` over the existing
+/// `ControlMaster`. Output format is `#{pane_current_path}` one path
+/// per line — narrower than the attach-side query, since the
+/// indicator only needs the cwd, not a target identifier.
+#[must_use]
+pub fn list_live_pane_cwds(host: &dyn Host) -> Vec<PathBuf> {
+    let tmux_args = ["list-panes", "-a", "-F", "#{pane_current_path}"];
+    let output = if host.id().is_local() {
+        Command::new("tmux").args(tmux_args).output()
+    } else {
+        // `#{...}` in -F starts with `#`, which a remote shell treats
+        // as a comment. `Host::ssh_argv` shell-quotes each element so
+        // the `#` survives the remote tokenizer — same fix as the
+        // attach-side `find_pane_remote`.
+        let mut remote_cmd = vec!["tmux"];
+        remote_cmd.extend(tmux_args);
+        let Some(argv) = host.ssh_argv(false, &remote_cmd) else {
+            return Vec::new();
+        };
+        let Some((program, rest)) = argv.split_first() else {
+            return Vec::new();
+        };
+        Command::new(program).args(rest).output()
+    };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_pane_cwds(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure parser: one path per line, blank lines skipped. Trims trailing
+/// newlines but otherwise treats the path as the entire line so cwds
+/// containing whitespace round-trip cleanly.
+#[must_use]
+pub fn parse_pane_cwds(tmux_output: &str) -> Vec<PathBuf> {
+    tmux_output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 fn find_pane_remote(host: &dyn Host, project_dir: &Path) -> Result<String, AttachError> {
     // -F format starts with `#{...}` — `Host::ssh_argv` shell-quotes
     // each remote_cmd element so the leading `#` survives the remote
@@ -579,6 +631,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_pane_cwds_extracts_one_path_per_line() {
+        let out = "/home/u/proj\n/home/u/other\n";
+        assert_eq!(
+            parse_pane_cwds(out),
+            vec![
+                PathBuf::from("/home/u/proj"),
+                PathBuf::from("/home/u/other")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_pane_cwds_skips_blank_lines() {
+        // A stray blank line should not produce a `PathBuf::from("")`
+        // — the indicator would never match an empty project_dir, but
+        // keeping the parser clean avoids surprising debug output.
+        let out = "/a\n\n/b\n";
+        assert_eq!(
+            parse_pane_cwds(out),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    #[test]
+    fn parse_pane_cwds_handles_paths_with_spaces() {
+        // The pane lister uses `#{pane_current_path}` with no separator,
+        // so a single line *is* the whole path. This is why we don't
+        // share parse_pane_match's split_once(' ') logic.
+        let out = "/home/u/path with spaces\n";
+        assert_eq!(
+            parse_pane_cwds(out),
+            vec![PathBuf::from("/home/u/path with spaces")]
+        );
+    }
+
+    #[test]
+    fn parse_pane_cwds_returns_empty_for_empty_input() {
+        // No tmux server / no panes / failed shell-out all collapse to
+        // an empty list. The caller treats this as "no live panes",
+        // which means every session on that host gets `has_live_pane = Some(false)`.
+        assert_eq!(parse_pane_cwds(""), Vec::<PathBuf>::new());
+    }
+
+    #[test]
     fn ssh_argv_for_list_panes_does_not_request_tty() {
         // Capturing list-panes output doesn't need a tty allocation;
         // asking for one wastes bandwidth.
@@ -597,6 +693,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH,
             attention: crate::session::Attention::Unknown,
             title: None,
+            has_live_pane: None,
         }
     }
 }

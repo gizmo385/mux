@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
+use crate::attachment::list_live_pane_cwds;
 use crate::host::Host;
 use crate::session::{Attention, HostId, SessionId};
 
@@ -45,6 +46,18 @@ pub enum WatcherEvent {
         host: HostId,
         path: PathBuf,
         mtime: SystemTime,
+    },
+    /// Snapshot of every live tmux pane's `pane_current_path` on
+    /// `host`, as of the latest pane-poll tick. The catalog uses
+    /// this to decide per-session whether Enter will be a fast
+    /// switch (a pane matches the session's `project_dir`) vs an
+    /// auto-resume (no match — fall through to `claude --resume`).
+    /// An empty `cwds` is a valid value (it means no live panes /
+    /// no tmux server / ssh hiccup) — every session on the host
+    /// transitions to `Some(false)` in that case.
+    LivePanes {
+        host: HostId,
+        cwds: Vec<PathBuf>,
     },
 }
 
@@ -264,6 +277,41 @@ impl TranscriptWatcher {
                 if !poll_once(host.as_ref(), &host_id, &root, &mut known, &tx) {
                     return;
                 }
+            }
+        });
+    }
+
+    /// Spawn a background thread that polls `host` for the set of live
+    /// tmux panes (their `pane_current_path`) at `interval`, and emits
+    /// one [`WatcherEvent::LivePanes`] per tick. Used for both local
+    /// and remote hosts — the local host's pane state isn't observable
+    /// via `notify`, and shelling out tmux every 3s on every keypress
+    /// would violate the "switching never blocks on I/O" discipline.
+    ///
+    /// The first tick fires immediately (before the first sleep) so
+    /// the dashboard learns initial pane state on first paint rather
+    /// than waiting one interval. Subsequent ticks pace at `interval`.
+    /// Errors (no tmux server, ssh failure) surface as an empty
+    /// `cwds` list, which the catalog interprets as "every session on
+    /// this host has no live pane".
+    ///
+    /// Thread terminates cleanly when the event receiver drops.
+    pub fn start_pane_polling_host(&self, host: Arc<dyn Host>, interval: Duration) {
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let host_id = host.id().clone();
+            loop {
+                let cwds = list_live_pane_cwds(host.as_ref());
+                if tx
+                    .send(WatcherEvent::LivePanes {
+                        host: host_id.clone(),
+                        cwds,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                thread::sleep(interval);
             }
         });
     }
@@ -607,9 +655,7 @@ mod tests {
                 assert_eq!(u.id.0, "s");
                 assert_eq!(u.attention, Attention::NeedsInput);
             }
-            other @ WatcherEvent::NewTranscript { .. } => {
-                panic!("unexpected event: {other:?}")
-            }
+            other => panic!("expected Attention, got: {other:?}"),
         }
         // Known-set should now record the new mtime so the next tick
         // doesn't re-emit.
@@ -638,18 +684,14 @@ mod tests {
                 assert_eq!(p, &path);
                 assert_eq!(*m, ts(50));
             }
-            other @ WatcherEvent::Attention(_) => {
-                panic!("expected NewTranscript first, got: {other:?}")
-            }
+            other => panic!("expected NewTranscript first, got: {other:?}"),
         }
         match &events[1] {
             WatcherEvent::Attention(u) => {
                 assert_eq!(u.id.0, "fresh");
                 assert_eq!(u.attention, Attention::Working);
             }
-            other @ WatcherEvent::NewTranscript { .. } => {
-                panic!("expected Attention second, got: {other:?}")
-            }
+            other => panic!("expected Attention second, got: {other:?}"),
         }
         // The new path is now in known-set; a subsequent tick with no
         // mtime change should be silent.

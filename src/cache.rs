@@ -133,6 +133,10 @@ impl CachedSession {
             last_activity: epoch_secs_to_systemtime(self.last_activity_secs),
             attention: self.attention.into(),
             title: self.title,
+            // Tmux pane state is ephemeral; the runtime pane poller
+            // will set this on its first tick. Anything cached here
+            // would be stale before the user could read it.
+            has_live_pane: None,
         }
     }
 }
@@ -190,6 +194,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             attention: Attention::NeedsInput,
             title: Some(format!("task {id}")),
+            has_live_pane: None,
         }
     }
 

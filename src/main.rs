@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -268,6 +268,13 @@ impl App {
         // per-thread clones above are the only live Senders.
         drop(remote_tx);
 
+        // Pane-presence polling for the local host. Remote hosts get
+        // theirs in `drain_remote_discoveries` once each `SshHost`
+        // is connected. The 3s cadence matches the remote-attention
+        // poll — fast enough that a pane killed by `prefix+&` reflects
+        // in the dashboard within one tick.
+        watcher.start_pane_polling_host(Arc::clone(&local_host), REMOTE_POLL_INTERVAL);
+
         Ok(Self {
             catalog,
             list_state,
@@ -441,11 +448,17 @@ impl App {
                     // Live polling: without this, remote attention stays
                     // frozen at the discovery reading.
                     self.watcher.start_polling_host(
-                        host,
+                        Arc::clone(&host),
                         transcript_root,
                         poll_seed,
                         REMOTE_POLL_INTERVAL,
                     );
+                    // Pane-presence polling on the same cadence.
+                    // Separate thread (not coupled to the transcript
+                    // poll) so a slow `tmux list-panes` over ssh
+                    // can't backpressure the attention pipeline.
+                    self.watcher
+                        .start_pane_polling_host(host, REMOTE_POLL_INTERVAL);
                 }
                 RemoteDiscoveryResult::Failed { host_id, error } => {
                     self.connect_errors.push((host_id, error));
@@ -542,6 +555,10 @@ impl App {
                 }
                 WatcherEvent::NewTranscript { host, path, mtime } => {
                     self.handle_new_transcript(&host, &path, mtime);
+                }
+                WatcherEvent::LivePanes { host, cwds } => {
+                    let set: HashSet<PathBuf> = cwds.into_iter().collect();
+                    self.catalog.apply_live_panes(&host, &set);
                 }
             }
         }
@@ -979,6 +996,15 @@ fn format_session_row(session: &Session) -> Line<'static> {
     let glyph = attention_glyph(effective_attention(session));
     let age = humanize_elapsed(session.last_activity);
     let dim = Style::new().add_modifier(Modifier::DIM);
+    // Dim the entire title when the pane poller has confirmed no
+    // live tmux pane matches this session — Enter is going to be a
+    // multi-second auto-resume rather than a fast switch, and the
+    // dimming pre-mentally-models that cost. `None` (poller hasn't
+    // reported for this host yet) renders at normal weight so a
+    // remote whose first pane poll is still in flight doesn't flash
+    // dim then bright.
+    let title_dim = matches!(session.has_live_pane, Some(false));
+    let title_style = if title_dim { dim } else { Style::new() };
 
     // Indented two levels under the project header. Project text is
     // no longer per-row (the header carries it); for title-less
@@ -986,7 +1012,7 @@ fn format_session_row(session: &Session) -> Line<'static> {
     // unnamed sessions in the same project remain distinguishable.
     let mut spans = vec![Span::raw("    "), Span::raw(glyph), Span::raw(" ")];
     if let Some(title) = &session.title {
-        spans.push(Span::raw(title.clone()));
+        spans.push(Span::styled(title.clone(), title_style));
     } else {
         let id = &session.id.0;
         let suffix = if id.len() > 6 {
@@ -994,6 +1020,8 @@ fn format_session_row(session: &Session) -> Line<'static> {
         } else {
             id.as_str()
         };
+        // Title-less rows are already dim; the live-pane signal would
+        // be invisible on top, so keep the existing styling.
         spans.push(Span::styled(format!("({suffix})"), dim));
     }
     spans.push(Span::raw("  "));

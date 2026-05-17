@@ -71,6 +71,7 @@ pub fn build_session(
         last_activity: mtime,
         attention: Attention::Unknown,
         title,
+        has_live_pane: None,
     }))
 }
 

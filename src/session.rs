@@ -61,4 +61,16 @@ pub struct Session {
     /// `None` means "no signal beyond the cwd" and the UI falls back to cwd
     /// alone.
     pub title: Option<String>,
+    /// Whether the session's host has a live tmux pane whose
+    /// `pane_current_path` matches `project_dir`. `Some(true)` means
+    /// Enter is a fast switch into an existing pane; `Some(false)`
+    /// means it'll fall through to `claude --resume` (spinning up a
+    /// fresh tmux + claude — slower). `None` means the pane poller
+    /// hasn't yet reported for this host (initial state).
+    ///
+    /// Deliberately *not* serialized into the disk cache: tmux state
+    /// is ephemeral and can change without a corresponding session
+    /// event, so it must always be re-derived at runtime from the
+    /// pane poller.
+    pub has_live_pane: Option<bool>,
 }

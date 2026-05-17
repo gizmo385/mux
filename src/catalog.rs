@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use crate::session::{Attention, HostId, Session, SessionId};
 
 #[derive(Debug, Default)]
@@ -39,6 +42,23 @@ impl SessionCatalog {
             }
         }
         false
+    }
+
+    /// Apply a fresh pane-presence snapshot from the pane poller for
+    /// one host: for every session on `host_id`, set `has_live_pane`
+    /// to `Some(true)` iff its `project_dir` appears in `cwds`,
+    /// otherwise `Some(false)`. Sessions on other hosts are untouched.
+    ///
+    /// A pane poller failure (no tmux, ssh hiccup) surfaces as an
+    /// empty `cwds` set — every session on that host transitions to
+    /// `Some(false)`, which matches the user-visible reality
+    /// (Enter will fall through to `claude --resume`).
+    pub fn apply_live_panes(&mut self, host_id: &HostId, cwds: &HashSet<PathBuf>) {
+        for session in &mut self.sessions {
+            if &session.host == host_id {
+                session.has_live_pane = Some(cwds.contains(&session.project_dir));
+            }
+        }
     }
 
     /// Replace every session currently in the catalog whose `host` is
@@ -93,6 +113,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH,
             attention: Attention::Unknown,
             title: None,
+            has_live_pane: None,
         }
     }
 
@@ -163,6 +184,54 @@ mod tests {
         c.add(session_on("b", host.clone()));
         c.reconcile_host(&host, Vec::new());
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn apply_live_panes_marks_match_true_and_others_false() {
+        let mut c = SessionCatalog::new();
+        let host = HostId("alpha".into());
+        let mut a = session_on("a", host.clone());
+        a.project_dir = PathBuf::from("/work/a");
+        let mut b = session_on("b", host.clone());
+        b.project_dir = PathBuf::from("/work/b");
+        c.add(a);
+        c.add(b);
+
+        let mut cwds = HashSet::new();
+        cwds.insert(PathBuf::from("/work/a"));
+        c.apply_live_panes(&host, &cwds);
+
+        assert_eq!(c.sessions()[0].has_live_pane, Some(true));
+        assert_eq!(c.sessions()[1].has_live_pane, Some(false));
+    }
+
+    #[test]
+    fn apply_live_panes_does_not_touch_sessions_on_other_hosts() {
+        let mut c = SessionCatalog::new();
+        let a = HostId("alpha".into());
+        let b = HostId("beta".into());
+        c.add(session_on("a1", a.clone()));
+        c.add(session_on("b1", b.clone()));
+
+        c.apply_live_panes(&a, &HashSet::new());
+        // Both alpha sessions get a snapshot decision...
+        assert_eq!(c.sessions()[0].has_live_pane, Some(false));
+        // ...but beta is unchanged from its default.
+        assert_eq!(c.sessions()[1].has_live_pane, None);
+    }
+
+    #[test]
+    fn apply_live_panes_empty_set_marks_every_session_false() {
+        // Failure-mode contract: a pane poller error (no tmux server)
+        // surfaces as an empty cwds set, which means every session on
+        // that host is marked as not having a live pane.
+        let mut c = SessionCatalog::new();
+        let host = HostId("alpha".into());
+        c.add(session_on("a", host.clone()));
+        c.add(session_on("b", host.clone()));
+        c.apply_live_panes(&host, &HashSet::new());
+        assert_eq!(c.sessions()[0].has_live_pane, Some(false));
+        assert_eq!(c.sessions()[1].has_live_pane, Some(false));
     }
 
     #[test]

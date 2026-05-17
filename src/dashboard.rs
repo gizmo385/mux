@@ -288,6 +288,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(10_000 - seconds_ago),
             attention: Attention::Unknown,
             title: title.map(str::to_string),
+            has_live_pane: None,
         }
     }
 

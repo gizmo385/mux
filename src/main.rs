@@ -124,6 +124,13 @@ struct App {
     /// footer to show "connecting to N host(s)…" while at least one is
     /// outstanding.
     pending_hosts: usize,
+    /// Sticky list of hosts whose startup connect failed, with the full
+    /// error message captured for future surfacing (logs, a detail
+    /// modal). The footer renders just the host names so a multi-host
+    /// failure doesn't blow up into an unreadable line; the messages
+    /// stay around so a connect failure isn't silently lost when the
+    /// transient `status` field cycles to a different message.
+    connect_errors: Vec<(HostId, String)>,
     /// Captured at startup: `$TMUX` set means we attach via `tmux
     /// switch-client` (no parent/child relationship to break), so the return
     /// hint differs from the outside-tmux case where we suspend and run
@@ -206,11 +213,10 @@ impl App {
                 let _ = tx.send(result);
             });
         }
-        // The original Sender is held by App so the channel stays open
-        // for the lifetime of the dashboard; per-thread clones drop as
-        // each background thread finishes.
+        // Drop the original Sender so the channel closes once every
+        // background thread has sent its result and exited. The
+        // per-thread clones above are the only live Senders.
         drop(remote_tx);
-        let remote_rx_outer = remote_rx;
 
         Ok(Self {
             catalog,
@@ -227,8 +233,9 @@ impl App {
             create_tx,
             create_rx,
             creating: None,
-            remote_rx: remote_rx_outer,
+            remote_rx,
             pending_hosts,
+            connect_errors: Vec::new(),
             in_tmux: std::env::var_os("TMUX").is_some(),
         })
     }
@@ -252,7 +259,7 @@ impl App {
                     }
                 }
                 RemoteDiscoveryResult::Failed { host_id, error } => {
-                    self.status = Some(format!("connect {host_id}: {error}"));
+                    self.connect_errors.push((host_id, error));
                 }
             }
         }
@@ -602,6 +609,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.catalog.is_empty(),
         app.in_tmux,
         app.pending_hosts,
+        &app.connect_errors,
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -615,23 +623,34 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 }
 
 /// Pure footer composition so the keybind/return hint logic is unit-testable
-/// without standing up a ratatui frame. Precedence: in-flight create > status
-/// message > empty catalog > keybind line. The keybind line gets a
-/// trailing "· connecting to N host(s)…" suffix while remote SSH
-/// discovery is still pending. The return hint is mode-aware because
-/// attach takes two different code paths (see `App.in_tmux`).
+/// without standing up a ratatui frame. Precedence: in-flight create >
+/// transient status > sticky connect-failure line > empty catalog >
+/// keybind line. The keybind line gets a trailing "· connecting to N
+/// host(s)…" suffix while remote SSH discovery is still pending. The
+/// return hint is mode-aware because attach takes two different code
+/// paths (see `App.in_tmux`).
+///
+/// Connect failures sit *below* transient status so a fresh action's
+/// feedback isn't drowned out, but stay visible (until the next
+/// transient status, then re-surface) so they're not silently lost
+/// the way a single overwriting `status` field would lose them.
 fn compose_footer(
     creating: Option<&CreatingSession>,
     status: Option<&str>,
     catalog_empty: bool,
     in_tmux: bool,
     pending_hosts: usize,
+    connect_errors: &[(HostId, String)],
 ) -> String {
     if let Some(c) = creating {
         return format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name);
     }
     if let Some(s) = status {
         return format!(" {s} ");
+    }
+    if !connect_errors.is_empty() {
+        let names: Vec<String> = connect_errors.iter().map(|(h, _)| h.to_string()).collect();
+        return format!(" connect failed: {} ", names.join(", "));
     }
     if catalog_empty {
         if pending_hosts > 0 {
@@ -719,30 +738,41 @@ fn humanize_elapsed(t: SystemTime) -> String {
 mod tests {
     use super::*;
 
+    fn no_connect_errors() -> Vec<(HostId, String)> {
+        Vec::new()
+    }
+
     #[test]
     fn footer_keybind_line_shows_in_tmux_return_hint() {
-        let s = compose_footer(None, None, false, true, 0);
+        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(!s.contains("prefix+d"), "got: {s}");
     }
 
     #[test]
     fn footer_keybind_line_shows_outside_tmux_return_hint() {
-        let s = compose_footer(None, None, false, false, 0);
+        let s = compose_footer(None, None, false, false, 0, &no_connect_errors());
         assert!(s.contains("return: prefix+d"), "got: {s}");
         assert!(!s.contains("prefix+s"), "got: {s}");
     }
 
     #[test]
     fn footer_empty_catalog_omits_return_hint() {
-        let s = compose_footer(None, None, true, true, 0);
+        let s = compose_footer(None, None, true, true, 0, &no_connect_errors());
         assert!(!s.contains("return:"), "got: {s}");
         assert!(s.contains("no sessions"), "got: {s}");
     }
 
     #[test]
     fn footer_status_takes_precedence_over_keybinds() {
-        let s = compose_footer(None, Some("attach: boom"), false, true, 0);
+        let s = compose_footer(
+            None,
+            Some("attach: boom"),
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+        );
         assert!(s.contains("attach: boom"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
     }
@@ -753,7 +783,14 @@ mod tests {
             repo_name: "agent-mux".into(),
             task: "refactor".into(),
         };
-        let s = compose_footer(Some(&creating), Some("ignored"), false, true, 0);
+        let s = compose_footer(
+            Some(&creating),
+            Some("ignored"),
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+        );
         assert!(s.contains("creating worktree"), "got: {s}");
         assert!(s.contains("agent-mux"), "got: {s}");
         assert!(!s.contains("ignored"), "got: {s}");
@@ -761,7 +798,7 @@ mod tests {
 
     #[test]
     fn footer_keybind_line_appends_connecting_suffix_when_hosts_pending() {
-        let s = compose_footer(None, None, false, true, 2);
+        let s = compose_footer(None, None, false, true, 2, &no_connect_errors());
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(s.contains("connecting to 2 host(s)"), "got: {s}");
     }
@@ -771,14 +808,47 @@ mod tests {
         // First impression matters: when the catalog is empty *and*
         // remote discovery is still in flight, "no sessions discovered"
         // would mis-imply we're done.
-        let s = compose_footer(None, None, true, true, 1);
+        let s = compose_footer(None, None, true, true, 1, &no_connect_errors());
         assert!(s.contains("connecting to 1 host(s)"), "got: {s}");
         assert!(!s.contains("no sessions"), "got: {s}");
     }
 
     #[test]
     fn footer_connecting_suffix_disappears_once_all_hosts_have_reported() {
-        let s = compose_footer(None, None, false, true, 0);
+        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
         assert!(!s.contains("connecting to"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_renders_connect_errors_as_sticky_line_when_no_status() {
+        let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
+        let s = compose_footer(None, None, false, true, 0, &errors);
+        assert!(s.contains("connect failed: alpenglow"), "got: {s}");
+        assert!(!s.contains("return:"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_lists_all_failed_host_names_comma_separated() {
+        // The fix the review surfaced: a second failure must not
+        // silently overwrite the first. Host names get rendered;
+        // the full error text is retained off-screen for future log
+        // surfacing.
+        let errors = vec![
+            (HostId("alpenglow".into()), "first error".to_string()),
+            (HostId("gpu-1".into()), "second error".to_string()),
+        ];
+        let s = compose_footer(None, None, false, true, 0, &errors);
+        assert!(s.contains("alpenglow"), "got: {s}");
+        assert!(s.contains("gpu-1"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_transient_status_takes_precedence_over_connect_errors() {
+        // A fresh action's feedback must not be drowned out by the
+        // sticky connect-failure line.
+        let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
+        let s = compose_footer(None, Some("opened terminal in /x"), false, true, 0, &errors);
+        assert!(s.contains("opened terminal"), "got: {s}");
+        assert!(!s.contains("connect failed"), "got: {s}");
     }
 }

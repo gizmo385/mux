@@ -206,6 +206,7 @@ mod tests {
 
         let cfg = Config {
             workspace_folders: vec![work, code],
+            ..Default::default()
         };
         let reg = RepoRegistry::from_config(&cfg);
         let mut names: Vec<String> = reg.repos().iter().map(|r| r.name.clone()).collect();
@@ -222,6 +223,7 @@ mod tests {
         // Same folder listed twice — the repo should only appear once.
         let cfg = Config {
             workspace_folders: vec![work.clone(), work],
+            ..Default::default()
         };
         let reg = RepoRegistry::from_config(&cfg);
         assert_eq!(reg.len(), 1);
@@ -240,6 +242,7 @@ mod tests {
         let work = make_plain_dir(tmp.path(), "work");
         let cfg = Config {
             workspace_folders: vec![work.clone()],
+            ..Default::default()
         };
         let mut reg = RepoRegistry::from_config(&cfg);
         assert!(reg.is_empty());
@@ -256,6 +259,7 @@ mod tests {
         let work = make_plain_dir(tmp.path(), "work");
         let cfg = Config {
             workspace_folders: vec![work.clone()],
+            ..Default::default()
         };
         let mut reg = RepoRegistry::from_config(&cfg);
         assert!(reg.is_empty());
@@ -273,6 +277,7 @@ mod tests {
         let work = make_plain_dir(tmp.path(), "work");
         let cfg = Config {
             workspace_folders: vec![work.clone()],
+            ..Default::default()
         };
         let mut reg = RepoRegistry::from_config(&cfg);
 

@@ -27,3 +27,7 @@ Legend: ✓ shipped · ⋯ in progress
 - ✓ repo registry TTL refresh: opening the new-session picker triggers a re-scan if the cached snapshot is older than 30s, so repos cloned mid-session appear without an agent-mux restart. The depth-1 walk is cheap enough to run synchronously; the cache prevents repeated walks during rapid open/close.
 - ✓ live session discovery: the transcript watcher does a single recursive watch on `~/.claude/projects/` instead of per-file watches, so new transcripts (whether agent-mux just spawned them, or `claude` was started externally) surface in the dashboard as soon as their first JSONL line is on disk. New rows append at the tail so the user's current selection is preserved.
 - ✓ stale-session filter: transcripts whose recorded `cwd` no longer exists on disk are dropped at discovery time, so deleted worktrees (e.g. cleaned-up claude-squad worktrees) stop cluttering the list with un-attachable entries. Also filters out the legacy "no cwd metadata" case where the fallback decoded-dir-name path doesn't exist.
+
+### M2 — Remote hosts
+
+- ✓ host config schema: `[hosts.<name>]` tables in `~/.config/agent-mux/config.toml`, each with `ssh = "<target>"` (a `~/.ssh/config` alias or `user@host`) and an optional `transcript_root` (tilde-expanded; defaults to `~/.claude/projects`). The table key is the dashboard label, separate from the SSH destination so the label can stay friendly. `local` is reserved and rejected at load.

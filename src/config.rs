@@ -1,12 +1,19 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// Reserved host name standing for the local machine. May not be used as a
+/// `[hosts.<name>]` key — the local host is implicit, not configured.
+pub const LOCAL_HOST_NAME: &str = "local";
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
+    ReservedHostName(String),
+    EmptySshTarget(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -14,6 +21,12 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Parse(e) => write!(f, "parse: {e}"),
+            Self::ReservedHostName(name) => {
+                write!(f, "host name {name:?} is reserved")
+            }
+            Self::EmptySshTarget(name) => {
+                write!(f, "host {name:?} has an empty `ssh` field")
+            }
         }
     }
 }
@@ -26,10 +39,23 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct HostConfig {
+    pub ssh: String,
+    #[serde(default = "default_transcript_root")]
+    pub transcript_root: PathBuf,
+}
+
+fn default_transcript_root() -> PathBuf {
+    PathBuf::from("~/.claude/projects")
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub workspace_folders: Vec<PathBuf>,
+    #[serde(default)]
+    pub hosts: BTreeMap<String, HostConfig>,
 }
 
 impl Config {
@@ -39,7 +65,10 @@ impl Config {
     ///
     /// # Errors
     /// [`ConfigError::Io`] for unreadable files (other than not-found);
-    /// [`ConfigError::Parse`] if the TOML is malformed.
+    /// [`ConfigError::Parse`] if the TOML is malformed;
+    /// [`ConfigError::ReservedHostName`] if a `[hosts.<name>]` table uses a
+    /// reserved name (see [`LOCAL_HOST_NAME`]);
+    /// [`ConfigError::EmptySshTarget`] if a host's `ssh` field is empty.
     pub fn load() -> Result<Self, ConfigError> {
         match default_config_path() {
             Some(p) => Self::load_from(&p),
@@ -59,6 +88,15 @@ impl Config {
         };
         let mut cfg: Self = toml::from_str(&raw).map_err(ConfigError::Parse)?;
         cfg.workspace_folders = cfg.workspace_folders.iter().map(|p| expand(p)).collect();
+        for (name, host) in &mut cfg.hosts {
+            if name.eq_ignore_ascii_case(LOCAL_HOST_NAME) {
+                return Err(ConfigError::ReservedHostName(name.clone()));
+            }
+            if host.ssh.trim().is_empty() {
+                return Err(ConfigError::EmptySshTarget(name.clone()));
+            }
+            host.transcript_root = expand(&host.transcript_root);
+        }
         Ok(cfg)
     }
 }
@@ -163,5 +201,153 @@ mod tests {
         fs::write(&path, "not = valid = toml").expect("write");
         let err = Config::load_from(&path).expect_err("should reject");
         assert!(matches!(err, ConfigError::Parse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn load_from_with_no_hosts_returns_empty_map() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, r#"workspace_folders = ["/work"]"#).expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert!(cfg.hosts.is_empty());
+    }
+
+    #[test]
+    fn load_from_parses_hosts_with_defaults() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[hosts.devbox]
+ssh = "devbox"
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let host = cfg.hosts.get("devbox").expect("devbox host");
+        assert_eq!(host.ssh, "devbox");
+        let home = dirs::home_dir().expect("home");
+        assert_eq!(host.transcript_root, home.join(".claude/projects"));
+    }
+
+    #[test]
+    fn load_from_parses_explicit_transcript_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[hosts.gpu]
+ssh = "gizmo@gpu-1.internal"
+transcript_root = "/srv/claude/projects"
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let host = cfg.hosts.get("gpu").expect("gpu host");
+        assert_eq!(host.ssh, "gizmo@gpu-1.internal");
+        assert_eq!(host.transcript_root, PathBuf::from("/srv/claude/projects"));
+    }
+
+    #[test]
+    fn load_from_expands_tilde_in_transcript_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[hosts.devbox]
+ssh = "devbox"
+transcript_root = "~/scratch/claude"
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let host = cfg.hosts.get("devbox").expect("devbox host");
+        let home = dirs::home_dir().expect("home");
+        assert_eq!(host.transcript_root, home.join("scratch/claude"));
+    }
+
+    #[test]
+    fn load_from_parses_multiple_hosts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+workspace_folders = ["~/work"]
+
+[hosts.devbox]
+ssh = "devbox"
+
+[hosts.gpu]
+ssh = "user@gpu-1.internal"
+transcript_root = "/srv/claude/projects"
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert_eq!(cfg.hosts.len(), 2);
+        // BTreeMap orders deterministically.
+        let names: Vec<_> = cfg.hosts.keys().cloned().collect();
+        assert_eq!(names, vec!["devbox".to_string(), "gpu".to_string()]);
+    }
+
+    #[test]
+    fn load_from_rejects_reserved_local_host_name() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[hosts.local]
+ssh = "anything"
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::ReservedHostName(ref n) if n == "local"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_reserved_local_host_name_case_insensitive() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[hosts.Local]
+ssh = "anything"
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::ReservedHostName(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_empty_ssh_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[hosts.devbox]
+ssh = "   "
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::EmptySshTarget(ref n) if n == "devbox"),
+            "got: {err:?}"
+        );
     }
 }

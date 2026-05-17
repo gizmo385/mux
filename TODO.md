@@ -28,8 +28,8 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M3 — Inline preview
 
-- add preview pane to Dashboard (toggleable side pane showing last N parsed entries for the selected session; renderer already in `src/preview.rs`) `#m3 #ui`
 - record observations: does seeing inline preview change which sessions the user attaches to? Does the user want richer chat? This is the Shape B pivot decision input. `#m3 #dogfood`
+- decide preview verbosity config knob (M5): how many entries, whether to show tool result body, whether thinking blocks are surfaced. SPEC.md notes "configuration for preview verbosity" as part of M3 scope but defers shape; revisit once dogfooding has surfaced what the user actually wants to tune. `#m3 #m5 #config #dogfood`
 
 ### M4 — Attention notifications
 

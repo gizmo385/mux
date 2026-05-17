@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
+use crate::preview::PreviewLine;
 use crate::session::{HostId, Session};
 
 /// One row in the dashboard list. Headers are unselectable; the
@@ -260,6 +263,105 @@ fn walk_session_index(current: Option<usize>, rows: &[DisplayRow], step: isize) 
 pub fn first_session_index(rows: &[DisplayRow]) -> Option<usize> {
     rows.iter()
         .position(|r| matches!(r, DisplayRow::SessionRow(_)))
+}
+
+/// Per-session entry in the dashboard's preview cache. `Loading` means
+/// a fetch is in flight; `Ready` is the parsed lines from the last
+/// completed fetch; `Failed` carries a short error for display. An
+/// absent entry means "never fetched."
+///
+/// The state machine doubles as in-flight deduplication: the dispatcher
+/// only spawns a fetch when the entry is absent or `Failed`, so a flurry
+/// of j/k strokes with the pane open does not stack N concurrent reads
+/// for the same session.
+#[derive(Debug, Clone)]
+pub enum PreviewEntry {
+    Loading,
+    Ready(Vec<PreviewLine>),
+    Failed(String),
+}
+
+/// Body of the preview pane for one cache state. Resolves the four
+/// user-visible cases — no selection, in-flight fetch (or absent
+/// cache, which renders the same), an empty result, and a fetch
+/// failure — and otherwise delegates to [`compose_preview_lines`].
+///
+/// Absent and `Loading` both render as "loading…" because absent means
+/// "the dispatcher will create a `Loading` on the next tick"; the user
+/// shouldn't see a spurious empty pane in between.
+#[must_use]
+pub fn compose_preview_pane_lines(
+    entry: Option<&PreviewEntry>,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    if !selected {
+        return vec![dim_line("(no session selected)")];
+    }
+    match entry {
+        None | Some(PreviewEntry::Loading) => vec![dim_line("loading…")],
+        Some(PreviewEntry::Ready(lines)) if lines.is_empty() => vec![dim_line("(no preview)")],
+        Some(PreviewEntry::Ready(lines)) => compose_preview_lines(lines),
+        Some(PreviewEntry::Failed(msg)) => {
+            vec![dim_line(&format!("preview unavailable: {msg}"))]
+        }
+    }
+}
+
+fn dim_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::new().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// Turn parsed `PreviewLine`s into styled `ratatui::Line`s for the
+/// preview pane. Pure rendering — no width awareness, no truncation;
+/// the `Paragraph` widget wraps as needed.
+///
+/// Glyph + colour scheme:
+/// - `> ` bold for user prompts (the human's voice, visually loud)
+/// - `  ` dim for assistant prose (the response, present but quieter)
+/// - `⚒ ` cyan for tool calls (action, distinct from chat)
+/// - `↳ ` green/red for tool results (terse outcome only — open the
+///   session for detail)
+#[must_use]
+pub fn compose_preview_lines(lines: &[PreviewLine]) -> Vec<Line<'static>> {
+    lines.iter().map(preview_line_to_styled).collect()
+}
+
+fn preview_line_to_styled(line: &PreviewLine) -> Line<'static> {
+    match line {
+        PreviewLine::User(text) => Line::from(vec![
+            Span::styled("> ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(text.clone(), Style::new().add_modifier(Modifier::BOLD)),
+        ]),
+        PreviewLine::Assistant(text) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(text.clone(), Style::new().add_modifier(Modifier::DIM)),
+        ]),
+        PreviewLine::ToolUse { name, summary } => {
+            let body = if summary.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}: {summary}")
+            };
+            Line::from(vec![
+                Span::styled("⚒ ", Style::new().fg(Color::Cyan)),
+                Span::styled(body, Style::new().fg(Color::Cyan)),
+            ])
+        }
+        PreviewLine::ToolResult { ok } => {
+            let (glyph, label, colour) = if *ok {
+                ("↳ ", "ok", Color::Green)
+            } else {
+                ("↳ ", "error", Color::Red)
+            };
+            Line::from(vec![
+                Span::styled(glyph, Style::new().fg(colour)),
+                Span::styled(label, Style::new().fg(colour)),
+            ])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -638,5 +740,95 @@ mod tests {
         let shift_f = KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT);
         s.handle_editing_key(shift_f);
         assert_eq!(s.query, "F");
+    }
+
+    /// Helper: stringify the styled-content of preview lines so tests
+    /// can assert on glyph + body without coupling to `ratatui::Style`
+    /// internals. Joins every span's text into one string per line.
+    fn preview_strings(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compose_preview_lines_empty_input_yields_no_lines() {
+        assert!(compose_preview_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn compose_preview_lines_user_prefixes_with_caret() {
+        let lines = compose_preview_lines(&[PreviewLine::User("hello".to_string())]);
+        assert_eq!(preview_strings(&lines), vec!["> hello".to_string()]);
+    }
+
+    #[test]
+    fn compose_preview_lines_assistant_indents_without_glyph() {
+        let lines = compose_preview_lines(&[PreviewLine::Assistant("on it".to_string())]);
+        assert_eq!(preview_strings(&lines), vec!["  on it".to_string()]);
+    }
+
+    #[test]
+    fn compose_preview_lines_tool_use_with_summary_joins_name_and_summary() {
+        let lines = compose_preview_lines(&[PreviewLine::ToolUse {
+            name: "Bash".to_string(),
+            summary: "list repo".to_string(),
+        }]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec!["⚒ Bash: list repo".to_string()]
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_tool_use_without_summary_shows_name_only() {
+        let lines = compose_preview_lines(&[PreviewLine::ToolUse {
+            name: "AskUserQuestion".to_string(),
+            summary: String::new(),
+        }]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec!["⚒ AskUserQuestion".to_string()]
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_tool_result_renders_ok_or_error() {
+        let lines = compose_preview_lines(&[
+            PreviewLine::ToolResult { ok: true },
+            PreviewLine::ToolResult { ok: false },
+        ]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec!["↳ ok".to_string(), "↳ error".to_string()]
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_preserves_input_order() {
+        let lines = compose_preview_lines(&[
+            PreviewLine::User("ask".to_string()),
+            PreviewLine::Assistant("answer".to_string()),
+            PreviewLine::ToolUse {
+                name: "Read".to_string(),
+                summary: "f.rs".to_string(),
+            },
+            PreviewLine::ToolResult { ok: true },
+        ]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec![
+                "> ask".to_string(),
+                "  answer".to_string(),
+                "⚒ Read: f.rs".to_string(),
+                "↳ ok".to_string(),
+            ]
+        );
     }
 }

@@ -134,7 +134,16 @@ impl Theme {
     /// user-facing error messages and docs.
     #[must_use]
     pub fn preset_names() -> &'static [&'static str] {
-        &["default", "bright", "mono"]
+        &[
+            "default",
+            "bright",
+            "mono",
+            "warm",
+            "cool",
+            "solarized",
+            "gruvbox",
+            "nord",
+        ]
     }
 
     /// The "default" preset: matches the colour scheme that shipped
@@ -178,6 +187,87 @@ impl Theme {
         Self::default()
     }
 
+    /// Sunset / warm palette: reds, ambers, and earthy browns. Picks
+    /// custom RGB instead of plain `Yellow`/`Red` so the warmth is more
+    /// distinctive than the bare ANSI red would suggest.
+    #[must_use]
+    pub fn preset_warm() -> Self {
+        Self {
+            needs_input: Some(Color::Rgb(0xff, 0x57, 0x33)),
+            working: Some(Color::Rgb(0xf4, 0xa7, 0x38)),
+            idle: Some(Color::Rgb(0x8c, 0x6e, 0x54)),
+            unknown: Some(Color::Rgb(0xa0, 0x87, 0x70)),
+            tool_use: Some(Color::Rgb(0xd1, 0xa3, 0x47)),
+            tool_result_ok: Some(Color::Rgb(0xb3, 0xa2, 0x28)),
+            tool_result_err: Some(Color::Rgb(0xcc, 0x3a, 0x20)),
+        }
+    }
+
+    /// Ocean / cool palette: blues, teals, sea greens. Errors stay
+    /// rose-red so attention still pops against the surrounding cool
+    /// tones — a pure all-blue palette buries the primary attention
+    /// signal.
+    #[must_use]
+    pub fn preset_cool() -> Self {
+        Self {
+            needs_input: Some(Color::Rgb(0xe2, 0x6d, 0x75)),
+            working: Some(Color::Rgb(0x6c, 0xb4, 0xd6)),
+            idle: Some(Color::Rgb(0x47, 0x66, 0x80)),
+            unknown: Some(Color::Rgb(0x5e, 0x7e, 0x94)),
+            tool_use: Some(Color::Rgb(0x39, 0xa3, 0xa3)),
+            tool_result_ok: Some(Color::Rgb(0x4c, 0xaa, 0x6c)),
+            tool_result_err: Some(Color::Rgb(0xe2, 0x6d, 0x75)),
+        }
+    }
+
+    /// Solarized accents (the palette's canonical 8 colours). Designed
+    /// to work over either the dark or light Solarized backgrounds —
+    /// agent-mux doesn't set its own background, so accent-only is the
+    /// right slice to expose.
+    #[must_use]
+    pub fn preset_solarized() -> Self {
+        Self {
+            needs_input: Some(Color::Rgb(0xdc, 0x32, 0x2f)), // red
+            working: Some(Color::Rgb(0xb5, 0x89, 0x00)),     // yellow
+            idle: Some(Color::Rgb(0x58, 0x6e, 0x75)),        // base01
+            unknown: Some(Color::Rgb(0x58, 0x6e, 0x75)),
+            tool_use: Some(Color::Rgb(0x26, 0x8b, 0xd2)), // blue
+            tool_result_ok: Some(Color::Rgb(0x85, 0x99, 0x00)), // green
+            tool_result_err: Some(Color::Rgb(0xdc, 0x32, 0x2f)),
+        }
+    }
+
+    /// Gruvbox bright variants. Earthy/retro feel that reads well on
+    /// dark terminals; the bright accents pop more than gruvbox's
+    /// muted "neutral" palette would.
+    #[must_use]
+    pub fn preset_gruvbox() -> Self {
+        Self {
+            needs_input: Some(Color::Rgb(0xfb, 0x49, 0x34)), // bright red
+            working: Some(Color::Rgb(0xfa, 0xbd, 0x2f)),     // bright yellow
+            idle: Some(Color::Rgb(0x92, 0x83, 0x74)),        // gray
+            unknown: Some(Color::Rgb(0x92, 0x83, 0x74)),
+            tool_use: Some(Color::Rgb(0x8e, 0xc0, 0x7c)), // bright aqua
+            tool_result_ok: Some(Color::Rgb(0xb8, 0xbb, 0x26)), // bright green
+            tool_result_err: Some(Color::Rgb(0xfb, 0x49, 0x34)),
+        }
+    }
+
+    /// Nord aurora + frost palette. Cool slate tones with the aurora
+    /// accents (red, yellow, green) for the primary semantic events.
+    #[must_use]
+    pub fn preset_nord() -> Self {
+        Self {
+            needs_input: Some(Color::Rgb(0xbf, 0x61, 0x6a)), // aurora red
+            working: Some(Color::Rgb(0xeb, 0xcb, 0x8b)),     // aurora yellow
+            idle: Some(Color::Rgb(0x4c, 0x56, 0x6a)),        // polar night
+            unknown: Some(Color::Rgb(0x4c, 0x56, 0x6a)),
+            tool_use: Some(Color::Rgb(0x88, 0xc0, 0xd0)), // frost cyan
+            tool_result_ok: Some(Color::Rgb(0xa3, 0xbe, 0x8c)), // aurora green
+            tool_result_err: Some(Color::Rgb(0xbf, 0x61, 0x6a)),
+        }
+    }
+
     /// Resolve a preset by name. Used both as the baseline for
     /// [`Theme::from_config`] and (transitively) by tests that want a
     /// known preset without going through TOML.
@@ -191,6 +281,11 @@ impl Theme {
             "default" => Ok(Self::preset_default()),
             "bright" => Ok(Self::preset_bright()),
             "mono" => Ok(Self::preset_mono()),
+            "warm" => Ok(Self::preset_warm()),
+            "cool" => Ok(Self::preset_cool()),
+            "solarized" => Ok(Self::preset_solarized()),
+            "gruvbox" => Ok(Self::preset_gruvbox()),
+            "nord" => Ok(Self::preset_nord()),
             _ => Err(ConfigError::UnknownThemePreset(name.to_string())),
         }
     }
@@ -809,6 +904,84 @@ sound = true
         assert_eq!(theme.tool_use, None);
         // Sibling fields still inherit from the bright preset.
         assert_eq!(theme.tool_result_ok, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn every_preset_name_resolves_successfully() {
+        // Doubles as a guard against `preset_names()` drifting from the
+        // `match` arm in `preset()`: a name listed without an arm (or
+        // vice versa) would surface here as an error or unreachable.
+        for name in Theme::preset_names() {
+            Theme::preset(name).unwrap_or_else(|e| panic!("preset {name:?} failed: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn opinionated_presets_colour_needs_input() {
+        // Needs-input is the primary attention signal; palettes that
+        // make a deliberate aesthetic choice should keep it visible.
+        // `default` preserves the pre-M5 (uncoloured-glyph) look and
+        // `mono` is deliberately colour-less — both opt out.
+        for name in Theme::preset_names() {
+            if matches!(*name, "default" | "mono") {
+                continue;
+            }
+            let theme = Theme::preset(name).unwrap();
+            assert!(
+                theme.needs_input.is_some(),
+                "preset {name:?} leaves needs_input uncoloured — attention signal would vanish",
+            );
+        }
+    }
+
+    #[test]
+    fn mono_is_the_only_fully_uncoloured_preset() {
+        for name in Theme::preset_names() {
+            let theme = Theme::preset(name).unwrap();
+            let all_none = theme.needs_input.is_none()
+                && theme.working.is_none()
+                && theme.idle.is_none()
+                && theme.unknown.is_none()
+                && theme.tool_use.is_none()
+                && theme.tool_result_ok.is_none()
+                && theme.tool_result_err.is_none();
+            if *name == "mono" {
+                assert!(all_none, "mono preset must be fully uncoloured");
+            } else {
+                assert!(
+                    !all_none,
+                    "preset {name:?} should not match mono's emptiness"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warm_and_cool_presets_are_distinct() {
+        // Cheap smoke test that the two "palette feel" presets actually
+        // differ — easy to typo identical RGB values when copy-pasting.
+        assert_ne!(Theme::preset_warm(), Theme::preset_cool());
+    }
+
+    #[test]
+    fn solarized_uses_canonical_red_accent() {
+        // Pin one well-known value from each named palette so a
+        // future refactor of the preset constants doesn't silently
+        // drift away from the spec.
+        let solarized = Theme::preset_solarized();
+        assert_eq!(solarized.needs_input, Some(Color::Rgb(0xdc, 0x32, 0x2f)));
+    }
+
+    #[test]
+    fn gruvbox_uses_bright_red_accent() {
+        let gruvbox = Theme::preset_gruvbox();
+        assert_eq!(gruvbox.needs_input, Some(Color::Rgb(0xfb, 0x49, 0x34)));
+    }
+
+    #[test]
+    fn nord_uses_aurora_red_accent() {
+        let nord = Theme::preset_nord();
+        assert_eq!(nord.needs_input, Some(Color::Rgb(0xbf, 0x61, 0x6a)));
     }
 
     #[test]

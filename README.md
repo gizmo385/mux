@@ -46,10 +46,15 @@ disabled_hosts = []     # host labels to silence entirely
 # subtracting a colour from a preset. Bad names fail loudly at load.
 #
 # Built-in presets:
-#   "default" — pre-M5 scheme: cyan/green/red preview, uncoloured glyphs.
-#   "bright"  — high contrast; every attention state coloured,
-#               preview switches to bright_* variants.
-#   "mono"    — no colours at all (modifiers like bold/dim still apply).
+#   "default"   — pre-M5 scheme: cyan/green/red preview, uncoloured glyphs.
+#   "bright"    — high contrast; every attention state coloured,
+#                 preview switches to bright_* variants.
+#   "mono"      — no colours at all (modifiers like bold/dim still apply).
+#   "warm"      — sunset palette: reds, ambers, earthy browns.
+#   "cool"      — ocean palette: blues, teals, sea greens (errors stay rose).
+#   "solarized" — canonical Solarized accents (works on dark or light bg).
+#   "gruvbox"   — Gruvbox bright variants; earthy / retro on dark terminals.
+#   "nord"      — Nord aurora + frost; slate tones with aurora-coloured events.
 #
 # With no `[theme]` section, the "default" preset applies.
 [theme]

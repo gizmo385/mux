@@ -1,6 +1,7 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, SystemTime};
 
@@ -19,10 +20,11 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
-use agent_mux::discovery::{build_session, claude_projects_dir, discover_local};
+use agent_mux::discovery::{build_session, claude_projects_dir, discover};
+use agent_mux::host::{Host, LocalHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::repo::{Repo, RepoRegistry};
-use agent_mux::session::{Attention, Host, Session};
+use agent_mux::session::{Attention, Session};
 use agent_mux::watcher::{TranscriptWatcher, WatcherEvent};
 use agent_mux::worktree::WorktreeManager;
 
@@ -97,6 +99,11 @@ struct App {
     catalog: SessionCatalog,
     list_state: ListState,
     home: Option<PathBuf>,
+    /// Local Host backend, also handed to the watcher for tail reads.
+    /// Held as `Arc<dyn Host>` so adding remote hosts in the next chunk
+    /// is a matter of plumbing additional entries, not changing the shape
+    /// of this field.
+    local_host: Arc<dyn Host>,
     watcher: TranscriptWatcher,
     updates: Receiver<WatcherEvent>,
     driver: TmuxDriver,
@@ -129,10 +136,11 @@ enum NewSessionResult {
 
 impl App {
     fn new() -> io::Result<Self> {
+        let local_host: Arc<dyn Host> = Arc::new(LocalHost::new());
         let projects_root = claude_projects_dir();
         let mut catalog = SessionCatalog::new();
         if let Some(root) = projects_root.as_ref()
-            && let Ok(sessions) = discover_local(root)
+            && let Ok(sessions) = discover(local_host.as_ref(), root)
         {
             catalog.replace_all(sessions);
         }
@@ -142,8 +150,9 @@ impl App {
             .iter()
             .map(|s| (s.id.clone(), s.transcript_path.clone()))
             .collect();
-        let (watcher, updates) = TranscriptWatcher::start(targets, projects_root.as_deref())
-            .map_err(io::Error::other)?;
+        let (watcher, updates) =
+            TranscriptWatcher::start(Arc::clone(&local_host), targets, projects_root.as_deref())
+                .map_err(io::Error::other)?;
 
         let mut list_state = ListState::default();
         if !catalog.is_empty() {
@@ -158,6 +167,7 @@ impl App {
             catalog,
             list_state,
             home: dirs::home_dir(),
+            local_host,
             watcher,
             updates,
             driver: TmuxDriver::new(),
@@ -270,7 +280,14 @@ impl App {
     /// `NewTranscript` and we retry until the file has enough content to
     /// build a session from.
     fn handle_new_transcript(&mut self, path: &Path) {
-        let Ok(Some(session)) = build_session(path) else {
+        // mtime from a `notify` Create/Modify event: the file is guaranteed
+        // to exist by the time the event is dispatched, so a failed stat
+        // collapses to "ignore this notification and let the next event
+        // re-trigger us" — same shape as `build_session` returning None.
+        let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
+        };
+        let Ok(Some(session)) = build_session(self.local_host.as_ref(), path, mtime) else {
             return;
         };
         let id = session.id.clone();
@@ -495,7 +512,7 @@ fn compose_footer(
 
 fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {
     let glyph = attention_glyph(effective_attention(session));
-    let host = host_label(session.host);
+    let host = session.host.to_string();
     let project = display_path(&session.project_dir, home);
     let age = humanize_elapsed(session.last_activity);
     let dim = Style::new().add_modifier(Modifier::DIM);
@@ -530,12 +547,6 @@ fn attention_glyph(a: Attention) -> &'static str {
         Attention::Working => "◐",
         Attention::Idle => "○",
         Attention::Unknown => "·",
-    }
-}
-
-fn host_label(h: Host) -> &'static str {
-    match h {
-        Host::Local => "local",
     }
 }
 

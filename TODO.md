@@ -18,7 +18,7 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M2 — Remote hosts
 
-- implement HostAbstraction with local and ssh impls; SSH impl manages ControlMaster socket lifecycle `#m2 #remote`
+- implement `SshHost`: shell out to system `ssh` with `ControlMaster` for connection reuse; drop-guard runs `ssh -O exit` on shutdown. The `Host` trait + `LocalHost` shipped in chunk 1. `#m2 #remote`
 - extend Transcript Watcher to poll remote transcript files at configurable interval over the host's SSH channel `#m2 #attention #remote`
 - extend TmuxDriver to attach into remote tmux via a persistent local tmux window running `ssh -t host tmux attach` `#m2 #attachment #remote`
 

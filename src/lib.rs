@@ -2,6 +2,7 @@ pub mod attachment;
 pub mod catalog;
 pub mod config;
 pub mod discovery;
+pub mod host;
 pub mod new_session_modal;
 pub mod repo;
 pub mod session;

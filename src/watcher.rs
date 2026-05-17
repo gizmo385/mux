@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -8,6 +7,7 @@ use std::thread;
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
+use crate::host::Host;
 use crate::session::{Attention, SessionId};
 
 /// How much of the transcript's tail to read when deriving attention.
@@ -38,6 +38,7 @@ pub struct TranscriptWatcher {
     watcher: notify::RecommendedWatcher,
     targets: Arc<Mutex<HashMap<PathBuf, SessionId>>>,
     event_tx: Sender<WatcherEvent>,
+    host: Arc<dyn Host>,
     /// True when a recursive watch on the projects root is active. When
     /// false, `add_target` falls back to per-file watches so the watcher
     /// still works in the degenerate no-discovery-root case.
@@ -59,11 +60,17 @@ impl TranscriptWatcher {
     /// synchronously before the watcher thread starts, so the UI never
     /// has to display `Unknown` for a session that has on-disk content.
     ///
+    /// `host` is the [`Host`] backing this watcher's transcript reads —
+    /// for local M2 it's a [`crate::host::LocalHost`]. The watcher itself
+    /// is tied to the local filesystem via `notify`; remote hosts get
+    /// their own polling pipeline in the next chunk.
+    ///
     /// # Errors
     /// Returns `notify::Error` if the platform watcher cannot be created
     /// or, in the per-file fallback, if any of the initial paths cannot
     /// be watched.
     pub fn start(
+        host: Arc<dyn Host>,
         initial: Vec<(SessionId, PathBuf)>,
         discovery_root: Option<&Path>,
     ) -> notify::Result<(Self, Receiver<WatcherEvent>)> {
@@ -93,7 +100,7 @@ impl TranscriptWatcher {
         for (id, path) in &initial {
             let _ = event_tx.send(WatcherEvent::Attention(AttentionUpdate {
                 id: id.clone(),
-                attention: derive_attention(path),
+                attention: derive_attention(host.as_ref(), path),
             }));
         }
 
@@ -103,6 +110,7 @@ impl TranscriptWatcher {
 
         let targets_for_thread = Arc::clone(&targets);
         let event_tx_for_thread = event_tx.clone();
+        let host_for_thread = Arc::clone(&host);
         thread::spawn(move || {
             for res in notify_rx {
                 let Ok(event) = res else { continue };
@@ -122,7 +130,7 @@ impl TranscriptWatcher {
                     let outgoing = match known_id {
                         Some(id) => WatcherEvent::Attention(AttentionUpdate {
                             id,
-                            attention: derive_attention(&path),
+                            attention: derive_attention(host_for_thread.as_ref(), &path),
                         }),
                         None => WatcherEvent::NewTranscript(path),
                     };
@@ -138,6 +146,7 @@ impl TranscriptWatcher {
                 watcher,
                 targets,
                 event_tx,
+                host,
                 has_recursive_root,
             },
             event_rx,
@@ -158,7 +167,7 @@ impl TranscriptWatcher {
         if !self.has_recursive_root {
             self.watcher.watch(&path, RecursiveMode::NonRecursive)?;
         }
-        let attention = derive_attention(&path);
+        let attention = derive_attention(self.host.as_ref(), &path);
         if let Ok(mut targets) = self.targets.lock() {
             targets.insert(path, id.clone());
         }
@@ -170,26 +179,19 @@ impl TranscriptWatcher {
 }
 
 /// Derive an attention state from the most recent meaningful JSONL entry in
-/// `transcript_path`. Reads only the last `TAIL_BYTES` of the file; the
-/// (possibly truncated) first line is discarded by virtue of failing to
-/// parse, and the remaining lines are walked to find the latest
+/// `transcript_path`. Reads only the last `TAIL_BYTES` of the file through
+/// `host`; the (possibly truncated) first line is discarded by virtue of
+/// failing to parse, and the remaining lines are walked to find the latest
 /// conversational entry.
 #[must_use]
-pub fn derive_attention(transcript_path: &Path) -> Attention {
-    let Ok(mut file) = File::open(transcript_path) else {
+pub fn derive_attention(host: &dyn Host, transcript_path: &Path) -> Attention {
+    let Ok(tail) = host.read_tail(transcript_path, TAIL_BYTES) else {
         return Attention::Unknown;
     };
-    let Ok(metadata) = file.metadata() else {
-        return Attention::Unknown;
-    };
-    let start = metadata.len().saturating_sub(TAIL_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return Attention::Unknown;
-    }
 
     let mut last: Option<EntryKind> = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+    for line in tail.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if let Some(kind) = classify(&value) {
@@ -229,7 +231,11 @@ fn classify(value: &serde_json::Value) -> Option<EntryKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::host::LocalHost;
+
+    fn host() -> LocalHost {
+        LocalHost::new()
+    }
 
     fn write_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
         let f = tempfile::NamedTempFile::new().unwrap();
@@ -241,7 +247,7 @@ mod tests {
     #[test]
     fn empty_file_is_unknown() {
         let f = tempfile::NamedTempFile::new().unwrap();
-        assert_eq!(derive_attention(f.path()), Attention::Unknown);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::Unknown);
     }
 
     #[test]
@@ -251,7 +257,7 @@ mod tests {
             r#"{"type":"file-history-snapshot"}"#,
             r#"{"type":"ai-title","title":"x"}"#,
         ]);
-        assert_eq!(derive_attention(f.path()), Attention::Unknown);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::Unknown);
     }
 
     #[test]
@@ -260,7 +266,7 @@ mod tests {
             r#"{"type":"user","message":"hi"}"#,
             r#"{"type":"assistant","message":"hello"}"#,
         ]);
-        assert_eq!(derive_attention(f.path()), Attention::NeedsInput);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
     }
 
     #[test]
@@ -269,7 +275,7 @@ mod tests {
             r#"{"type":"assistant","message":"hello"}"#,
             r#"{"type":"user","message":"do thing"}"#,
         ]);
-        assert_eq!(derive_attention(f.path()), Attention::Working);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
     }
 
     #[test]
@@ -278,7 +284,7 @@ mod tests {
             r#"{"type":"assistant","message":"running tool"}"#,
             r#"{"type":"user","toolUseResult":{"stdout":"ok"}}"#,
         ]);
-        assert_eq!(derive_attention(f.path()), Attention::Working);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
     }
 
     #[test]
@@ -289,12 +295,12 @@ mod tests {
             r#"{"type":"file-history-snapshot"}"#,
             r#"{"type":"ai-title","title":"x"}"#,
         ]);
-        assert_eq!(derive_attention(f.path()), Attention::NeedsInput);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
     }
 
     #[test]
     fn nonexistent_file_is_unknown() {
         let path = std::path::PathBuf::from("/nonexistent/path/foo.jsonl");
-        assert_eq!(derive_attention(&path), Attention::Unknown);
+        assert_eq!(derive_attention(&host(), &path), Attention::Unknown);
     }
 }

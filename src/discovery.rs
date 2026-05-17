@@ -1,8 +1,9 @@
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use crate::session::{Attention, Host, Session, SessionId};
+use crate::host::Host;
+use crate::session::{Attention, Session, SessionId};
 use crate::worktree;
 
 #[must_use]
@@ -10,40 +11,26 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
-/// Discover sessions by scanning `root` (typically `~/.claude/projects`).
+/// Discover sessions by listing `root` (typically `~/.claude/projects`)
+/// through the given `Host`. The same code path serves the local case and
+/// the future SSH case — the only thing that varies is the `Host` impl.
 ///
 /// # Errors
-/// Returns `io::Error` if a project subdirectory or transcript file is
-/// unreadable. A missing `root` directory is treated as "no sessions"
-/// and yields an empty `Vec`.
-pub fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
+/// Returns `io::Error` if `host.list_transcripts` or the per-transcript
+/// reads fail. A missing `root` directory is treated as "no sessions"
+/// (see [`crate::host::Host::list_transcripts`]) and yields an empty `Vec`.
+pub fn discover(host: &dyn Host, root: &Path) -> io::Result<Vec<Session>> {
     let mut sessions = Vec::new();
-    let entries = match fs::read_dir(root) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(sessions),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        for jsonl in fs::read_dir(entry.path())? {
-            let jsonl = jsonl?;
-            let path = jsonl.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(s) = build_session(&path)? {
-                sessions.push(s);
-            }
+    for stat in host.list_transcripts(root)? {
+        if let Some(s) = build_session(host, &stat.path, stat.mtime)? {
+            sessions.push(s);
         }
     }
     Ok(sessions)
 }
 
-/// Build a `Session` from a single transcript path. Reused by the
-/// transcript watcher's discovery flow when a new `.jsonl` appears
+/// Build a `Session` from a single transcript path and its mtime. Reused
+/// by the transcript watcher's discovery flow when a new `.jsonl` appears
 /// mid-run, so both startup discovery and live discovery produce
 /// identically-shaped sessions.
 ///
@@ -56,31 +43,32 @@ pub fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
 /// generate failed-attach noise.
 ///
 /// # Errors
-/// Returns `io::Error` if metadata or the transcript itself cannot be
-/// read.
-pub fn build_session(transcript_path: &Path) -> io::Result<Option<Session>> {
+/// Returns `io::Error` if the transcript cannot be read through the host.
+pub fn build_session(
+    host: &dyn Host,
+    transcript_path: &Path,
+    mtime: SystemTime,
+) -> io::Result<Option<Session>> {
     let id = match transcript_path.file_stem().and_then(|s| s.to_str()) {
         Some(s) => SessionId(s.to_string()),
         None => return Ok(None),
     };
-    let metadata = fs::metadata(transcript_path)?;
-    let last_activity = metadata.modified()?;
-    let transcript_meta = read_transcript_meta(transcript_path)?;
+    let transcript_meta = read_transcript_meta(host, transcript_path)?;
     let project_dir = transcript_meta
         .cwd
         .unwrap_or_else(|| fallback_dir(transcript_path));
-    if !project_dir.is_dir() {
+    if !host.is_dir(&project_dir) {
         return Ok(None);
     }
-    let title = task_toml_title(&project_dir)
+    let title = task_toml_title(host, &project_dir)
         .or(transcript_meta.ai_title)
         .or(transcript_meta.first_user_message);
     Ok(Some(Session {
         id,
-        host: Host::Local,
+        host: host.id().clone(),
         project_dir,
         transcript_path: transcript_path.to_path_buf(),
-        last_activity,
+        last_activity: mtime,
         attention: Attention::Unknown,
         title,
     }))
@@ -108,13 +96,11 @@ const FIRST_USER_MSG_MAX_CHARS: usize = 60;
 /// ai-title from the *last* `{"type":"ai-title",...}` entry (titles
 /// refine as the session grows), and the first non-empty user message
 /// for the title-fallback path. Malformed JSON lines are skipped.
-fn read_transcript_meta(transcript_path: &Path) -> io::Result<TranscriptMeta> {
-    let file = File::open(transcript_path)?;
-    let reader = BufReader::new(file);
+fn read_transcript_meta(host: &dyn Host, transcript_path: &Path) -> io::Result<TranscriptMeta> {
+    let raw = host.read_to_string(transcript_path)?;
     let mut meta = TranscriptMeta::default();
-    for line in reader.lines() {
-        let line = line?;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if meta.cwd.is_none()
@@ -187,10 +173,11 @@ fn normalize_for_title(raw: &str) -> String {
     taken
 }
 
-fn task_toml_title(project_dir: &Path) -> Option<String> {
-    worktree::read_task_metadata(project_dir)
-        .ok()
-        .map(|m| m.task)
+fn task_toml_title(host: &dyn Host, project_dir: &Path) -> Option<String> {
+    let raw = host
+        .read_to_string(&worktree::task_metadata_path(project_dir))
+        .ok()?;
+    worktree::parse_task_metadata(&raw).ok().map(|m| m.task)
 }
 
 fn fallback_dir(transcript_path: &Path) -> PathBuf {
@@ -207,7 +194,8 @@ fn fallback_dir(transcript_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::create_dir_all;
+    use crate::host::LocalHost;
+    use std::fs::{self, create_dir_all};
 
     /// Build the standard "real cwd + project entry" scaffolding under a
     /// fresh tempdir. Returns `(tempdir, projects_root, real_cwd)` so the
@@ -219,6 +207,12 @@ mod tests {
         create_dir_all(&projects).unwrap();
         create_dir_all(&cwd).unwrap();
         (tmp, projects, cwd)
+    }
+
+    /// Test-local shorthand: every test in this module discovers against
+    /// the local filesystem, so wrap the explicit-host call.
+    fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
+        discover(&LocalHost::new(), root)
     }
 
     #[test]

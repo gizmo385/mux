@@ -128,7 +128,25 @@ pub fn resolve_default_base_branch(repo: &Path) -> Option<String> {
 /// [`WorktreeError::TomlParse`] if its contents don't deserialize.
 pub fn read_task_metadata(worktree: &Path) -> Result<TaskMetadata, WorktreeError> {
     let raw = fs::read_to_string(worktree.join(METADATA_PATH))?;
-    toml::from_str(&raw).map_err(WorktreeError::TomlParse)
+    parse_task_metadata(&raw)
+}
+
+/// Parse already-loaded task metadata TOML. Split from [`read_task_metadata`]
+/// so callers that go through the [`crate::host::Host`] abstraction can do
+/// their own (possibly remote) read and then parse here.
+///
+/// # Errors
+/// Returns [`WorktreeError::TomlParse`] if the input doesn't deserialize.
+pub fn parse_task_metadata(raw: &str) -> Result<TaskMetadata, WorktreeError> {
+    toml::from_str(raw).map_err(WorktreeError::TomlParse)
+}
+
+/// Canonical relative path of a worktree's task metadata file, exposed so
+/// the [`crate::host::Host`]-backed read in `discovery` doesn't duplicate
+/// the convention.
+#[must_use]
+pub fn task_metadata_path(worktree: &Path) -> PathBuf {
+    worktree.join(METADATA_PATH)
 }
 
 fn write_task_metadata(worktree: &Path, meta: &TaskMetadata) -> Result<(), WorktreeError> {

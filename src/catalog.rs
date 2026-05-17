@@ -60,14 +60,14 @@ impl SessionCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::Host;
+    use crate::session::HostId;
     use std::path::PathBuf;
     use std::time::SystemTime;
 
     fn session(id: &str) -> Session {
         Session {
             id: SessionId(id.to_string()),
-            host: Host::Local,
+            host: HostId::local(),
             project_dir: PathBuf::from("/proj"),
             transcript_path: PathBuf::from(format!("/transcripts/{id}.jsonl")),
             last_activity: SystemTime::UNIX_EPOCH,

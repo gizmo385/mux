@@ -9,8 +9,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### M0 — Local dashboard
 
 - tune attention heuristic after dogfooding (current rules: assistant → needs-input, user/tool result → working, mtime > 1h → idle); make thresholds configurable in M4 `#m0 #attention`
-- dogfood M0 for a week; record friction notes for M1 / M2 scoping `#m0 #dogfood`
-- add a switch-latency smoke test (or criterion benchmark) that fails if a focus-change round trip exceeds a budget (target: ≤ 50ms against an in-memory catalog populated with N sessions). Reason: claude-squad's 10+ second switching is the empirical failure mode we exist to avoid; make regressions visible in CI rather than catching them only in dogfooding. `#m0 #perf`
 
 ### M1 — Session creation + worktree management
 
@@ -54,3 +52,4 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 - post-M1 polish: dashboard grouping by repo — sessions render under their parent repo headers, with collapsing per-repo. Deferred until the flat-list rendering of M1 is dogfooded; we may not need grouping if labels are enough. `#post-m1 #ui`
 - decide UX when agent-mux is launched from inside an existing tmux session vs from a bare shell `#m0 #ui`
 - flesh out `agent-mux-review` Layer 2 categories as project-specific rules emerge in `ARCHITECTURE.md` `#review #setup`
+- post-M2: switch-latency smoke test (or criterion benchmark) that fails if a focus-change round trip exceeds a budget (target: ≤ 50ms against an in-memory catalog populated with N sessions). Reason: claude-squad's 10+ second switching is the empirical failure mode we exist to avoid. Deferred from M0 — the budget needs to cover both local and remote switching, and setting a local-only number now risks rework once M2 lands. `#post-m2 #perf`

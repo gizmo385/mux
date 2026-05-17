@@ -26,10 +26,15 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 - remote-session cache: cleanup of orphaned `~/.cache/agent-mux/sessions/<host>.json` files when a host is removed from config. Today the file is left on disk; harmless (it's never read because we only load cache for hosts in current config) but leaks bytes. Probably bundles with the post-M5 shutdown/cleanup work. `#m2 #remote #cleanup`
 - remote-session cache: decide whether to visually distinguish cached-but-not-yet-refreshed rows from live ones. Shipped with no distinction in 2026-05 — argument was that the cache reflects last-known state and the staleness window is bounded by the SSH handshake (~seconds). Revisit if dogfooding shows confusion ("why is this row showing stale attention?"). Lowest-cost option: extra dim modifier on rows whose host is in `pending_hosts`. `#m2 #remote #ux #post-cache`
 
+### M0 — Local dashboard polish
+
+- footer keybind line is dense after the group-jump hints landed (2026-05-17): `j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · q: quit  ·  return: …` will truncate on narrow terminals. Not a regression (the line was already long) but worth a follow-up. Plausible shapes: (a) drop secondary hints (`t: terminal`, `n: new`) when terminal width < threshold; (b) hide the group-jump hints once the user has used them once (a "learned" signal); (c) split into two footer rows. Defer until dogfooding shows whether it actually bites. `#m0 #ui #footer`
+
 ### M3 — Inline preview
 
 - record observations: does seeing inline preview change which sessions the user attaches to? Does the user want richer chat? This is the Shape B pivot decision input. `#m3 #dogfood`
 - decide preview verbosity config knob (M5): how many entries, whether to show tool result body, whether thinking blocks are surfaced. SPEC.md notes "configuration for preview verbosity" as part of M3 scope but defers shape; revisit once dogfooding has surfaced what the user actually wants to tune. `#m3 #m5 #config #dogfood`
+- markdown-aware preview rendering (split out from the newline fix, 2026-05-17): with newlines now preserved, the next readability gain is surfacing inline markdown — bold (`**x**`), italic (`_x_`), inline code (`` `x` ``), and bullet/numbered list glyphs. Risks: parser scope creep, mis-rendered code blocks, performance on large messages. Defer until newline-preservation has been dogfooded; that change may already be enough. `#m3 #ui #preview #dogfood`
 
 ### M4 — Attention notifications
 

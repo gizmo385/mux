@@ -26,7 +26,8 @@ use agent_mux::config::{Config, Theme};
 use agent_mux::dashboard::{
     DisplayRow, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
     build_display_rows_filtered, compose_preview_pane_lines, first_session_index, matches_query,
-    next_session_index, prev_session_index,
+    next_host_index, next_project_index, next_session_index, prev_host_index, prev_project_index,
+    prev_session_index,
 };
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::host::{Host, LocalHost, SshHost};
@@ -60,10 +61,14 @@ const REPO_REFRESH_TTL: Duration = Duration::from_secs(30);
 /// candidate for `[preview]` config.
 const PREVIEW_BYTES: u64 = 64 * 1024;
 
-/// Maximum `PreviewLine`s rendered in the preview pane. The parser
-/// returns the trailing N; the pane shows that many at most. M5
-/// candidate for `[preview]` config.
-const PREVIEW_LIMIT: usize = 20;
+/// Maximum `PreviewLine`s the parser keeps from the transcript tail.
+/// This is the source-entry cap; the renderer then trims composed
+/// visual lines to the actual pane height at render time, so the cap
+/// only matters as an upper bound on how much we're willing to render
+/// on a very tall terminal. 100 covers ~50-row preview panes even when
+/// every entry is a single-line tool call, with headroom for longer
+/// multi-line assistant replies. M5 candidate for `[preview]` config.
+const PREVIEW_LIMIT: usize = 100;
 
 fn main() -> io::Result<()> {
     // `args().skip(1)` drops argv[0] (program path). Anything left is
@@ -835,6 +840,34 @@ impl App {
         }
     }
 
+    fn next_project(&mut self) {
+        let rows = self.current_rows();
+        if let Some(i) = next_project_index(self.list_state.selected(), &rows) {
+            self.list_state.select(Some(i));
+        }
+    }
+
+    fn prev_project(&mut self) {
+        let rows = self.current_rows();
+        if let Some(i) = prev_project_index(self.list_state.selected(), &rows) {
+            self.list_state.select(Some(i));
+        }
+    }
+
+    fn next_host(&mut self) {
+        let rows = self.current_rows();
+        if let Some(i) = next_host_index(self.list_state.selected(), &rows) {
+            self.list_state.select(Some(i));
+        }
+    }
+
+    fn prev_host(&mut self) {
+        let rows = self.current_rows();
+        if let Some(i) = prev_host_index(self.list_state.selected(), &rows) {
+            self.list_state.select(Some(i));
+        }
+    }
+
     /// Resolve the currently-selected list row to a session. Returns
     /// `None` if no row is selected, the selected row is a header (the
     /// navigation helpers shouldn't allow this but the lookup stays
@@ -893,6 +926,22 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 }
                 Some(Action::Prev) => {
                     app.prev();
+                    None
+                }
+                Some(Action::NextProject) => {
+                    app.next_project();
+                    None
+                }
+                Some(Action::PrevProject) => {
+                    app.prev_project();
+                    None
+                }
+                Some(Action::NextHost) => {
+                    app.next_host();
+                    None
+                }
+                Some(Action::PrevHost) => {
+                    app.prev_host();
                     None
                 }
                 Some(Action::Attach) => app.attach_selected(),
@@ -983,6 +1032,10 @@ enum Action {
     Quit,
     Next,
     Prev,
+    NextProject,
+    PrevProject,
+    NextHost,
+    PrevHost,
     Attach,
     SpawnTerminal,
     NewSession,
@@ -991,10 +1044,24 @@ enum Action {
 }
 
 fn action_for(key: KeyEvent) -> Option<Action> {
+    // Ctrl-j / Ctrl-k jump host. Handled first so they don't fall through
+    // to the lowercase j/k single-session navigation below. Ctrl-C is
+    // already intercepted upstream so it never reaches this function.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('j') => Some(Action::NextHost),
+            KeyCode::Char('k') => Some(Action::PrevHost),
+            _ => None,
+        };
+    }
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Next),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Prev),
+        // Shift-j / Shift-k jump project. Crossterm reports these as the
+        // uppercase glyph rather than 'j' + SHIFT, hence the literal 'J' / 'K'.
+        KeyCode::Char('J') => Some(Action::NextProject),
+        KeyCode::Char('K') => Some(Action::PrevProject),
         KeyCode::Enter => Some(Action::Attach),
         KeyCode::Char('t') => Some(Action::SpawnTerminal),
         KeyCode::Char('n') => Some(Action::NewSession),
@@ -1072,10 +1139,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             Some(s) => (app.preview_cache.get(&s.id).cloned(), preview_pane_title(s)),
             None => (None, " preview ".to_string()),
         };
+        // Inner height = pane height minus the top + bottom border.
+        // This is the line budget the composer trims to so the newest
+        // entry always sits at the bottom of the visible area.
+        let max_preview_lines = usize::from(split[1].height.saturating_sub(2));
         let body = compose_preview_pane_lines(
             entry.as_ref(),
             app.list_state.selected().is_some(),
             &app.theme,
+            max_preview_lines,
         );
         let preview = Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(preview_title))
@@ -1186,7 +1258,7 @@ fn compose_footer(
         String::new()
     };
     format!(
-        " ↑/↓ or j/k: move · ⏎: attach · t: terminal · p: preview · n: new · q: quit  ·  return: {return_hint}{suffix} "
+        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · q: quit  ·  return: {return_hint}{suffix} "
     )
 }
 
@@ -1347,6 +1419,13 @@ mod tests {
     fn footer_keybind_line_advertises_preview_toggle() {
         let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
         assert!(s.contains("p: preview"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_keybind_line_advertises_group_jumps() {
+        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
+        assert!(s.contains("J/K: project"), "got: {s}");
+        assert!(s.contains("⌃j/⌃k: host"), "got: {s}");
     }
 
     #[test]

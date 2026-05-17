@@ -23,10 +23,14 @@ use serde_json::Value;
 /// surfaced — preview is the "what's happening" pane, not a debugger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewLine {
-    /// Human-authored prompt. Whitespace-collapsed.
+    /// Human-authored prompt. Intra-line whitespace runs are collapsed
+    /// to a single space; `\n` separators between paragraphs survive so
+    /// the renderer can preserve structure.
     User(String),
     /// Assistant prose response. Excludes `thinking` blocks, which are
     /// the model's internal reasoning and not useful in a glance-preview.
+    /// Same whitespace handling as [`PreviewLine::User`] — newlines kept,
+    /// inner spaces/tabs collapsed.
     Assistant(String),
     /// One tool invocation. `summary` is a short, tool-specific hint
     /// (file path for Read/Edit, description or command for Bash, etc.)
@@ -109,7 +113,11 @@ fn extract_user(value: &Value) -> Vec<PreviewLine> {
     if text.is_empty() || is_command_envelope(&text) {
         return Vec::new();
     }
-    vec![PreviewLine::User(collapse_whitespace(&text))]
+    let collapsed = collapse_inline_whitespace(&text);
+    if collapsed.is_empty() {
+        return Vec::new();
+    }
+    vec![PreviewLine::User(collapsed)]
 }
 
 fn extract_user_text(message: &Value) -> String {
@@ -128,7 +136,7 @@ fn extract_user_text(message: &Value) -> String {
             continue;
         };
         if !out.is_empty() {
-            out.push(' ');
+            out.push('\n');
         }
         out.push_str(t);
     }
@@ -145,7 +153,7 @@ fn extract_assistant(value: &Value) -> Vec<PreviewLine> {
         return Vec::new();
     };
     if let Some(s) = message.get("content").and_then(Value::as_str) {
-        let collapsed = collapse_whitespace(s);
+        let collapsed = collapse_inline_whitespace(s);
         return if collapsed.is_empty() {
             Vec::new()
         } else {
@@ -163,7 +171,7 @@ fn extract_assistant(value: &Value) -> Vec<PreviewLine> {
         match block_type {
             "text" => {
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
-                    let collapsed = collapse_whitespace(t);
+                    let collapsed = collapse_inline_whitespace(t);
                     if !collapsed.is_empty() {
                         lines.push(PreviewLine::Assistant(collapsed));
                     }
@@ -239,8 +247,22 @@ fn is_error_result(result: &Value) -> bool {
     result.get("error").is_some()
 }
 
-fn collapse_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Collapse runs of spaces and tabs within each line, but keep `\n`
+/// separators so the dashboard renderer can preserve paragraph structure.
+/// Leading and trailing empty lines are stripped; empty lines in the
+/// middle are kept (they're how the writer signalled a paragraph break).
+fn collapse_inline_whitespace(s: &str) -> String {
+    let mut lines: Vec<String> = s
+        .split('\n')
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    while lines.first().is_some_and(String::is_empty) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -310,7 +332,7 @@ mod tests {
         let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first"},{"type":"image","source":{}},{"type":"text","text":"second"}]}}"#;
         assert_eq!(
             parse_preview(input, 10),
-            vec![PreviewLine::User("first second".to_string())]
+            vec![PreviewLine::User("first\nsecond".to_string())]
         );
     }
 
@@ -327,12 +349,32 @@ mod tests {
     }
 
     #[test]
-    fn user_text_with_internal_whitespace_is_collapsed() {
+    fn user_text_collapses_intra_line_whitespace_but_keeps_newlines() {
+        // Inner space/tab runs collapse; the blank line between
+        // paragraphs is preserved so the renderer can show a break.
         let input =
             r#"{"type":"user","message":{"role":"user","content":"hello\n\n  world\t\there"}}"#;
         assert_eq!(
             parse_preview(input, 10),
-            vec![PreviewLine::User("hello world here".to_string())]
+            vec![PreviewLine::User("hello\n\nworld here".to_string())]
+        );
+    }
+
+    #[test]
+    fn user_text_strips_leading_and_trailing_blank_lines() {
+        let input = r#"{"type":"user","message":{"role":"user","content":"\n\n  hello\n\n"}}"#;
+        assert_eq!(
+            parse_preview(input, 10),
+            vec![PreviewLine::User("hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn assistant_text_preserves_paragraph_breaks() {
+        let input = r#"{"type":"assistant","message":{"role":"assistant","content":"line one\n\nline two"}}"#;
+        assert_eq!(
+            parse_preview(input, 10),
+            vec![PreviewLine::Assistant("line one\n\nline two".to_string())]
         );
     }
 

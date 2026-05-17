@@ -266,6 +266,82 @@ pub fn first_session_index(rows: &[DisplayRow]) -> Option<usize> {
         .position(|r| matches!(r, DisplayRow::SessionRow(_)))
 }
 
+/// First `SessionRow` index belonging to the project group the current
+/// selection sits *under* — i.e., the next project's first session,
+/// wrapping at the end. Returns `None` when there's no current selection,
+/// no enclosing project, or there's only one project group in `rows`
+/// (so there's nowhere distinct to jump to).
+#[must_use]
+pub fn next_project_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
+    walk_to_group(current, rows, 1, is_project_header)
+}
+
+/// First `SessionRow` index of the previous project group, wrapping at
+/// the start. Same semantics as [`next_project_index`] in reverse — lands
+/// on the first session under the previous project header, not the last,
+/// so repeated `K` presses page through projects deterministically from
+/// their first session.
+#[must_use]
+pub fn prev_project_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
+    walk_to_group(current, rows, -1, is_project_header)
+}
+
+/// First `SessionRow` index belonging to the next host group, wrapping
+/// at the end. Returns `None` when the dashboard has only one host (so
+/// there's nowhere distinct to go).
+#[must_use]
+pub fn next_host_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
+    walk_to_group(current, rows, 1, is_host_header)
+}
+
+/// First `SessionRow` index belonging to the previous host group,
+/// wrapping at the start.
+#[must_use]
+pub fn prev_host_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
+    walk_to_group(current, rows, -1, is_host_header)
+}
+
+fn is_project_header(row: &DisplayRow) -> bool {
+    matches!(row, DisplayRow::ProjectHeader(_))
+}
+
+fn is_host_header(row: &DisplayRow) -> bool {
+    matches!(row, DisplayRow::HostHeader(_))
+}
+
+/// Shared engine for the four group-jump helpers. Identifies the group
+/// header (`is_header`) the current selection sits under, finds the
+/// next or previous header of the same kind (wrapping), then returns
+/// the first `SessionRow` index after that header.
+///
+/// Returns `None` when there's no current selection, when the current
+/// row has no preceding header (malformed row list), or when there are
+/// fewer than two groups of this kind (no distinct destination).
+fn walk_to_group(
+    current: Option<usize>,
+    rows: &[DisplayRow],
+    step: isize,
+    is_header: impl Fn(&DisplayRow) -> bool,
+) -> Option<usize> {
+    let cur = current?;
+    if rows.is_empty() {
+        return None;
+    }
+    let cur_group = (0..=cur).rev().find(|&i| is_header(&rows[i]))?;
+    let groups: Vec<usize> = (0..rows.len()).filter(|&i| is_header(&rows[i])).collect();
+    if groups.len() < 2 {
+        return None;
+    }
+    let cur_pos = groups.iter().position(|&i| i == cur_group)?;
+    let next_pos = if step > 0 {
+        (cur_pos + 1) % groups.len()
+    } else {
+        (cur_pos + groups.len() - 1) % groups.len()
+    };
+    let target_header = groups[next_pos];
+    (target_header + 1..rows.len()).find(|&i| matches!(rows[i], DisplayRow::SessionRow(_)))
+}
+
 /// Per-session entry in the dashboard's preview cache. `Loading` means
 /// a fetch is in flight; `Ready` is the parsed lines from the last
 /// completed fetch; `Failed` carries a short error for display. An
@@ -290,23 +366,40 @@ pub enum PreviewEntry {
 /// Absent and `Loading` both render as "loading…" because absent means
 /// "the dispatcher will create a `Loading` on the next tick"; the user
 /// shouldn't see a spurious empty pane in between.
+///
+/// `max_lines` is the pane's inner height (frame area minus borders).
+/// When the composed body exceeds that, lines are dropped from the
+/// **top**, never the bottom — the newest preview entry always stays
+/// pinned to the bottom of the pane regardless of terminal size. This
+/// is what lets a tall terminal naturally show more entries and a short
+/// terminal never hide the most recent activity. Trimming a multi-line
+/// entry mid-body is acceptable: the visual effect reads like scroll.
 #[must_use]
 pub fn compose_preview_pane_lines(
     entry: Option<&PreviewEntry>,
     selected: bool,
     theme: &Theme,
+    max_lines: usize,
 ) -> Vec<Line<'static>> {
-    if !selected {
-        return vec![dim_line("(no session selected)")];
-    }
-    match entry {
-        None | Some(PreviewEntry::Loading) => vec![dim_line("loading…")],
-        Some(PreviewEntry::Ready(lines)) if lines.is_empty() => vec![dim_line("(no preview)")],
-        Some(PreviewEntry::Ready(lines)) => compose_preview_lines(lines, theme),
-        Some(PreviewEntry::Failed(msg)) => {
-            vec![dim_line(&format!("preview unavailable: {msg}"))]
+    let mut lines = if selected {
+        match entry {
+            None | Some(PreviewEntry::Loading) => vec![dim_line("loading…")],
+            Some(PreviewEntry::Ready(lines)) if lines.is_empty() => {
+                vec![dim_line("(no preview)")]
+            }
+            Some(PreviewEntry::Ready(lines)) => compose_preview_lines(lines, theme),
+            Some(PreviewEntry::Failed(msg)) => {
+                vec![dim_line(&format!("preview unavailable: {msg}"))]
+            }
         }
+    } else {
+        vec![dim_line("(no session selected)")]
+    };
+    if lines.len() > max_lines {
+        let drop = lines.len() - max_lines;
+        lines.drain(..drop);
     }
+    lines
 }
 
 fn dim_line(text: &str) -> Line<'static> {
@@ -321,29 +414,45 @@ fn dim_line(text: &str) -> Line<'static> {
 /// the `Paragraph` widget wraps as needed.
 ///
 /// Glyph + colour scheme:
-/// - `> ` bold for user prompts (the human's voice, visually loud)
-/// - `  ` dim for assistant prose (the response, present but quieter)
-/// - `⚒ ` cyan for tool calls (action, distinct from chat)
-/// - `↳ ` green/red for tool results (terse outcome only — open the
-///   session for detail)
+/// - `> ` bold (+ `theme.user_fg`) for user prompts — the human's voice,
+///   visually loud via bold
+/// - `  ` default weight (+ `theme.assistant_fg`) for assistant prose —
+///   readable at the terminal's normal foreground, distinguished from
+///   user by absence of bold rather than by a dim modifier (that
+///   modifier rendered as unreadable-faint on many palettes)
+/// - `⚒ ` `theme.tool_use` for tool calls (action, distinct from chat)
+/// - `↳ ` `theme.tool_result_ok` / `theme.tool_result_err` for tool
+///   results (terse outcome only — open the session for detail)
+///
+/// User and Assistant entries may contain `\n`-separated paragraphs;
+/// each source line becomes its own ratatui `Line` so the paragraph
+/// structure survives into the rendered pane. Continuation lines reuse
+/// the entry's style and align under the first line's content (no glyph
+/// repetition). Long entries are capped — see `ENTRY_MAX_LINES`.
 #[must_use]
 pub fn compose_preview_lines(lines: &[PreviewLine], theme: &Theme) -> Vec<Line<'static>> {
     lines
         .iter()
-        .map(|line| preview_line_to_styled(line, theme))
+        .flat_map(|line| preview_line_to_styled(line, theme))
         .collect()
 }
 
-fn preview_line_to_styled(line: &PreviewLine, theme: &Theme) -> Line<'static> {
+/// Cap on visual lines emitted per User/Assistant entry. A multi-page
+/// assistant reply must not be allowed to crowd out more recent activity
+/// in a pane that doesn't scroll. When this trips, the last emitted line
+/// becomes "…" so the user knows there's more behind an attach.
+const ENTRY_MAX_LINES: usize = 6;
+
+fn preview_line_to_styled(line: &PreviewLine, theme: &Theme) -> Vec<Line<'static>> {
     match line {
-        PreviewLine::User(text) => Line::from(vec![
-            Span::styled("> ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::styled(text.clone(), Style::new().add_modifier(Modifier::BOLD)),
-        ]),
-        PreviewLine::Assistant(text) => Line::from(vec![
-            Span::raw("  "),
-            Span::styled(text.clone(), Style::new().add_modifier(Modifier::DIM)),
-        ]),
+        PreviewLine::User(text) => {
+            let style = apply_fg(Style::new().add_modifier(Modifier::BOLD), theme.user_fg);
+            multiline_entry(text, "> ", "  ", style)
+        }
+        PreviewLine::Assistant(text) => {
+            let style = apply_fg(Style::new(), theme.assistant_fg);
+            multiline_entry(text, "  ", "  ", style)
+        }
         PreviewLine::ToolUse { name, summary } => {
             let body = if summary.is_empty() {
                 name.clone()
@@ -351,7 +460,10 @@ fn preview_line_to_styled(line: &PreviewLine, theme: &Theme) -> Line<'static> {
                 format!("{name}: {summary}")
             };
             let style = apply_fg(Style::new(), theme.tool_use);
-            Line::from(vec![Span::styled("⚒ ", style), Span::styled(body, style)])
+            vec![Line::from(vec![
+                Span::styled("⚒ ", style),
+                Span::styled(body, style),
+            ])]
         }
         PreviewLine::ToolResult { ok } => {
             let (label, colour) = if *ok {
@@ -360,9 +472,47 @@ fn preview_line_to_styled(line: &PreviewLine, theme: &Theme) -> Line<'static> {
                 ("error", theme.tool_result_err)
             };
             let style = apply_fg(Style::new(), colour);
-            Line::from(vec![Span::styled("↳ ", style), Span::styled(label, style)])
+            vec![Line::from(vec![
+                Span::styled("↳ ", style),
+                Span::styled(label, style),
+            ])]
         }
     }
+}
+
+/// Render an entry whose body may contain `\n`-separated paragraphs.
+/// First line gets `first_prefix`; subsequent lines get `cont_prefix`
+/// (typically blank-space aligned under the first line's content). If
+/// the body exceeds `ENTRY_MAX_LINES`, the last emitted line is replaced
+/// with a "…" marker so the entry still fits inside its quota.
+fn multiline_entry(
+    text: &str,
+    first_prefix: &'static str,
+    cont_prefix: &'static str,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let chunks: Vec<&str> = text.split('\n').collect();
+    let truncate = chunks.len() > ENTRY_MAX_LINES;
+    let real_count = if truncate {
+        ENTRY_MAX_LINES - 1
+    } else {
+        chunks.len()
+    };
+    let mut out = Vec::with_capacity(real_count + usize::from(truncate));
+    for (i, chunk) in chunks.iter().take(real_count).enumerate() {
+        let prefix = if i == 0 { first_prefix } else { cont_prefix };
+        out.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled((*chunk).to_string(), style),
+        ]));
+    }
+    if truncate {
+        out.push(Line::from(vec![
+            Span::styled(cont_prefix, style),
+            Span::styled("…", style),
+        ]));
+    }
+    out
 }
 
 /// Apply `colour` as a foreground if `Some`; leave the style untouched
@@ -553,6 +703,99 @@ mod tests {
     fn first_session_index_returns_none_for_header_only_input() {
         let rows = vec![DisplayRow::HostHeader(HostId("solo".into()))];
         assert_eq!(first_session_index(&rows), None);
+    }
+
+    // ------- next/prev_project_index, next/prev_host_index -------
+
+    #[test]
+    fn next_project_index_jumps_to_first_session_of_next_project() {
+        let s = vec![
+            session("a", "local", "/x", 0),
+            session("b", "local", "/y", 0),
+            session("c", "local", "/y", 0),
+        ];
+        let rows = build_display_rows(&s);
+        // Layout: H:local(0) P:/x(1) S:a(2) P:/y(3) S:b(4) S:c(5)
+        assert_eq!(next_project_index(Some(2), &rows), Some(4));
+        // From the middle of /y, wraps back to /x's first session.
+        assert_eq!(next_project_index(Some(5), &rows), Some(2));
+    }
+
+    #[test]
+    fn prev_project_index_jumps_to_first_session_of_previous_project() {
+        let s = vec![
+            session("a", "local", "/x", 0),
+            session("b", "local", "/y", 0),
+            session("c", "local", "/y", 0),
+        ];
+        let rows = build_display_rows(&s);
+        // Layout: H:local(0) P:/x(1) S:a(2) P:/y(3) S:b(4) S:c(5)
+        // From either session under /y, K lands on /x's first session.
+        assert_eq!(prev_project_index(Some(4), &rows), Some(2));
+        assert_eq!(prev_project_index(Some(5), &rows), Some(2));
+        // From /x, wraps to /y's first session.
+        assert_eq!(prev_project_index(Some(2), &rows), Some(4));
+    }
+
+    #[test]
+    fn project_jumps_return_none_when_only_one_project_exists() {
+        let s = vec![
+            session("a", "local", "/p", 0),
+            session("b", "local", "/p", 0),
+        ];
+        let rows = build_display_rows(&s);
+        assert_eq!(next_project_index(Some(2), &rows), None);
+        assert_eq!(prev_project_index(Some(2), &rows), None);
+    }
+
+    #[test]
+    fn next_host_index_jumps_to_first_session_of_next_host() {
+        let s = vec![
+            session("a", "alpenglow", "/p", 0),
+            session("b", "local", "/q", 0),
+        ];
+        let rows = build_display_rows(&s);
+        // Layout: H:local(0) P:/q(1) S:b(2) H:alpenglow(3) P:/p(4) S:a(5)
+        assert_eq!(next_host_index(Some(2), &rows), Some(5));
+        // From the alpenglow side, wraps to local's first session.
+        assert_eq!(next_host_index(Some(5), &rows), Some(2));
+    }
+
+    #[test]
+    fn prev_host_index_wraps_at_start() {
+        let s = vec![
+            session("a", "alpenglow", "/p", 0),
+            session("b", "local", "/q", 0),
+        ];
+        let rows = build_display_rows(&s);
+        // Symmetric with next: from local we go to alpenglow and back.
+        assert_eq!(prev_host_index(Some(2), &rows), Some(5));
+        assert_eq!(prev_host_index(Some(5), &rows), Some(2));
+    }
+
+    #[test]
+    fn host_jumps_return_none_when_only_one_host_exists() {
+        let s = vec![
+            session("a", "local", "/x", 0),
+            session("b", "local", "/y", 0),
+        ];
+        let rows = build_display_rows(&s);
+        // Only `local` host, even with multiple projects under it.
+        assert_eq!(next_host_index(Some(2), &rows), None);
+        assert_eq!(prev_host_index(Some(2), &rows), None);
+    }
+
+    #[test]
+    fn group_jumps_return_none_when_no_current_selection() {
+        let s = vec![
+            session("a", "local", "/x", 0),
+            session("b", "local", "/y", 0),
+        ];
+        let rows = build_display_rows(&s);
+        assert_eq!(next_project_index(None, &rows), None);
+        assert_eq!(prev_project_index(None, &rows), None);
+        assert_eq!(next_host_index(None, &rows), None);
+        assert_eq!(prev_host_index(None, &rows), None);
     }
 
     // ------- matches_query -------
@@ -830,6 +1073,66 @@ mod tests {
     }
 
     #[test]
+    fn compose_preview_lines_assistant_with_newlines_emits_one_line_per_paragraph() {
+        let lines = compose_preview_lines_t(&[PreviewLine::Assistant(
+            "intro line\n\nfollow-up paragraph".to_string(),
+        )]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec![
+                "  intro line".to_string(),
+                "  ".to_string(),
+                "  follow-up paragraph".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_user_with_newlines_uses_aligned_continuation_indent() {
+        // Continuation lines drop the `> ` glyph and use a matching
+        // two-space indent so the body aligns under the first line.
+        let lines = compose_preview_lines_t(&[PreviewLine::User("first\nsecond".to_string())]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec!["> first".to_string(), "  second".to_string()]
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_assistant_over_cap_is_truncated_with_marker() {
+        let body = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = compose_preview_lines_t(&[PreviewLine::Assistant(body)]);
+        assert_eq!(
+            preview_strings(&lines),
+            vec![
+                "  line 1".to_string(),
+                "  line 2".to_string(),
+                "  line 3".to_string(),
+                "  line 4".to_string(),
+                "  line 5".to_string(),
+                "  …".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_assistant_exactly_at_cap_is_not_truncated() {
+        let body = (1..=6)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = compose_preview_lines_t(&[PreviewLine::Assistant(body)]);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(
+            preview_strings(&lines).last().unwrap(),
+            &"  line 6".to_string()
+        );
+    }
+
+    #[test]
     fn compose_preview_lines_preserves_input_order() {
         let lines = compose_preview_lines_t(&[
             PreviewLine::User("ask".to_string()),
@@ -847,6 +1150,126 @@ mod tests {
                 "  answer".to_string(),
                 "⚒ Read: f.rs".to_string(),
                 "↳ ok".to_string(),
+            ]
+        );
+    }
+
+    /// The assistant line carries no foreground colour by default — the
+    /// previous hardcoded `Modifier::DIM` is gone — and no bold either,
+    /// so the user/assistant distinction is bold vs. not-bold.
+    #[test]
+    fn compose_preview_lines_assistant_default_style_is_plain_no_dim() {
+        let lines = compose_preview_lines_t(&[PreviewLine::Assistant("answer".to_string())]);
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[1].style.fg, None);
+        assert!(
+            !spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        assert!(
+            !spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_user_default_style_is_bold_no_colour() {
+        let lines = compose_preview_lines_t(&[PreviewLine::User("ask".to_string())]);
+        let spans = &lines[0].spans;
+        assert!(
+            spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn compose_preview_lines_user_fg_theme_override_is_applied() {
+        let theme = Theme {
+            user_fg: Some(ratatui::style::Color::Yellow),
+            ..Theme::default()
+        };
+        let lines = compose_preview_lines(&[PreviewLine::User("ask".to_string())], &theme);
+        assert_eq!(
+            lines[0].spans[1].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn compose_preview_lines_assistant_fg_theme_override_is_applied() {
+        let theme = Theme {
+            assistant_fg: Some(ratatui::style::Color::Blue),
+            ..Theme::default()
+        };
+        let lines = compose_preview_lines(&[PreviewLine::Assistant("a".to_string())], &theme);
+        assert_eq!(
+            lines[0].spans[1].style.fg,
+            Some(ratatui::style::Color::Blue)
+        );
+    }
+
+    /// When the composed pane body fits the height budget, no trimming.
+    #[test]
+    fn compose_preview_pane_lines_passes_through_when_under_budget() {
+        let entry = PreviewEntry::Ready(vec![
+            PreviewLine::User("a".to_string()),
+            PreviewLine::Assistant("b".to_string()),
+        ]);
+        let body = compose_preview_pane_lines(Some(&entry), true, &Theme::default(), 10);
+        assert_eq!(
+            preview_strings(&body),
+            vec!["> a".to_string(), "  b".to_string()]
+        );
+    }
+
+    /// When the composed pane body exceeds the height budget, the
+    /// **top** is trimmed so the most-recent activity stays pinned to
+    /// the bottom of the visible region.
+    #[test]
+    fn compose_preview_pane_lines_drops_oldest_lines_when_over_budget() {
+        let entry = PreviewEntry::Ready(vec![
+            PreviewLine::User("oldest".to_string()),
+            PreviewLine::Assistant("middle".to_string()),
+            PreviewLine::ToolUse {
+                name: "Read".to_string(),
+                summary: "x".to_string(),
+            },
+            PreviewLine::ToolResult { ok: true },
+        ]);
+        let body = compose_preview_pane_lines(Some(&entry), true, &Theme::default(), 2);
+        // 4 source entries -> 4 visual lines; budget 2 keeps the
+        // trailing two (ToolUse + ToolResult), the newest.
+        assert_eq!(
+            preview_strings(&body),
+            vec!["⚒ Read: x".to_string(), "↳ ok".to_string()]
+        );
+    }
+
+    /// Mid-entry trims are acceptable: the visual effect reads like
+    /// scroll. Top 3 lines of a 6-line assistant entry vanish; bottom
+    /// 3 remain.
+    #[test]
+    fn compose_preview_pane_lines_can_trim_mid_entry_at_paragraph_boundary() {
+        let body_text = (1..=6)
+            .map(|i| format!("para {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = PreviewEntry::Ready(vec![PreviewLine::Assistant(body_text)]);
+        let body = compose_preview_pane_lines(Some(&entry), true, &Theme::default(), 3);
+        assert_eq!(
+            preview_strings(&body),
+            vec![
+                "  para 4".to_string(),
+                "  para 5".to_string(),
+                "  para 6".to_string(),
             ]
         );
     }

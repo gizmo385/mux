@@ -113,6 +113,16 @@ pub struct ThemeConfig {
     pub tool_result_ok: Option<String>,
     /// Colour of `↳ error` lines in the preview pane.
     pub tool_result_err: Option<String>,
+    /// Colour of `> …` user prompt lines in the preview pane. Default
+    /// (when absent) is the terminal's foreground; the bold modifier
+    /// still applies regardless of colour.
+    pub user_fg: Option<String>,
+    /// Colour of assistant prose lines in the preview pane. Default
+    /// (when absent) is the terminal's foreground. There is no longer
+    /// a dim modifier baked in — assistant prose was unreadable on
+    /// several common palettes; users who want a quieter assistant can
+    /// set this to e.g. `bright_black` themselves.
+    pub assistant_fg: Option<String>,
 }
 
 /// Resolved theme: each field is the parsed `ratatui::Color` or `None`
@@ -127,6 +137,8 @@ pub struct Theme {
     pub tool_use: Option<Color>,
     pub tool_result_ok: Option<Color>,
     pub tool_result_err: Option<Color>,
+    pub user_fg: Option<Color>,
+    pub assistant_fg: Option<Color>,
 }
 
 impl Theme {
@@ -159,6 +171,8 @@ impl Theme {
             tool_use: Some(Color::Cyan),
             tool_result_ok: Some(Color::Green),
             tool_result_err: Some(Color::Red),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
@@ -175,13 +189,15 @@ impl Theme {
             tool_use: Some(Color::LightCyan),
             tool_result_ok: Some(Color::LightGreen),
             tool_result_err: Some(Color::LightRed),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
-    /// Monochrome: no foreground colours at all. The structural
-    /// modifiers (bold for user prompts, dim for assistant prose) still
-    /// carry the distinctions. For users on terminals without colour,
-    /// or simply for a quieter palette.
+    /// Monochrome: no foreground colours at all. The bold modifier on
+    /// user prompts is the lone structural signal carrying the user
+    /// versus assistant distinction. For users on terminals without
+    /// colour, or simply for a quieter palette.
     #[must_use]
     pub fn preset_mono() -> Self {
         Self::default()
@@ -200,6 +216,8 @@ impl Theme {
             tool_use: Some(Color::Rgb(0xd1, 0xa3, 0x47)),
             tool_result_ok: Some(Color::Rgb(0xb3, 0xa2, 0x28)),
             tool_result_err: Some(Color::Rgb(0xcc, 0x3a, 0x20)),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
@@ -217,6 +235,8 @@ impl Theme {
             tool_use: Some(Color::Rgb(0x39, 0xa3, 0xa3)),
             tool_result_ok: Some(Color::Rgb(0x4c, 0xaa, 0x6c)),
             tool_result_err: Some(Color::Rgb(0xe2, 0x6d, 0x75)),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
@@ -234,6 +254,8 @@ impl Theme {
             tool_use: Some(Color::Rgb(0x26, 0x8b, 0xd2)), // blue
             tool_result_ok: Some(Color::Rgb(0x85, 0x99, 0x00)), // green
             tool_result_err: Some(Color::Rgb(0xdc, 0x32, 0x2f)),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
@@ -250,6 +272,8 @@ impl Theme {
             tool_use: Some(Color::Rgb(0x8e, 0xc0, 0x7c)), // bright aqua
             tool_result_ok: Some(Color::Rgb(0xb8, 0xbb, 0x26)), // bright green
             tool_result_err: Some(Color::Rgb(0xfb, 0x49, 0x34)),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
@@ -265,6 +289,8 @@ impl Theme {
             tool_use: Some(Color::Rgb(0x88, 0xc0, 0xd0)), // frost cyan
             tool_result_ok: Some(Color::Rgb(0xa3, 0xbe, 0x8c)), // aurora green
             tool_result_err: Some(Color::Rgb(0xbf, 0x61, 0x6a)),
+            user_fg: None,
+            assistant_fg: None,
         }
     }
 
@@ -321,6 +347,12 @@ impl Theme {
                 "tool_result_err",
                 cfg.tool_result_err.as_deref(),
                 base.tool_result_err,
+            )?,
+            user_fg: overlay("user_fg", cfg.user_fg.as_deref(), base.user_fg)?,
+            assistant_fg: overlay(
+                "assistant_fg",
+                cfg.assistant_fg.as_deref(),
+                base.assistant_fg,
             )?,
         })
     }

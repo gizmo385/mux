@@ -31,7 +31,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 - implement transcript renderer: parse Claude Code JSONL entries (user/assistant/tool_use/tool_result) into compact display lines `#m3 #preview`
 - add per-row preview pane to Dashboard (last N entries, default configurable later) `#m3 #ui`
 - record observations: does seeing inline preview change which sessions the user attaches to? Does the user want richer chat? This is the Shape B pivot decision input. `#m3 #dogfood`
-- session search/filter: `/` opens an input at the bottom of the dashboard; typing live-filters the visible session list. Match strategy at idea-time: case-insensitive substring against title + `project_dir` + host label (the three things the user reads when scanning). Enter commits the filter and returns focus to the list; Esc clears and exits search. While filtered, j/k navigate only the matching rows; host/project group headers collapse if all their sessions are filtered out (otherwise the indentation reads as broken). Default vim binding `/` is the user's stated preference. Why M3-adjacent: search becomes more valuable as the per-row content grows (preview will make rows taller, so scrolling cost goes up). Could ship pre-M3 if dogfooding makes "where's that session" a real friction. `#m3 #dashboard #ux`
 
 ### M4 — Customization
 

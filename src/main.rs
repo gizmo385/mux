@@ -22,13 +22,15 @@ use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, Tmu
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
 use agent_mux::dashboard::{
-    DisplayRow, build_display_rows, first_session_index, next_session_index, prev_session_index,
+    DisplayRow, SearchMode, SearchOutcome, SearchState, build_display_rows,
+    build_display_rows_filtered, first_session_index, matches_query, next_session_index,
+    prev_session_index,
 };
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::repo::{Repo, RepoRegistry};
-use agent_mux::session::{Attention, HostId, Session};
+use agent_mux::session::{Attention, HostId, Session, SessionId};
 use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent, derive_attention};
 use agent_mux::worktree::WorktreeManager;
 
@@ -139,6 +141,11 @@ struct App {
     /// hint differs from the outside-tmux case where we suspend and run
     /// `tmux attach` as a subprocess that `prefix+d` cleanly exits.
     in_tmux: bool,
+    /// Dashboard search/filter state. `None` when no filter is active.
+    /// `Some(Editing)` means the search bar owns the keyboard; `Some(Active)`
+    /// means the filter persists but normal navigation works. See
+    /// [`SearchState`] for the full mode contract.
+    search: Option<SearchState>,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -244,7 +251,131 @@ impl App {
             pending_hosts,
             connect_errors: Vec::new(),
             in_tmux: std::env::var_os("TMUX").is_some(),
+            search: None,
         })
+    }
+
+    /// Display rows for the *current* view — filtered when search is
+    /// active with a non-empty query, otherwise the full layout.
+    /// Centralised here so every consumer (draw, navigation,
+    /// selection resolution) sees the same set of rows; otherwise a
+    /// j/k stroke could walk a list shape the user can't actually see.
+    fn current_rows(&self) -> Vec<DisplayRow> {
+        match self.search.as_ref() {
+            Some(s) if !s.query.is_empty() => {
+                let q = s.query.to_lowercase();
+                let sessions = self.catalog.sessions();
+                build_display_rows_filtered(sessions, |i| matches_query(&sessions[i], &q))
+            }
+            _ => build_display_rows(self.catalog.sessions()),
+        }
+    }
+
+    /// Open the search bar in Editing mode. If a filter is already
+    /// active (Active mode), this returns the user to Editing with
+    /// the existing query preserved — typing extends what they had.
+    fn open_search(&mut self) {
+        match self.search.as_mut() {
+            Some(s) => s.mode = SearchMode::Editing,
+            None => self.search = Some(SearchState::new()),
+        }
+        self.status = None;
+    }
+
+    /// Drop the search filter entirely. The previously-selected
+    /// session (if it still exists in the catalog) stays selected in
+    /// the unfiltered view; otherwise selection re-seats to the first
+    /// session row.
+    fn exit_search(&mut self) {
+        let prior = self.selected_session().map(|s| s.id.clone());
+        self.search = None;
+        self.reseat_selection_to(prior.as_ref());
+    }
+
+    /// Route a key event to the search bar while it owns the
+    /// keyboard. Returns `true` if the key was consumed (Editing
+    /// mode), `false` if the caller should continue with normal
+    /// dispatch. Mutates selection on every edit so the highlight
+    /// follows the live filter.
+    fn route_search_editing_key(&mut self, key: KeyEvent) -> bool {
+        // Bail out if the search bar isn't holding the keyboard.
+        if !matches!(
+            self.search.as_ref().map(|s| s.mode),
+            Some(SearchMode::Editing)
+        ) {
+            return false;
+        }
+        // Capture selection *before* mutating the search state — the
+        // helper borrows `self` and would alias the mut-borrow below.
+        let prior = self.selected_id_for_reseat();
+        let Some(search) = self.search.as_mut() else {
+            // Should be unreachable thanks to the Editing-mode check
+            // above, but staying defensive avoids a panic if the
+            // pattern ever drifts.
+            return false;
+        };
+        let outcome = search.handle_editing_key(key);
+        match outcome {
+            SearchOutcome::Exit => {
+                self.search = None;
+                self.reseat_selection_to(prior.as_ref());
+            }
+            SearchOutcome::Commit | SearchOutcome::Edited => {
+                self.reseat_selection_to(prior.as_ref());
+            }
+        }
+        true
+    }
+
+    /// Route a key event that lands while search is in Active mode.
+    /// Esc clears the filter; `/` returns to Editing with the existing
+    /// query. Returns `true` if consumed so the caller knows to skip
+    /// normal action dispatch.
+    fn route_search_active_key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(
+            self.search.as_ref().map(|s| s.mode),
+            Some(SearchMode::Active)
+        ) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.exit_search();
+                true
+            }
+            KeyCode::Char('/') => {
+                if let Some(s) = self.search.as_mut() {
+                    s.mode = SearchMode::Editing;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Capture the currently-selected session id *before* an operation
+    /// that may reshape `current_rows`. Used by [`reseat_selection_to`]
+    /// to keep selection on the same session across filter changes.
+    fn selected_id_for_reseat(&self) -> Option<SessionId> {
+        self.selected_session().map(|s| s.id.clone())
+    }
+
+    /// After a change that may have reshaped `current_rows`, re-seat
+    /// selection: if the previously-selected session is still visible,
+    /// move the highlight to its new row index; otherwise fall back
+    /// to the first session row (or `None` if the filter is empty).
+    fn reseat_selection_to(&mut self, prior: Option<&SessionId>) {
+        let rows = self.current_rows();
+        let sessions = self.catalog.sessions();
+        let new_idx = prior
+            .and_then(|id| {
+                rows.iter().position(|r| match r {
+                    DisplayRow::SessionRow(i) => sessions[*i].id == *id,
+                    _ => false,
+                })
+            })
+            .or_else(|| first_session_index(&rows));
+        self.list_state.select(new_idx);
     }
 
     fn drain_remote_discoveries(&mut self) {
@@ -267,7 +398,7 @@ impl App {
                         self.catalog.add(session);
                     }
                     if first_insert && !self.catalog.is_empty() {
-                        let rows = build_display_rows(self.catalog.sessions());
+                        let rows = self.current_rows();
                         self.list_state.select(first_session_index(&rows));
                     }
                     // Live polling: without this, remote attention stays
@@ -398,7 +529,7 @@ impl App {
             return;
         }
         if self.list_state.selected().is_none() {
-            let rows = build_display_rows(self.catalog.sessions());
+            let rows = self.current_rows();
             self.list_state.select(first_session_index(&rows));
         }
         if let Err(e) = self
@@ -455,14 +586,14 @@ impl App {
     }
 
     fn next(&mut self) {
-        let rows = build_display_rows(self.catalog.sessions());
+        let rows = self.current_rows();
         if let Some(i) = next_session_index(self.list_state.selected(), &rows) {
             self.list_state.select(Some(i));
         }
     }
 
     fn prev(&mut self) {
-        let rows = build_display_rows(self.catalog.sessions());
+        let rows = self.current_rows();
         if let Some(i) = prev_session_index(self.list_state.selected(), &rows) {
             self.list_state.select(Some(i));
         }
@@ -475,7 +606,7 @@ impl App {
     /// range (defensive against a catalog mutation racing a keypress).
     fn selected_session(&self) -> Option<&Session> {
         let idx = self.list_state.selected()?;
-        let rows = build_display_rows(self.catalog.sessions());
+        let rows = self.current_rows();
         let DisplayRow::SessionRow(session_idx) = rows.get(idx)? else {
             return None;
         };
@@ -495,8 +626,9 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             app.status = Some(err);
         }
         if has_event && let Event::Key(key) = event::read()? {
-            // Ctrl-C quits unconditionally, even when the modal is open.
-            // Everything else routes to the modal when one is up.
+            // Ctrl-C quits unconditionally, even when the modal is open
+            // or the search bar has focus. Everything else routes to
+            // those if they're up.
             let ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
             if ctrl_c {
@@ -504,6 +636,17 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             }
             if app.modal.is_some() {
                 app.handle_modal_key(key);
+                continue;
+            }
+            // Editing-mode search owns the keyboard — composing the
+            // filter must not also fire Action::Quit on `q`.
+            if app.route_search_editing_key(key) {
+                continue;
+            }
+            // Active-mode search only intercepts Esc (clear) and `/`
+            // (re-edit); everything else falls through to action dispatch
+            // so j/k/Enter/n/t continue to work against the filtered list.
+            if app.route_search_active_key(key) {
                 continue;
             }
             let pending = match action_for(key) {
@@ -520,6 +663,10 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 Some(Action::SpawnTerminal) => app.spawn_terminal_selected(),
                 Some(Action::NewSession) => {
                     app.open_new_session();
+                    None
+                }
+                Some(Action::OpenSearch) => {
+                    app.open_search();
                     None
                 }
                 None => None,
@@ -586,6 +733,7 @@ enum Action {
     Attach,
     SpawnTerminal,
     NewSession,
+    OpenSearch,
 }
 
 fn action_for(key: KeyEvent) -> Option<Action> {
@@ -596,17 +744,31 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Some(Action::Attach),
         KeyCode::Char('t') => Some(Action::SpawnTerminal),
         KeyCode::Char('n') => Some(Action::NewSession),
+        KeyCode::Char('/') => Some(Action::OpenSearch),
         _ => None,
     }
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
-    let layout = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
+    // When search is active we add a dedicated 1-line bar between
+    // the list and the footer. Keeping the footer separately means
+    // the regular keybind line stays visible — search adds context,
+    // it doesn't blot out the navigation hints.
+    let constraints: Vec<Constraint> = if app.search.is_some() {
+        vec![
+            Constraint::Length(1), // header
+            Constraint::Min(0),    // list
+            Constraint::Length(1), // search bar
+            Constraint::Length(1), // footer
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ]
+    };
+    let layout = Layout::vertical(constraints).split(frame.area());
 
     let header = Paragraph::new(Line::from(Span::styled(
         " agent-mux ",
@@ -614,8 +776,16 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     )));
     frame.render_widget(header, layout[0]);
 
-    let title = format!(" sessions ({}) ", app.catalog.len());
-    let rows = build_display_rows(app.catalog.sessions());
+    let rows = app.current_rows();
+    let visible_sessions = rows
+        .iter()
+        .filter(|r| matches!(r, DisplayRow::SessionRow(_)))
+        .count();
+    let title = if app.search.is_some() {
+        format!(" sessions ({visible_sessions}/{}) ", app.catalog.len())
+    } else {
+        format!(" sessions ({}) ", app.catalog.len())
+    };
     let sessions_slice = app.catalog.sessions();
     let items: Vec<ListItem<'_>> = rows
         .iter()
@@ -633,6 +803,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, layout[1], &mut app.list_state);
 
+    let footer_idx = if let Some(search) = app.search.as_ref() {
+        let bar_text = compose_search_bar(search, visible_sessions);
+        let bar = Paragraph::new(Line::from(Span::styled(
+            bar_text,
+            // The bar is bold (not dim) — when the search owns the
+            // keyboard, it's the foreground UI; dimming it would read
+            // as inactive.
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+        frame.render_widget(bar, layout[2]);
+        3
+    } else {
+        2
+    };
+
     let footer_text = compose_footer(
         app.creating.as_ref(),
         app.status.as_deref(),
@@ -645,10 +830,34 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         footer_text,
         Style::new().add_modifier(Modifier::DIM),
     )));
-    frame.render_widget(footer, layout[2]);
+    frame.render_widget(footer, layout[footer_idx]);
 
     if let Some(modal) = app.modal.as_mut() {
         modal.draw(frame);
+    }
+}
+
+/// Render the search bar's contents. Mode-aware: Editing mode shows
+/// a fake cursor block to signal "I'm taking your keystrokes"; Active
+/// mode shows a hint reminding the user how to re-edit or exit. Match
+/// count goes in both so the user knows whether their query narrowed
+/// the list to zero hits before pressing Enter.
+fn compose_search_bar(search: &SearchState, visible: usize) -> String {
+    let matches = if visible == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{visible} matches")
+    };
+    match search.mode {
+        SearchMode::Editing => {
+            format!(
+                " /{}█  ({matches})  ·  ⏎ apply  ·  esc cancel ",
+                search.query
+            )
+        }
+        SearchMode::Active => {
+            format!(" /{}  ({matches})  ·  / edit  ·  esc clear ", search.query)
+        }
     }
 }
 
@@ -906,5 +1115,58 @@ mod tests {
         let s = compose_footer(None, Some("opened terminal in /x"), false, true, 0, &errors);
         assert!(s.contains("opened terminal"), "got: {s}");
         assert!(!s.contains("connect failed"), "got: {s}");
+    }
+
+    // ------- compose_search_bar -------
+
+    #[test]
+    fn search_bar_editing_mode_renders_query_with_cursor_and_apply_hint() {
+        let mut s = SearchState::new();
+        s.query = "refactor".into();
+        let bar = compose_search_bar(&s, 3);
+        assert!(bar.contains("/refactor█"), "got: {bar}");
+        assert!(bar.contains("3 matches"), "got: {bar}");
+        assert!(bar.contains("⏎ apply"), "got: {bar}");
+        assert!(bar.contains("esc cancel"), "got: {bar}");
+    }
+
+    #[test]
+    fn search_bar_active_mode_renders_query_without_cursor_and_clear_hint() {
+        let mut s = SearchState::new();
+        s.query = "refactor".into();
+        s.mode = SearchMode::Active;
+        let bar = compose_search_bar(&s, 3);
+        assert!(bar.contains("/refactor "), "got: {bar}");
+        assert!(
+            !bar.contains('█'),
+            "active mode should not show cursor: {bar}"
+        );
+        assert!(bar.contains("/ edit"), "got: {bar}");
+        assert!(bar.contains("esc clear"), "got: {bar}");
+    }
+
+    #[test]
+    fn search_bar_uses_singular_match_label_for_one_result() {
+        let s = SearchState::new();
+        let bar = compose_search_bar(&s, 1);
+        assert!(bar.contains("1 match)"), "got: {bar}");
+        // Plural form should not appear when count is 1.
+        assert!(!bar.contains("1 matches"), "got: {bar}");
+    }
+
+    #[test]
+    fn search_bar_uses_plural_match_label_for_zero_or_many() {
+        let s = SearchState::new();
+        assert!(compose_search_bar(&s, 0).contains("0 matches"));
+        assert!(compose_search_bar(&s, 12).contains("12 matches"));
+    }
+
+    #[test]
+    fn search_bar_empty_query_still_renders_cursor() {
+        // The user has just pressed `/`; the bar must signal that the
+        // keyboard is now theirs (cursor block) even before they type.
+        let s = SearchState::new();
+        let bar = compose_search_bar(&s, 5);
+        assert!(bar.contains("/█"), "got: {bar}");
     }
 }

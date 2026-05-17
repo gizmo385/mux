@@ -12,6 +12,7 @@ The dashboard runs (`cargo run`), discovers local Claude Code sessions, groups t
 - `Enter` — switch into the tmux pane running the selected session; if there is no live pane, resume the conversation in a fresh `claude --resume` in the session's recorded cwd
 - `t` — open a new tmux window in the session's cwd (or, outside tmux, drop into `$SHELL` in the cwd)
 - `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created alongside the parent repo and `claude` is launched in it.
+- `/` — search/filter sessions by title, project directory, or host (case-insensitive substring). Type to narrow live, `Enter` to apply (keeps filter and returns focus to the list), `Esc` to clear and exit, `/` again to edit the active filter.
 - `q` / Ctrl-C — quit
 
 ## Configuration

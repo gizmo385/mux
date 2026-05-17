@@ -38,6 +38,19 @@ ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 enabled = true          # master on/off
 sound = false           # play the OS "default" notification sound
 disabled_hosts = []     # host labels to silence entirely
+
+# Theme overrides (M5). Each field is one colour. Empty string (or the
+# literal "default") leaves the terminal default in place. Accepts
+# named ANSI colours, `bright_*` variants, and `#RRGGBB` hex. Bad
+# names fail loudly at config load.
+[theme]
+needs_input    = "red"     # ● glyph for needs-input sessions
+working        = ""        # ◐ glyph for working sessions
+idle           = ""        # ○ glyph for idle sessions
+unknown        = ""        # · glyph for unknown sessions
+tool_use       = "cyan"    # ⚒ Tool: … in preview
+tool_result_ok = "green"   # ↳ ok in preview
+tool_result_err = "red"    # ↳ error in preview
 ```
 
 The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; tilde expansion only — env vars not yet supported).

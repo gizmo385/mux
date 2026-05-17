@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::config::Theme;
 use crate::preview::PreviewLine;
 use crate::session::{HostId, Session};
 
@@ -293,6 +294,7 @@ pub enum PreviewEntry {
 pub fn compose_preview_pane_lines(
     entry: Option<&PreviewEntry>,
     selected: bool,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     if !selected {
         return vec![dim_line("(no session selected)")];
@@ -300,7 +302,7 @@ pub fn compose_preview_pane_lines(
     match entry {
         None | Some(PreviewEntry::Loading) => vec![dim_line("loading…")],
         Some(PreviewEntry::Ready(lines)) if lines.is_empty() => vec![dim_line("(no preview)")],
-        Some(PreviewEntry::Ready(lines)) => compose_preview_lines(lines),
+        Some(PreviewEntry::Ready(lines)) => compose_preview_lines(lines, theme),
         Some(PreviewEntry::Failed(msg)) => {
             vec![dim_line(&format!("preview unavailable: {msg}"))]
         }
@@ -325,11 +327,14 @@ fn dim_line(text: &str) -> Line<'static> {
 /// - `↳ ` green/red for tool results (terse outcome only — open the
 ///   session for detail)
 #[must_use]
-pub fn compose_preview_lines(lines: &[PreviewLine]) -> Vec<Line<'static>> {
-    lines.iter().map(preview_line_to_styled).collect()
+pub fn compose_preview_lines(lines: &[PreviewLine], theme: &Theme) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| preview_line_to_styled(line, theme))
+        .collect()
 }
 
-fn preview_line_to_styled(line: &PreviewLine) -> Line<'static> {
+fn preview_line_to_styled(line: &PreviewLine, theme: &Theme) -> Line<'static> {
     match line {
         PreviewLine::User(text) => Line::from(vec![
             Span::styled("> ", Style::new().add_modifier(Modifier::BOLD)),
@@ -345,22 +350,30 @@ fn preview_line_to_styled(line: &PreviewLine) -> Line<'static> {
             } else {
                 format!("{name}: {summary}")
             };
-            Line::from(vec![
-                Span::styled("⚒ ", Style::new().fg(Color::Cyan)),
-                Span::styled(body, Style::new().fg(Color::Cyan)),
-            ])
+            let style = apply_fg(Style::new(), theme.tool_use);
+            Line::from(vec![Span::styled("⚒ ", style), Span::styled(body, style)])
         }
         PreviewLine::ToolResult { ok } => {
-            let (glyph, label, colour) = if *ok {
-                ("↳ ", "ok", Color::Green)
+            let (label, colour) = if *ok {
+                ("ok", theme.tool_result_ok)
             } else {
-                ("↳ ", "error", Color::Red)
+                ("error", theme.tool_result_err)
             };
-            Line::from(vec![
-                Span::styled(glyph, Style::new().fg(colour)),
-                Span::styled(label, Style::new().fg(colour)),
-            ])
+            let style = apply_fg(Style::new(), colour);
+            Line::from(vec![Span::styled("↳ ", style), Span::styled(label, style)])
         }
+    }
+}
+
+/// Apply `colour` as a foreground if `Some`; leave the style untouched
+/// otherwise. Keeps the `Theme::field: Option<Color>` "absent means
+/// inherit terminal default" semantics centralised — render paths just
+/// call this and don't branch.
+#[must_use]
+pub fn apply_fg(style: Style, colour: Option<ratatui::style::Color>) -> Style {
+    match colour {
+        Some(c) => style.fg(c),
+        None => style,
     }
 }
 
@@ -742,6 +755,12 @@ mod tests {
         assert_eq!(s.query, "F");
     }
 
+    /// Compose against the default theme. Tests that don't care about
+    /// per-colour overrides use this so each call site stays one line.
+    fn compose_preview_lines_t(lines: &[PreviewLine]) -> Vec<Line<'static>> {
+        compose_preview_lines(lines, &Theme::default())
+    }
+
     /// Helper: stringify the styled-content of preview lines so tests
     /// can assert on glyph + body without coupling to `ratatui::Style`
     /// internals. Joins every span's text into one string per line.
@@ -759,24 +778,24 @@ mod tests {
 
     #[test]
     fn compose_preview_lines_empty_input_yields_no_lines() {
-        assert!(compose_preview_lines(&[]).is_empty());
+        assert!(compose_preview_lines_t(&[]).is_empty());
     }
 
     #[test]
     fn compose_preview_lines_user_prefixes_with_caret() {
-        let lines = compose_preview_lines(&[PreviewLine::User("hello".to_string())]);
+        let lines = compose_preview_lines_t(&[PreviewLine::User("hello".to_string())]);
         assert_eq!(preview_strings(&lines), vec!["> hello".to_string()]);
     }
 
     #[test]
     fn compose_preview_lines_assistant_indents_without_glyph() {
-        let lines = compose_preview_lines(&[PreviewLine::Assistant("on it".to_string())]);
+        let lines = compose_preview_lines_t(&[PreviewLine::Assistant("on it".to_string())]);
         assert_eq!(preview_strings(&lines), vec!["  on it".to_string()]);
     }
 
     #[test]
     fn compose_preview_lines_tool_use_with_summary_joins_name_and_summary() {
-        let lines = compose_preview_lines(&[PreviewLine::ToolUse {
+        let lines = compose_preview_lines_t(&[PreviewLine::ToolUse {
             name: "Bash".to_string(),
             summary: "list repo".to_string(),
         }]);
@@ -788,7 +807,7 @@ mod tests {
 
     #[test]
     fn compose_preview_lines_tool_use_without_summary_shows_name_only() {
-        let lines = compose_preview_lines(&[PreviewLine::ToolUse {
+        let lines = compose_preview_lines_t(&[PreviewLine::ToolUse {
             name: "AskUserQuestion".to_string(),
             summary: String::new(),
         }]);
@@ -800,7 +819,7 @@ mod tests {
 
     #[test]
     fn compose_preview_lines_tool_result_renders_ok_or_error() {
-        let lines = compose_preview_lines(&[
+        let lines = compose_preview_lines_t(&[
             PreviewLine::ToolResult { ok: true },
             PreviewLine::ToolResult { ok: false },
         ]);
@@ -812,7 +831,7 @@ mod tests {
 
     #[test]
     fn compose_preview_lines_preserves_input_order() {
-        let lines = compose_preview_lines(&[
+        let lines = compose_preview_lines_t(&[
             PreviewLine::User("ask".to_string()),
             PreviewLine::Assistant("answer".to_string()),
             PreviewLine::ToolUse {

@@ -21,9 +21,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
-use agent_mux::config::Config;
+use agent_mux::config::{Config, Theme};
 use agent_mux::dashboard::{
-    DisplayRow, PreviewEntry, SearchMode, SearchOutcome, SearchState, build_display_rows,
+    DisplayRow, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
     build_display_rows_filtered, compose_preview_pane_lines, first_session_index, matches_query,
     next_session_index, prev_session_index,
 };
@@ -180,6 +180,10 @@ struct App {
     /// M4: fires OS notifications on session attention transitions
     /// into `NeedsInput`. Owns its own per-session suppression state.
     notifier: Notifier,
+    /// Resolved (parsed) M5 theme colours. Stored on the app so render
+    /// paths look up `Option<Color>` from a typed struct rather than
+    /// re-parsing strings every frame.
+    theme: Theme,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -323,6 +327,7 @@ impl App {
         // evaluates struct fields in source order, so `notifier:` (last)
         // can't borrow `config` after `config:` (earlier) has taken it.
         let notifier = Notifier::new(Box::new(LibNotifyDispatcher), config.notifications.clone());
+        let theme = Theme::from_config(&config.theme).map_err(io::Error::other)?;
 
         Ok(Self {
             catalog,
@@ -349,6 +354,7 @@ impl App {
             preview_tx,
             preview_rx,
             notifier,
+            theme,
         })
     }
 
@@ -1014,7 +1020,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             DisplayRow::ProjectHeader(path) => {
                 ListItem::new(format_project_header(path, app.home.as_deref()))
             }
-            DisplayRow::SessionRow(i) => ListItem::new(format_session_row(&sessions_slice[*i])),
+            DisplayRow::SessionRow(i) => {
+                ListItem::new(format_session_row(&sessions_slice[*i], &app.theme))
+            }
         })
         .collect();
     let list = List::new(items)
@@ -1035,7 +1043,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             Some(s) => (app.preview_cache.get(&s.id).cloned(), preview_pane_title(s)),
             None => (None, " preview ".to_string()),
         };
-        let body = compose_preview_pane_lines(entry.as_ref(), app.list_state.selected().is_some());
+        let body = compose_preview_pane_lines(
+            entry.as_ref(),
+            app.list_state.selected().is_some(),
+            &app.theme,
+        );
         let preview = Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(preview_title))
             .wrap(Wrap { trim: true });
@@ -1187,10 +1199,12 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
     ))
 }
 
-fn format_session_row(session: &Session) -> Line<'static> {
-    let glyph = attention_glyph(effective_attention(session));
+fn format_session_row(session: &Session, theme: &Theme) -> Line<'static> {
+    let attention = effective_attention(session);
+    let glyph = attention_glyph(attention);
     let age = humanize_elapsed(session.last_activity);
     let dim = Style::new().add_modifier(Modifier::DIM);
+    let glyph_style = apply_fg(Style::new(), attention_color(attention, theme));
     // Dim the entire title when the pane poller has confirmed no
     // live tmux pane matches this session — Enter is going to be a
     // multi-second auto-resume rather than a fast switch, and the
@@ -1205,7 +1219,11 @@ fn format_session_row(session: &Session) -> Line<'static> {
     // no longer per-row (the header carries it); for title-less
     // sessions, fall back to a short session-id suffix so two
     // unnamed sessions in the same project remain distinguishable.
-    let mut spans = vec![Span::raw("    "), Span::raw(glyph), Span::raw(" ")];
+    let mut spans = vec![
+        Span::raw("    "),
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+    ];
     if let Some(title) = &session.title {
         spans.push(Span::styled(title.clone(), title_style));
     } else {
@@ -1222,6 +1240,20 @@ fn format_session_row(session: &Session) -> Line<'static> {
     spans.push(Span::raw("  "));
     spans.push(Span::styled(age, dim));
     Line::from(spans)
+}
+
+/// Theme lookup for the attention-state glyph colour. Returns `None`
+/// (terminal default) for any state the user hasn't explicitly themed —
+/// the default config only colours `NeedsInput`/`Working`/etc. when the
+/// user opts in, so an empty `[theme]` section preserves the pre-M5
+/// uncoloured look.
+fn attention_color(a: Attention, theme: &Theme) -> Option<ratatui::style::Color> {
+    match a {
+        Attention::NeedsInput => theme.needs_input,
+        Attention::Working => theme.working,
+        Attention::Idle => theme.idle,
+        Attention::Unknown => theme.unknown,
+    }
 }
 
 fn effective_attention(session: &Session) -> Attention {

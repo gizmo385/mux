@@ -266,7 +266,7 @@ mod tests {
 
         make_repo(&work, "added-after-boot");
         // 1h TTL against a sub-millisecond-old cache: should not refresh.
-        let did_refresh = reg.refresh_if_stale(&cfg, Duration::from_secs(3600));
+        let did_refresh = reg.refresh_if_stale(&cfg, Duration::from_hours(1));
         assert!(!did_refresh);
         assert!(reg.is_empty(), "stale-cache value still served");
     }

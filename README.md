@@ -48,11 +48,31 @@ These `agent-mux-<id>` tmux sessions accumulate on the remote over time. Clean t
 
 ## Setup
 
-After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hook (fmt-check + clippy + tests).
+The Rust toolchain is pinned via `rust-toolchain.toml` (channel `1.94.0`). If you have rustup, it will auto-fetch this version on first `cargo` invocation; without rustup, any 1.94.x install satisfies the gate (CI uses exactly `1.94.0`). Pinning is what keeps the local pre-commit hook in sync with CI — bumps are deliberate.
+
+After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hook (fmt-check, clippy, tests, release-build — mirrors CI).
 
 ## How to run
 
 `cargo run` to start the binary. `cargo build --release` for an optimised build. `cargo test` for the test suite. See `PROCESS.md` for the canonical-commands list.
+
+## Pre-built binaries
+
+Each push to `main` publishes fresh binaries to the [`latest` release](https://github.com/gizmo385/mux/releases/tag/latest):
+
+- `agent-mux-aarch64-apple-darwin.tar.gz` — macOS, Apple Silicon
+- `agent-mux-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64 (glibc)
+- `agent-mux-x86_64-unknown-linux-musl.tar.gz` — Linux x86_64 (static, portable)
+
+Install on macOS (Apple Silicon):
+
+```sh
+curl -L https://github.com/gizmo385/mux/releases/download/latest/agent-mux-aarch64-apple-darwin.tar.gz \
+  | tar -xz -C /tmp \
+  && install -m 755 /tmp/agent-mux /usr/local/bin/agent-mux
+```
+
+Tagged releases (when present) are the stable pin; `latest` tracks `main` and is overwritten on every push.
 
 ## Documents
 

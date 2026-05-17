@@ -1,5 +1,7 @@
 #!/usr/bin/env sh
+# Mirrors `.github/workflows/check.yml`. If you change one, change the other.
 set -e
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked

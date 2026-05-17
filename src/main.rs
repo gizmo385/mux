@@ -100,6 +100,11 @@ struct App {
     create_tx: Sender<NewSessionResult>,
     create_rx: Receiver<NewSessionResult>,
     creating: Option<CreatingSession>,
+    /// Captured at startup: `$TMUX` set means we attach via `tmux
+    /// switch-client` (no parent/child relationship to break), so the return
+    /// hint differs from the outside-tmux case where we suspend and run
+    /// `tmux attach` as a subprocess that `prefix+d` cleanly exits.
+    in_tmux: bool,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -153,6 +158,7 @@ impl App {
             create_tx,
             create_rx,
             creating: None,
+            in_tmux: std::env::var_os("TMUX").is_some(),
         })
     }
 
@@ -405,17 +411,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, layout[1], &mut app.list_state);
 
-    let footer_text = if let Some(c) = &app.creating {
-        format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name)
-    } else {
-        match (&app.status, app.catalog.is_empty()) {
-            (Some(s), _) => format!(" {s} "),
-            (None, true) => " no sessions discovered · n: new · q: quit ".to_string(),
-            (None, false) => {
-                " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit ".to_string()
-            }
-        }
-    };
+    let footer_text = compose_footer(
+        app.creating.as_ref(),
+        app.status.as_deref(),
+        app.catalog.is_empty(),
+        app.in_tmux,
+    );
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
         Style::new().add_modifier(Modifier::DIM),
@@ -425,6 +426,31 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     if let Some(modal) = app.modal.as_mut() {
         modal.draw(frame);
     }
+}
+
+/// Pure footer composition so the keybind/return hint logic is unit-testable
+/// without standing up a ratatui frame. Precedence: in-flight create > status
+/// message > empty catalog > keybind line. The return hint is mode-aware
+/// because attach takes two different code paths (see `App.in_tmux`).
+fn compose_footer(
+    creating: Option<&CreatingSession>,
+    status: Option<&str>,
+    catalog_empty: bool,
+    in_tmux: bool,
+) -> String {
+    if let Some(c) = creating {
+        return format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name);
+    }
+    if let Some(s) = status {
+        return format!(" {s} ");
+    }
+    if catalog_empty {
+        return " no sessions discovered · n: new · q: quit ".to_string();
+    }
+    let return_hint = if in_tmux { "prefix+s" } else { "prefix+d" };
+    format!(
+        " ↑/↓ or j/k: move · ⏎: attach · t: terminal · n: new · q: quit  ·  return: {return_hint} "
+    )
 }
 
 fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {
@@ -495,5 +521,50 @@ fn humanize_elapsed(t: SystemTime) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footer_keybind_line_shows_in_tmux_return_hint() {
+        let s = compose_footer(None, None, false, true);
+        assert!(s.contains("return: prefix+s"), "got: {s}");
+        assert!(!s.contains("prefix+d"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_keybind_line_shows_outside_tmux_return_hint() {
+        let s = compose_footer(None, None, false, false);
+        assert!(s.contains("return: prefix+d"), "got: {s}");
+        assert!(!s.contains("prefix+s"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_empty_catalog_omits_return_hint() {
+        let s = compose_footer(None, None, true, true);
+        assert!(!s.contains("return:"), "got: {s}");
+        assert!(s.contains("no sessions"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_status_takes_precedence_over_keybinds() {
+        let s = compose_footer(None, Some("attach: boom"), false, true);
+        assert!(s.contains("attach: boom"), "got: {s}");
+        assert!(!s.contains("return:"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_creating_takes_precedence_over_status() {
+        let creating = CreatingSession {
+            repo_name: "agent-mux".into(),
+            task: "refactor".into(),
+        };
+        let s = compose_footer(Some(&creating), Some("ignored"), false, true);
+        assert!(s.contains("creating worktree"), "got: {s}");
+        assert!(s.contains("agent-mux"), "got: {s}");
+        assert!(!s.contains("ignored"), "got: {s}");
     }
 }

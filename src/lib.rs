@@ -1,4 +1,5 @@
 pub mod attachment;
+pub mod cache;
 pub mod catalog;
 pub mod config;
 pub mod dashboard;

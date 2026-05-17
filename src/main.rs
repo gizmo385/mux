@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
+use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
 use agent_mux::dashboard::{
@@ -184,6 +185,12 @@ enum RemoteDiscoveryResult {
 
 impl App {
     fn new() -> io::Result<Self> {
+        // Config drives both the cache-load (which `[hosts.<name>]`
+        // do we have snapshots for) and the SSH-discovery spawn loop,
+        // so it's loaded first.
+        let config = Config::load().unwrap_or_default();
+        let cache_dir = cache::default_dir();
+
         let local_host: Arc<dyn Host> = Arc::new(LocalHost::new());
         let projects_root = claude_projects_dir();
         let mut catalog = SessionCatalog::new();
@@ -193,9 +200,33 @@ impl App {
             catalog.replace_all(sessions);
         }
 
+        // Seed the catalog with cached remote sessions so the
+        // dashboard renders them on first paint, instead of waiting
+        // for each `ControlMaster` handshake to complete. Each host's
+        // live discovery thread will `reconcile_host` later, dropping
+        // entries that no longer exist on the remote and refreshing
+        // attention/title on the rest. Caching is best-effort —
+        // missing/corrupt files silently yield empty lists.
+        if let Some(dir) = cache_dir.as_ref() {
+            for name in config.hosts.keys() {
+                let host_id = HostId(name.clone());
+                for session in cache::read_for_host(dir, &host_id) {
+                    catalog.add(session);
+                }
+            }
+        }
+
+        // Only local transcripts go into the `notify` watcher seed —
+        // remote attention is driven by per-host polling threads
+        // spun up when each live SSH discovery succeeds. A cached
+        // remote session sitting in the catalog has no live host
+        // yet, so feeding its path here would do nothing useful
+        // (no local file at that path) and could confuse the
+        // watcher.
         let targets: Vec<_> = catalog
             .sessions()
             .iter()
+            .filter(|s| s.host.is_local())
             .map(|s| (s.id.clone(), s.transcript_path.clone()))
             .collect();
         let (watcher, updates) =
@@ -208,7 +239,6 @@ impl App {
             list_state.select(Some(i));
         }
 
-        let config = Config::load().unwrap_or_default();
         let registry = RepoRegistry::from_config(&config);
         let (create_tx, create_rx) = channel();
 
@@ -222,8 +252,14 @@ impl App {
             let ssh_target = host_config.ssh.clone();
             let transcript_root = host_config.transcript_root.clone();
             let tx = remote_tx.clone();
+            let cache_dir_for_thread = cache_dir.clone();
             std::thread::spawn(move || {
-                let result = connect_and_discover(host_id.clone(), ssh_target, transcript_root);
+                let result = connect_and_discover(
+                    host_id.clone(),
+                    ssh_target,
+                    transcript_root,
+                    cache_dir_for_thread,
+                );
                 let _ = tx.send(result);
             });
         }
@@ -392,15 +428,16 @@ impl App {
                         .iter()
                         .map(|s| (s.id.clone(), s.transcript_path.clone(), s.last_activity))
                         .collect();
-                    self.hosts.insert(host_id, Arc::clone(&host));
-                    let first_insert = self.catalog.is_empty();
-                    for session in sessions {
-                        self.catalog.add(session);
-                    }
-                    if first_insert && !self.catalog.is_empty() {
-                        let rows = self.current_rows();
-                        self.list_state.select(first_session_index(&rows));
-                    }
+                    self.hosts.insert(host_id.clone(), Arc::clone(&host));
+                    // Capture selection *before* reconcile so we can
+                    // re-seat it: a cached row the user already
+                    // highlighted should stay highlighted when the
+                    // live read overlays the same id; if the entry
+                    // disappeared, selection falls back to the first
+                    // visible session row.
+                    let prior = self.selected_id_for_reseat();
+                    self.catalog.reconcile_host(&host_id, sessions);
+                    self.reseat_selection_to(prior.as_ref());
                     // Live polling: without this, remote attention stays
                     // frozen at the discovery reading.
                     self.watcher.start_polling_host(
@@ -692,6 +729,7 @@ fn connect_and_discover(
     host_id: HostId,
     ssh_target: String,
     transcript_root: PathBuf,
+    cache_dir: Option<PathBuf>,
 ) -> RemoteDiscoveryResult {
     let ssh = match SshHost::connect(host_id.clone(), ssh_target) {
         Ok(h) => h,
@@ -717,6 +755,13 @@ fn connect_and_discover(
     // its first interval elapses.
     for session in &mut sessions {
         session.attention = derive_attention(host.as_ref(), &session.transcript_path);
+    }
+    // Snapshot to disk so the next startup paints this host's
+    // sessions before its `ControlMaster` handshake completes.
+    // Best-effort: an unwritable cache directory must not fail the
+    // discovery, since the cache is strictly an optimisation.
+    if let Some(dir) = cache_dir {
+        let _ = cache::write_for_host(&dir, &host_id, &sessions);
     }
     RemoteDiscoveryResult::Ready {
         host_id,

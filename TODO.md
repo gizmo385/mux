@@ -18,9 +18,11 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M2 — Remote hosts
 
-- extend Transcript Watcher to poll remote transcript files at configurable interval over the host's SSH channel. Without this, remote sessions are frozen at their startup attention reading — `needs-input` events never reach the dashboard. Wire-up: per-host polling loop on a background thread, using the `Arc<dyn Host>` already in `App.hosts`; emit `AttentionUpdate` over the existing `WatcherEvent` channel so the catalog update path stays unchanged. Settle interval at implementation time (probably 2–5s, configurable in M4). `#m2 #attention #remote`
-- extend TmuxDriver to attach into remote tmux via a persistent local tmux window running `ssh -t host tmux attach` `#m2 #attachment #remote`
 - `SshHost` assumes a GNU `find` on the remote (uses `-printf '%T@ %p\0'`). macOS remotes need Homebrew `findutils` or a BSD-stat fallback. Defer until a macOS remote actually surfaces. `#m2 #remote #portability`
+- remote polling: surface persistent `list_transcripts` failures (e.g. SSH master died mid-run) instead of silently retrying every tick. Today the polling loop swallows errors so attention freezes silently when a host goes away. Likely shape: an `AttentionUpdate(_, Unknown)` for every known session on the affected host after N consecutive failures, plus a footer hint mirroring the startup `connect_errors` line. Defer until dogfooding shows it's actually a problem — for stable home-LAN SSH the silent retry is often fine. `#m2 #remote #attention`
+- remote polling: known-set never shrinks. When a transcript is deleted on the remote, the polling thread's `HashMap` keeps the entry forever and the catalog keeps a stale row. Probably wants to be addressed together with deletion handling in the catalog (no current code path removes sessions). Defer until session-removal is on the menu. `#m2 #remote #lifecycle`
+- remote attach: nested-tmux prefix collision when running agent-mux from inside local tmux. Documented as a known gotcha in README; users handle it with a different inner-tmux prefix or `<prefix> <prefix>` passthrough. Revisit if dogfooding shows it's worse than expected — possible mitigations: pin the remote tmux to a separate socket name we could later override config on, or wrap with byobu. `#m2 #remote #ux`
+- remote attach: the auto-spawned `agent-mux-<id>` tmux sessions on the remote accumulate over time — every resumed conversation leaves one behind. The user can `tmux kill-session` manually; a discard/cleanup affordance from the dashboard would be nicer. Plausibly bundles with the post-M4 worktree discard/merge workflow. `#m2 #remote #cleanup`
 
 ### M3 — Inline preview
 

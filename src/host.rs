@@ -65,6 +65,22 @@ pub trait Host: Send + Sync {
     /// useful question is "can I attach a session rooted here?" and a
     /// failed stat is indistinguishable from "no" for that purpose.
     fn is_dir(&self, path: &Path) -> bool;
+
+    /// Build the argv that runs `remote_cmd` against this host.
+    /// Returns `None` for local hosts (the caller runs `remote_cmd`
+    /// directly). For SSH hosts, returns the argv that wraps it in an
+    /// `ssh -S <ctrl-socket> [-t] <target>` invocation reusing the
+    /// existing `ControlMaster` connection.
+    ///
+    /// `tty` toggles `-t`, which is required for interactive tmux
+    /// attach but wasteful for one-shot capture (`tmux list-panes`).
+    ///
+    /// Lives on `Host` as informational argv construction — the
+    /// `AttachmentDriver` still does the actual spawning. Keeping the
+    /// SSH binary/socket/target details inside the trait's impl
+    /// preserves the discipline that callers stay host-agnostic
+    /// without `is_local()` branches.
+    fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>>;
 }
 
 /// `Host` implementation for the local machine. Pure `std::fs` calls; no
@@ -136,6 +152,10 @@ impl Host for LocalHost {
 
     fn is_dir(&self, path: &Path) -> bool {
         path.is_dir()
+    }
+
+    fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
+        None
     }
 }
 
@@ -299,6 +319,30 @@ impl Host for SshHost {
             .status();
         matches!(status, Ok(s) if s.success())
     }
+
+    fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>> {
+        let mut argv = vec![
+            self.ssh_binary.to_string_lossy().into_owned(),
+            "-S".into(),
+            self.control_path.display().to_string(),
+        ];
+        if tty {
+            argv.push("-t".into());
+        }
+        argv.push(self.ssh_target.clone());
+        // Shell-quote-and-join into a single final argv element. SSH
+        // sends every post-target argv joined by space to the remote
+        // shell as one command line, where it gets re-tokenized. If
+        // we pass each element raw, anything with a space, glob char,
+        // or — most subtly — a leading `#` (which sh treats as a
+        // comment marker at word-start, e.g. tmux's `-F #{format}`
+        // would be eaten on the remote) breaks. Single-quoting each
+        // element makes the remote shell pass it through verbatim.
+        if !remote_cmd.is_empty() {
+            argv.push(shell_join_quoted(remote_cmd));
+        }
+        Some(argv)
+    }
 }
 
 /// Shell-quote a path for inclusion in a remote command, preserving
@@ -323,7 +367,7 @@ fn shell_quote_path(s: &str) -> String {
 /// POSIX single-quote escape: wrap in `'…'`, splitting on any embedded
 /// single quote via the `'\''` idiom. Safe for any byte string a path
 /// can contain.
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
@@ -335,6 +379,26 @@ fn shell_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Shell-quote each element of `parts` and join with spaces, producing
+/// a single POSIX-sh-parseable command line. Used in two places:
+/// — inside [`SshHost::ssh_argv`] to encode `remote_cmd` as one final
+///   argv element (SSH joins post-target args with space, so the
+///   remote shell sees one string; quoting protects against word-
+///   splitting, glob expansion, and leading-`#` comment-eating).
+/// — in the `AttachmentDriver`, to embed an entire ssh argv as the
+///   single command-string `tmux new-window` execs via `sh -c`.
+pub(crate) fn shell_join_quoted<I, S>(parts: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    parts
+        .into_iter()
+        .map(|s| shell_single_quote(s.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse the NUL-delimited output of `find -printf '%T@ %p\0'` into
@@ -644,6 +708,136 @@ mod tests {
             super::epoch_seconds_to_systemtime(f64::INFINITY),
             UNIX_EPOCH
         );
+    }
+
+    #[test]
+    fn local_host_ssh_argv_returns_none() {
+        let host = LocalHost::new();
+        assert!(host.ssh_argv(true, &["tmux", "ls"]).is_none());
+    }
+
+    fn devbox() -> SshHost {
+        SshHost {
+            id: HostId("devbox".into()),
+            ssh_target: "devbox".into(),
+            control_path: PathBuf::from("/tmp/sock"),
+            ssh_binary: PathBuf::from("ssh"),
+        }
+    }
+
+    #[test]
+    fn ssh_argv_builds_prefix_without_tty_for_capture() {
+        // No -t before the target: capturing list-panes output doesn't
+        // need a tty allocation and asking for one wastes bytes on the
+        // wire. The trailing command lands as one shell-quoted argv
+        // element (SSH joins post-target args with space and the remote
+        // shell re-tokenizes — quoting protects against word-splitting,
+        // glob expansion, and the leading-`#` comment-eating).
+        let argv = devbox()
+            .ssh_argv(false, &["tmux", "list-panes", "-a"])
+            .expect("remote");
+        assert_eq!(
+            argv,
+            vec![
+                "ssh",
+                "-S",
+                "/tmp/sock",
+                "devbox",
+                "'tmux' 'list-panes' '-a'"
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_argv_inserts_tty_flag_for_interactive_use() {
+        // -t goes *before* the target so `ssh -t target cmd` is the
+        // shape OpenSSH expects.
+        let argv = devbox()
+            .ssh_argv(true, &["tmux", "attach", "-t", "main:0.0"])
+            .expect("remote");
+        assert_eq!(
+            argv,
+            vec![
+                "ssh",
+                "-S",
+                "/tmp/sock",
+                "-t",
+                "devbox",
+                "'tmux' 'attach' '-t' 'main:0.0'"
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_argv_with_empty_remote_cmd_omits_trailing_command_arg() {
+        let argv = devbox().ssh_argv(false, &[]).expect("remote");
+        assert_eq!(argv, vec!["ssh", "-S", "/tmp/sock", "devbox"]);
+    }
+
+    #[test]
+    fn ssh_argv_quotes_format_string_so_remote_shell_does_not_treat_hash_as_comment() {
+        // Regression: tmux's `-F` format strings start with `#{...}`.
+        // Without quoting, the remote shell sees `tmux ... -F #{...}`
+        // and treats everything from `#` to EOL as a comment, so tmux
+        // gets an empty `-F` argument and fails. Single-quoting the
+        // format string preserves it verbatim through the remote sh
+        // tokenizer.
+        let argv = devbox()
+            .ssh_argv(false, &["tmux", "list-panes", "-F", "#{session_name}"])
+            .expect("remote");
+        let cmd = argv.last().expect("trailing cmd arg");
+        assert!(cmd.contains("'#{session_name}'"), "got: {cmd}");
+        // Belt-and-braces: no bare `#` anywhere outside its quotes.
+        let unquoted: String = cmd
+            .split('\'')
+            .step_by(2) // only the bits *between* quotes are unquoted
+            .collect();
+        assert!(!unquoted.contains('#'), "unquoted # in: {cmd}");
+    }
+
+    #[test]
+    fn ssh_argv_preserves_multi_word_command_strings_as_single_tmux_arg() {
+        // Regression: `tmux new-session ... 'claude --resume <id>'`
+        // must land on the remote as five tmux argv elements, with
+        // the last being a single quoted string. Without quoting,
+        // SSH's space-joining splits "claude --resume <id>" into
+        // three tokens and tmux treats `--resume` as a flag of its
+        // own.
+        let argv = devbox()
+            .ssh_argv(
+                true,
+                &[
+                    "tmux",
+                    "new-session",
+                    "-c",
+                    "/work",
+                    "claude --resume abc-123",
+                ],
+            )
+            .expect("remote");
+        let cmd = argv.last().expect("trailing cmd arg");
+        assert!(cmd.contains("'claude --resume abc-123'"), "got: {cmd}");
+    }
+
+    // ---- shell quoting primitives ----
+
+    #[test]
+    fn shell_join_quoted_quotes_each_element() {
+        let got = super::shell_join_quoted(["a", "b c", "d"]);
+        assert_eq!(got, "'a' 'b c' 'd'");
+    }
+
+    #[test]
+    fn shell_join_quoted_escapes_embedded_single_quotes() {
+        // POSIX idiom: 'it'\''s' parses back to it's.
+        let got = super::shell_join_quoted(["it's"]);
+        assert_eq!(got, "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_join_quoted_on_empty_input_returns_empty_string() {
+        let got = super::shell_join_quoted::<_, &str>([]);
+        assert_eq!(got, "");
     }
 
     #[test]

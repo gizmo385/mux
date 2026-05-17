@@ -29,7 +29,7 @@ use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::repo::{Repo, RepoRegistry};
 use agent_mux::session::{Attention, HostId, Session};
-use agent_mux::watcher::{TranscriptWatcher, WatcherEvent, derive_attention};
+use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent, derive_attention};
 use agent_mux::worktree::WorktreeManager;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -156,8 +156,10 @@ enum NewSessionResult {
 
 /// Payload from a background SSH-discovery thread. `Ready` carries the
 /// connected `SshHost` (wrapped in `Arc` for trait-object insertion into
-/// `App.hosts`) and the sessions found on it, each with its initial
-/// attention already computed against the remote transcript tail.
+/// `App.hosts`), the sessions found on it (each with its initial
+/// attention already computed against the remote transcript tail), and
+/// the `transcript_root` used for discovery — the polling thread that
+/// keeps attention live needs to rescan the same directory.
 /// `Failed` carries the host's dashboard label and a one-line error so
 /// the footer can show why a host is missing from the catalog.
 enum RemoteDiscoveryResult {
@@ -165,6 +167,7 @@ enum RemoteDiscoveryResult {
         host_id: HostId,
         host: Arc<dyn Host>,
         sessions: Vec<Session>,
+        transcript_root: PathBuf,
     },
     Failed {
         host_id: HostId,
@@ -213,7 +216,7 @@ impl App {
             let transcript_root = host_config.transcript_root.clone();
             let tx = remote_tx.clone();
             std::thread::spawn(move || {
-                let result = connect_and_discover(host_id.clone(), ssh_target, &transcript_root);
+                let result = connect_and_discover(host_id.clone(), ssh_target, transcript_root);
                 let _ = tx.send(result);
             });
         }
@@ -252,8 +255,13 @@ impl App {
                     host_id,
                     host,
                     sessions,
+                    transcript_root,
                 } => {
-                    self.hosts.insert(host_id, host);
+                    let poll_seed: Vec<_> = sessions
+                        .iter()
+                        .map(|s| (s.id.clone(), s.transcript_path.clone(), s.last_activity))
+                        .collect();
+                    self.hosts.insert(host_id, Arc::clone(&host));
                     let first_insert = self.catalog.is_empty();
                     for session in sessions {
                         self.catalog.add(session);
@@ -262,6 +270,14 @@ impl App {
                         let rows = build_display_rows(self.catalog.sessions());
                         self.list_state.select(first_session_index(&rows));
                     }
+                    // Live polling: without this, remote attention stays
+                    // frozen at the discovery reading.
+                    self.watcher.start_polling_host(
+                        host,
+                        transcript_root,
+                        poll_seed,
+                        REMOTE_POLL_INTERVAL,
+                    );
                 }
                 RemoteDiscoveryResult::Failed { host_id, error } => {
                     self.connect_errors.push((host_id, error));
@@ -356,7 +372,9 @@ impl App {
                 WatcherEvent::Attention(update) => {
                     self.catalog.update_attention(&update.id, update.attention);
                 }
-                WatcherEvent::NewTranscript(path) => self.handle_new_transcript(&path),
+                WatcherEvent::NewTranscript { host, path, mtime } => {
+                    self.handle_new_transcript(&host, &path, mtime);
+                }
             }
         }
     }
@@ -364,23 +382,14 @@ impl App {
     /// React to a watcher-emitted "previously-unknown transcript appeared"
     /// event. The file may be only partially written on the first event,
     /// in which case `build_session` returns `Ok(None)` (no usable cwd
-    /// yet) and we silently drop it — the next Modify event re-fires
+    /// yet) and we silently drop it — the next event re-fires
     /// `NewTranscript` and we retry until the file has enough content to
     /// build a session from.
-    fn handle_new_transcript(&mut self, path: &Path) {
-        // mtime from a `notify` Create/Modify event: the file is guaranteed
-        // to exist by the time the event is dispatched, so a failed stat
-        // collapses to "ignore this notification and let the next event
-        // re-trigger us" — same shape as `build_session` returning None.
-        let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+    fn handle_new_transcript(&mut self, host_id: &HostId, path: &Path, mtime: SystemTime) {
+        let Some(host) = self.hosts.get(host_id).cloned() else {
             return;
         };
-        // NewTranscript only fires for the local recursive watch, so
-        // the local Host is the right backend to interpret the file.
-        let Some(local_host) = self.hosts.get(&HostId::local()) else {
-            return;
-        };
-        let Ok(Some(session)) = build_session(local_host.as_ref(), path, mtime) else {
+        let Ok(Some(session)) = build_session(host.as_ref(), path, mtime) else {
             return;
         };
         let id = session.id.clone();
@@ -392,7 +401,10 @@ impl App {
             let rows = build_display_rows(self.catalog.sessions());
             self.list_state.select(first_session_index(&rows));
         }
-        if let Err(e) = self.watcher.add_target(id, transcript_path) {
+        if let Err(e) = self
+            .watcher
+            .track_new_transcript(host_id, id, transcript_path)
+        {
             self.status = Some(format!("watch new transcript: {e}"));
         }
     }
@@ -400,7 +412,8 @@ impl App {
     fn attach_selected(&mut self) -> Option<SuspendCommand> {
         let result = {
             let session = self.selected_session()?;
-            self.driver.attach(session)
+            let host = self.hosts.get(&session.host)?.clone();
+            self.driver.attach(session, host.as_ref())
         };
         match result {
             Ok(AttachOutcome::Done) => {
@@ -421,8 +434,9 @@ impl App {
     fn spawn_terminal_selected(&mut self) -> Option<SuspendCommand> {
         let result = {
             let session = self.selected_session()?;
+            let host = self.hosts.get(&session.host)?.clone();
             let cwd = session.project_dir.clone();
-            (self.driver.spawn_terminal(session), cwd)
+            (self.driver.spawn_terminal(session, host.as_ref()), cwd)
         };
         match result {
             (Ok(AttachOutcome::Done), cwd) => {
@@ -530,7 +544,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
 fn connect_and_discover(
     host_id: HostId,
     ssh_target: String,
-    transcript_root: &Path,
+    transcript_root: PathBuf,
 ) -> RemoteDiscoveryResult {
     let ssh = match SshHost::connect(host_id.clone(), ssh_target) {
         Ok(h) => h,
@@ -542,7 +556,7 @@ fn connect_and_discover(
         }
     };
     let host: Arc<dyn Host> = Arc::new(ssh);
-    let mut sessions = match discover(host.as_ref(), transcript_root) {
+    let mut sessions = match discover(host.as_ref(), &transcript_root) {
         Ok(s) => s,
         Err(e) => {
             return RemoteDiscoveryResult::Failed {
@@ -552,9 +566,8 @@ fn connect_and_discover(
         }
     };
     // Pre-compute attention on the discovery thread so the row shows
-    // real state on first render. The watcher does not yet poll remote
-    // transcripts (next M2 chunk), so without this every remote session
-    // would sit at `Unknown` indefinitely.
+    // real state on first render — the polling thread won't tick until
+    // its first interval elapses.
     for session in &mut sessions {
         session.attention = derive_attention(host.as_ref(), &session.transcript_path);
     }
@@ -562,6 +575,7 @@ fn connect_and_discover(
         host_id,
         host,
         sessions,
+        transcript_root,
     }
 }
 

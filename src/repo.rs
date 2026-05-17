@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
 
@@ -19,9 +20,19 @@ impl Repo {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RepoRegistry {
     repos: Vec<Repo>,
+    last_scanned: SystemTime,
+}
+
+impl Default for RepoRegistry {
+    fn default() -> Self {
+        Self {
+            repos: Vec::new(),
+            last_scanned: SystemTime::now(),
+        }
+    }
 }
 
 impl RepoRegistry {
@@ -39,12 +50,29 @@ impl RepoRegistry {
             .collect();
         repos.sort_by(|a, b| a.path.cmp(&b.path));
         repos.dedup_by(|a, b| a.path == b.path);
-        Self { repos }
+        Self {
+            repos,
+            last_scanned: SystemTime::now(),
+        }
     }
 
     /// Re-scan from the (possibly updated) Config. Replaces the cached list.
     pub fn refresh(&mut self, config: &Config) {
         *self = Self::from_config(config);
+    }
+
+    /// Re-scan only if the cached snapshot is older than `ttl`. Returns
+    /// `true` if a refresh actually ran. Called by the Dashboard before
+    /// opening the new-session picker: a depth-1 directory walk is cheap
+    /// enough to run synchronously, so we don't bother with the "render
+    /// from cache, refresh async" dance `ARCHITECTURE.md` allowed for —
+    /// that escape hatch is reserved for scans that grow expensive.
+    pub fn refresh_if_stale(&mut self, config: &Config, ttl: Duration) -> bool {
+        if self.last_scanned.elapsed().is_ok_and(|e| e < ttl) {
+            return false;
+        }
+        self.refresh(config);
+        true
     }
 
     #[must_use]
@@ -220,6 +248,40 @@ mod tests {
         reg.refresh(&cfg);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.repos()[0].name, "fresh");
+    }
+
+    #[test]
+    fn refresh_if_stale_skips_when_cache_is_fresh() {
+        let tmp = TempDir::new().expect("tempdir");
+        let work = make_plain_dir(tmp.path(), "work");
+        let cfg = Config {
+            workspace_folders: vec![work.clone()],
+        };
+        let mut reg = RepoRegistry::from_config(&cfg);
+        assert!(reg.is_empty());
+
+        make_repo(&work, "added-after-boot");
+        // 1h TTL against a sub-millisecond-old cache: should not refresh.
+        let did_refresh = reg.refresh_if_stale(&cfg, Duration::from_secs(3600));
+        assert!(!did_refresh);
+        assert!(reg.is_empty(), "stale-cache value still served");
+    }
+
+    #[test]
+    fn refresh_if_stale_runs_when_cache_is_expired() {
+        let tmp = TempDir::new().expect("tempdir");
+        let work = make_plain_dir(tmp.path(), "work");
+        let cfg = Config {
+            workspace_folders: vec![work.clone()],
+        };
+        let mut reg = RepoRegistry::from_config(&cfg);
+
+        make_repo(&work, "added-after-boot");
+        // Zero TTL: any cache age counts as stale.
+        let did_refresh = reg.refresh_if_stale(&cfg, Duration::ZERO);
+        assert!(did_refresh);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.repos()[0].name, "added-after-boot");
     }
 
     #[test]

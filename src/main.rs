@@ -36,6 +36,12 @@ const IDLE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 /// in the channel and the dashboard re-rendering it.
 const TICK: Duration = Duration::from_millis(100);
 
+/// How long the Repo Registry's cached scan is allowed to age before the
+/// next picker-open re-scans. Short enough that newly-cloned repos appear
+/// without a restart; long enough that rapid open/close of the modal
+/// doesn't repeat the depth-1 walk on every keystroke.
+const REPO_REFRESH_TTL: Duration = Duration::from_secs(30);
+
 fn main() -> io::Result<()> {
     let mut app = App::new()?;
     let mut terminal = setup_terminal()?;
@@ -95,6 +101,7 @@ struct App {
     updates: Receiver<AttentionUpdate>,
     driver: TmuxDriver,
     status: Option<String>,
+    config: Config,
     registry: RepoRegistry,
     modal: Option<NewSessionModal>,
     create_tx: Sender<NewSessionResult>,
@@ -153,6 +160,7 @@ impl App {
             updates,
             driver: TmuxDriver::new(),
             status: None,
+            config,
             registry,
             modal: None,
             create_tx,
@@ -163,6 +171,8 @@ impl App {
     }
 
     fn open_new_session(&mut self) {
+        self.registry
+            .refresh_if_stale(&self.config, REPO_REFRESH_TTL);
         if self.registry.is_empty() {
             self.status = Some(
                 "no repos found. add workspace_folders to ~/.config/agent-mux/config.toml"

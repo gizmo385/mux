@@ -32,16 +32,21 @@ impl SessionCatalog {
         true
     }
 
-    /// Update the attention state of a session by id. Returns `true` if the
-    /// session was found and updated.
-    pub fn update_attention(&mut self, id: &SessionId, attention: Attention) -> bool {
+    /// Update the attention state of a session by id. Returns the
+    /// previous attention value if the session was found, or `None`
+    /// otherwise. The previous value is the transition signal the
+    /// M4 notifier consumes (fire only on prev ≠ `NeedsInput`, new =
+    /// `NeedsInput`) — without it, every poll-driven re-derivation
+    /// would look like a new transition.
+    pub fn update_attention(&mut self, id: &SessionId, attention: Attention) -> Option<Attention> {
         for session in &mut self.sessions {
             if session.id == *id {
+                let previous = session.attention;
                 session.attention = attention;
-                return true;
+                return Some(previous);
             }
         }
-        false
+        None
     }
 
     /// Apply a fresh pane-presence snapshot from the pane poller for

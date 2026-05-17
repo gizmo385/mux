@@ -30,6 +30,7 @@ use agent_mux::dashboard::{
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
+use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
 use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
@@ -176,6 +177,9 @@ struct App {
     /// Drained each tick — completed previews flow in here from the
     /// fetch threads and land in `preview_cache`.
     preview_rx: Receiver<PreviewResult>,
+    /// M4: fires OS notifications on session attention transitions
+    /// into `NeedsInput`. Owns its own per-session suppression state.
+    notifier: Notifier,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -339,6 +343,7 @@ impl App {
             preview_cache: HashMap::new(),
             preview_tx,
             preview_rx,
+            notifier: Notifier::new(Box::new(LibNotifyDispatcher)),
         })
     }
 
@@ -595,13 +600,16 @@ impl App {
         while let Ok(event) = self.updates.try_recv() {
             match event {
                 WatcherEvent::Attention(update) => {
-                    self.catalog.update_attention(&update.id, update.attention);
+                    let prev = self.catalog.update_attention(&update.id, update.attention);
                     // Transcript advanced — drop the cached preview so
                     // the next `ensure_preview_for_selected` refetches.
                     // Stale previews are worse than a brief "loading…"
                     // because the user can't tell from the dashboard
                     // when the transcript moved underneath them.
                     self.preview_cache.remove(&update.id);
+                    if let Some(prev) = prev {
+                        self.fire_attention_notification(&update.id, prev, update.attention);
+                    }
                 }
                 WatcherEvent::NewTranscript { host, path, mtime } => {
                     self.handle_new_transcript(&host, &path, mtime);
@@ -612,6 +620,38 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Route an attention transition to the notifier with the session's
+    /// display labels resolved. Looked up here rather than in the
+    /// notifier so the notifier stays decoupled from the catalog —
+    /// it gets exactly the few `&str`/`&Path` it renders into the payload.
+    fn fire_attention_notification(&mut self, id: &SessionId, prev: Attention, new: Attention) {
+        let Some(session) = self.catalog.sessions().iter().find(|s| s.id == *id) else {
+            return;
+        };
+        let title = session.title.as_deref().unwrap_or_else(|| {
+            // Fallback when the session has no resolved title: use the
+            // tail of the session id so multiple title-less sessions
+            // remain distinguishable in the notification stream.
+            let id_str = session.id.0.as_str();
+            id_str
+                .get(id_str.len().saturating_sub(6)..)
+                .unwrap_or(id_str)
+        });
+        let host = session.host.clone();
+        let project = session.project_dir.clone();
+        self.notifier.on_attention_update(
+            &Transition {
+                id,
+                prev,
+                new,
+                title,
+                host: &host,
+                project: &project,
+            },
+            SystemTime::now(),
+        );
     }
 
     fn toggle_preview(&mut self) {

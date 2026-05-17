@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod discovery;
 pub mod host;
 pub mod new_session_modal;
+pub mod notifications;
 pub mod preview;
 pub mod repo;
 pub mod session;

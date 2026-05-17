@@ -33,11 +33,10 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 ### M4 — Attention notifications
 
-- pull in `notify-rust` (cross-platform: libnotify on Linux, NSUserNotification on macOS) as the notification backend `#m4 #notifications`
-- fire one notification at the catalog's attention-update boundary when the previous attention was `Working`/`Idle`/`Unknown` and the new attention is `NeedsInput`; payload carries the session's title + host label so the user knows where to look `#m4 #notifications`
-- in-process suppression: debounce against rapid attention flapping; per-session "I've seen this, hush" so we don't re-notify on every transition while the user is mid-decision `#m4 #notifications`
 - terminal-focus suppression (don't notify when agent-mux's terminal already has focus): defer to dogfooding — likely not reliably detectable across terminal emulators, and may not be worth special-casing if it turns out rare in practice `#m4 #notifications #dogfood`
 - user-facing config knobs (on/off, sound, quiet hours, per-host suppression) deliberately *not* in M4 — they belong in M5's broader config surface alongside themes and keybinds `#m4 #notifications #defer-to-m5`
+- WSL2 dogfooding: confirm notifications surface on the user's WSL2 + WSLg setup. `notify-rust` uses D-Bus on Linux; WSLg ships a notification daemon but variability across distros is real. If notifications don't appear, document the workaround (or pin a different backend) rather than silently failing. `#m4 #notifications #dogfood`
+- Notifier::forget wiring: when `SessionCatalog::reconcile_host` drops entries (remote session gone), the per-session suppression state in `Notifier` leaks. Each entry is ~24 bytes so it's not urgent; revisit if a long-lived process shows growth. Reconciliation would need to expose which ids were dropped. `#m4 #lifecycle #cleanup`
 
 ### M5 — Customization
 

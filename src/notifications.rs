@@ -1,0 +1,626 @@
+//! M4 attention notifications.
+//!
+//! Fires an OS-level notification when a session transitions into
+//! `NeedsInput` from any other attention state, so the user knows a
+//! Claude Code conversation is waiting on them even when agent-mux's
+//! window isn't on screen.
+//!
+//! Suppression has two layers, both per-session:
+//!
+//! 1. **Episodic flag** — once a notification fires, it stays
+//!    suppressed until the session leaves `NeedsInput` (back to
+//!    `Working`/`Idle`/`Unknown`). One ping per "the assistant just
+//!    stopped" event; ignoring the notification while the session
+//!    waits does not produce a second ping.
+//! 2. **Time window** — even if the flag would otherwise allow a
+//!    fire, refuse to re-fire within [`DEBOUNCE_WINDOW`] of the prior
+//!    notification. This absorbs Working↔NeedsInput flapping at the
+//!    watcher's poll cadence (~1–3s); a transcript that briefly
+//!    flickered through Working would otherwise clear the flag and
+//!    re-arm.
+//!
+//! The notifier owns the suppression state; the catalog owns the
+//! attention itself. Wiring lives in `main.rs`, called from the
+//! `WatcherEvent::Attention` handler — the catalog returns the
+//! previous attention from `update_attention`, which is the signal
+//! the notifier needs to recognise an actual transition.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+use crate::session::{Attention, HostId, SessionId};
+
+/// Same-session re-fire window. Notifications for the same `SessionId`
+/// within this duration of the previous fire are suppressed even if the
+/// episodic flag would otherwise allow them.
+///
+/// Five seconds is just above the watcher's polling cadence
+/// (`REMOTE_POLL_INTERVAL` = 3s), which means one bad poll won't double-fire
+/// but two genuine `NeedsInput` episodes spaced ≥5s apart still notify.
+pub const DEBOUNCE_WINDOW: Duration = Duration::from_secs(5);
+
+/// The notification payload handed to the dispatcher. Split into
+/// `title` (loud) and `body` (context) because the OS surfaces those
+/// differently across platforms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payload {
+    pub title: String,
+    pub body: String,
+}
+
+/// Pluggable notification backend. Tests use a recorder to capture
+/// every dispatch synchronously; production uses [`LibNotifyDispatcher`]
+/// which shells out via `notify-rust`.
+pub trait Dispatcher: Send + Sync {
+    /// Hand a payload to the backend.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return `Err` when they cannot enqueue the
+    /// notification (missing daemon, malformed payload, etc.). The
+    /// notifier treats failure as "did not fire" — suppression state
+    /// is not armed, so the next attempt can try again.
+    fn dispatch(&self, payload: Payload) -> Result<(), String>;
+}
+
+/// Production dispatcher backed by `notify-rust`. Spawns a one-shot
+/// thread per notification so a slow D-Bus reply (Linux) or
+/// `NSUserNotification` handoff (macOS) cannot back-pressure the UI
+/// thread. Errors inside the spawned thread are swallowed — a missing
+/// notification daemon is dogfood feedback, not a crash condition.
+pub struct LibNotifyDispatcher;
+
+impl Dispatcher for LibNotifyDispatcher {
+    fn dispatch(&self, payload: Payload) -> Result<(), String> {
+        std::thread::spawn(move || {
+            let _ = notify_rust::Notification::new()
+                .summary(&payload.title)
+                .body(&payload.body)
+                .appname("agent-mux")
+                .show();
+        });
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionState {
+    last_fired: Option<SystemTime>,
+    fired_for_current_episode: bool,
+}
+
+pub struct Notifier {
+    dispatcher: Box<dyn Dispatcher>,
+    state: HashMap<SessionId, SessionState>,
+}
+
+impl Notifier {
+    #[must_use]
+    pub fn new(dispatcher: Box<dyn Dispatcher>) -> Self {
+        Self {
+            dispatcher,
+            state: HashMap::new(),
+        }
+    }
+
+    /// Drop bookkeeping for a session that no longer exists. The main
+    /// loop calls this on catalog reconciliations that drop entries,
+    /// preventing the `state` map from growing without bound across a
+    /// long-lived process.
+    pub fn forget(&mut self, id: &SessionId) {
+        self.state.remove(id);
+    }
+
+    /// Called at the catalog's attention-update boundary.
+    ///
+    /// Fires a notification iff:
+    /// - `new == NeedsInput` and `prev != NeedsInput` (an actual transition in),
+    /// - the session's episodic flag is clear (no notification has
+    ///   fired for this `NeedsInput` episode),
+    /// - and the time-window debounce has elapsed since the last fire
+    ///   for this session.
+    ///
+    /// `now` is passed in (rather than fetched here) so tests can drive
+    /// the time-window logic deterministically.
+    pub fn on_attention_update(&mut self, t: &Transition<'_>, now: SystemTime) {
+        if t.new != Attention::NeedsInput {
+            if t.prev == Attention::NeedsInput
+                && let Some(s) = self.state.get_mut(t.id)
+            {
+                s.fired_for_current_episode = false;
+            }
+            return;
+        }
+        if t.prev == Attention::NeedsInput {
+            return;
+        }
+        let entry = self.state.entry(t.id.clone()).or_default();
+        if entry.fired_for_current_episode {
+            return;
+        }
+        if let Some(last) = entry.last_fired
+            && now
+                .duration_since(last)
+                .ok()
+                .is_some_and(|d| d < DEBOUNCE_WINDOW)
+        {
+            return;
+        }
+        let payload = Payload {
+            title: format!("agent-mux: {}", t.title),
+            body: format!("{} · {}", t.host, t.project.display()),
+        };
+        if self.dispatcher.dispatch(payload).is_ok() {
+            entry.last_fired = Some(now);
+            entry.fired_for_current_episode = true;
+        }
+    }
+}
+
+/// One attention transition handed to [`Notifier::on_attention_update`].
+/// Bundles the session-derived display labels alongside the transition
+/// itself so the notifier signature stays compact and the caller can
+/// build the struct directly from a catalog entry.
+pub struct Transition<'a> {
+    pub id: &'a SessionId,
+    pub prev: Attention,
+    pub new: Attention,
+    pub title: &'a str,
+    pub host: &'a HostId,
+    pub project: &'a Path,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Test dispatcher that records every payload it receives. Wrapped
+    /// in `Arc<Mutex<…>>` so test code can inspect the log after the
+    /// `Notifier` has dropped the `Box<dyn Dispatcher>`.
+    #[derive(Default)]
+    struct RecorderDispatcher {
+        log: Mutex<Vec<Payload>>,
+    }
+
+    impl Dispatcher for RecorderDispatcher {
+        fn dispatch(&self, payload: Payload) -> Result<(), String> {
+            self.log.lock().unwrap().push(payload);
+            Ok(())
+        }
+    }
+
+    /// Newtype that forwards `dispatch` to an `Arc<RecorderDispatcher>`,
+    /// letting tests share a recorder between a `Box<dyn Dispatcher>`
+    /// owned by the notifier and an inspection handle owned by the test.
+    struct SharedRecorder(std::sync::Arc<RecorderDispatcher>);
+
+    impl Dispatcher for SharedRecorder {
+        fn dispatch(&self, p: Payload) -> Result<(), String> {
+            self.0.dispatch(p)
+        }
+    }
+
+    /// Dispatcher whose every call fails. Used to verify that a failing
+    /// dispatch does not poison the suppression state (the flag and
+    /// timestamp only update on success — otherwise a transient libnotify
+    /// outage would silently mute the user).
+    struct FailingDispatcher;
+
+    impl Dispatcher for FailingDispatcher {
+        fn dispatch(&self, _: Payload) -> Result<(), String> {
+            Err("backend down".to_string())
+        }
+    }
+
+    fn sid(s: &str) -> SessionId {
+        SessionId(s.to_string())
+    }
+
+    fn local() -> HostId {
+        HostId::local()
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// Helper: build a `Notifier` and return the dispatcher's log handle
+    /// alongside it so each test can inspect the dispatches directly.
+    fn notifier_with_log() -> (Notifier, std::sync::Arc<RecorderDispatcher>) {
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        let notifier = Notifier::new(Box::new(SharedRecorder(std::sync::Arc::clone(&rec))));
+        (notifier, rec)
+    }
+
+    /// Test helper that mirrors the wire-up shape in main.rs — bundles
+    /// the seven leaf values into a `Transition` and forwards to
+    /// `on_attention_update`. Lets each test express one call as one
+    /// readable line.
+    #[allow(clippy::too_many_arguments)]
+    fn fire(
+        n: &mut Notifier,
+        id: &SessionId,
+        prev: Attention,
+        new: Attention,
+        title: &str,
+        host: &HostId,
+        project: &Path,
+        now: SystemTime,
+    ) {
+        n.on_attention_update(
+            &Transition {
+                id,
+                prev,
+                new,
+                title,
+                host,
+                project,
+            },
+            now,
+        );
+    }
+
+    fn log_titles(rec: &RecorderDispatcher) -> Vec<String> {
+        rec.log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn fires_on_working_to_needs_input_transition() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "refactor parser",
+            &local(),
+            Path::new("/proj"),
+            at(100),
+        );
+        assert_eq!(log_titles(&rec), vec!["agent-mux: refactor parser"]);
+    }
+
+    #[test]
+    fn fires_on_idle_to_needs_input_transition() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Idle,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(100),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fires_on_unknown_to_needs_input_transition() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Unknown,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(100),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn does_not_fire_when_new_state_is_not_needs_input() {
+        let (mut n, rec) = notifier_with_log();
+        for new in [Attention::Working, Attention::Idle, Attention::Unknown] {
+            fire(
+                &mut n,
+                &sid("a"),
+                Attention::NeedsInput,
+                new,
+                "x",
+                &local(),
+                Path::new("/p"),
+                at(100),
+            );
+        }
+        assert!(rec.log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn does_not_fire_when_prev_state_was_already_needs_input() {
+        let (mut n, rec) = notifier_with_log();
+        // Catalog re-derived the same state; not a transition.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(100),
+        );
+        assert!(rec.log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn episodic_flag_suppresses_refire_until_session_leaves_needs_input() {
+        // Realistic flow: notify on entry → assistant produces tool_use
+        // (Working) → assistant produces another text response stopping
+        // (NeedsInput). Without the flag-clear, the second NeedsInput
+        // would refire. The flag-clear only happens when we observe a
+        // leaving-NeedsInput transition.
+        let (mut n, rec) = notifier_with_log();
+
+        // First entry — fires.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(100),
+        );
+
+        // Session sits in NeedsInput for ten seconds (past the debounce
+        // window). The user hasn't acted yet. No second fire.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(120),
+        );
+
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refires_after_session_leaves_and_returns_to_needs_input() {
+        let (mut n, rec) = notifier_with_log();
+        // Episode 1: enter → fire.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        // Leave NeedsInput (user attached and replied → assistant working).
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(60),
+        );
+        // Episode 2: assistant stopped again → fire again. Well past the
+        // debounce window so only the episodic flag's reset can let this
+        // through.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(120),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn debounce_window_suppresses_rapid_flapping_even_when_flag_clears() {
+        // The watcher might briefly flick Working between two NeedsInput
+        // events. Without the time-window debounce, the leaving-state
+        // event would clear the flag and the next event would re-fire.
+        let (mut n, rec) = notifier_with_log();
+
+        // T=0: fire.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        // T=1: flap back to Working (clears flag).
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(1),
+        );
+        // T=2: flap back to NeedsInput. Flag is clear, but the time
+        // window says "you fired 2s ago, hush."
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(2),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn debounce_window_does_not_block_genuine_episode_past_the_window() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(1),
+        );
+        // T=10: well past DEBOUNCE_WINDOW (5s).
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(10),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn debounce_does_not_cross_sessions() {
+        // A's recent fire must not suppress B's first fire.
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        fire(
+            &mut n,
+            &sid("b"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "y",
+            &local(),
+            Path::new("/p"),
+            at(1),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn payload_includes_session_title_host_and_project() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "refactor parser",
+            &HostId("alpenglow".to_string()),
+            Path::new("/home/user/work/mux"),
+            at(0),
+        );
+        let log = rec.log.lock().unwrap();
+        assert_eq!(log[0].title, "agent-mux: refactor parser");
+        assert_eq!(log[0].body, "alpenglow · /home/user/work/mux");
+    }
+
+    #[test]
+    fn failed_dispatch_does_not_arm_suppression_so_next_attempt_can_fire() {
+        // A transient backend outage must not mute the user. We model
+        // this by failing once, then succeeding: the second attempt
+        // should fire even though the first appeared to "fire" from
+        // the caller's perspective.
+        let mut n = Notifier::new(Box::new(FailingDispatcher));
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        // Swap in a recorder; if suppression were armed we'd see zero
+        // dispatches. (We construct fresh state to simulate "backend
+        // came back" — same Notifier instance, same session id, but
+        // its state map shouldn't have been touched by the failed call.)
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        // Replace the dispatcher behind the existing notifier.
+        n.dispatcher = Box::new(SharedRecorder(std::sync::Arc::clone(&rec)));
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forget_clears_state_so_next_transition_can_fire_without_debounce() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        n.forget(&sid("a"));
+        // T=1: would normally be suppressed by the time window, but
+        // forget wiped the state.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(1),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 2);
+    }
+}

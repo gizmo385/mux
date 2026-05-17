@@ -23,6 +23,10 @@ pub enum ConfigError {
         field: String,
         value: String,
     },
+    /// `theme.preset` named a preset that isn't built in. Reported with
+    /// the available preset names so the user can correct without
+    /// hunting through docs.
+    UnknownThemePreset(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -38,6 +42,13 @@ impl std::fmt::Display for ConfigError {
             }
             Self::InvalidColor { field, value } => {
                 write!(f, "theme.{field}: {value:?} is not a recognised colour")
+            }
+            Self::UnknownThemePreset(name) => {
+                write!(
+                    f,
+                    "theme.preset: {name:?} is not a recognised preset (available: {})",
+                    Theme::preset_names().join(", ")
+                )
             }
         }
     }
@@ -77,42 +88,31 @@ pub struct Config {
     pub theme: ThemeConfig,
 }
 
-/// Raw theme strings from `[theme]` in `config.toml`. Each field is the
-/// colour name for one semantic UI element. Empty string = "use the
-/// terminal's default foreground" (no `fg` set on the `Style`). Defaults
-/// reproduce the colour scheme that shipped before M5 so an empty config
-/// renders identically.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Raw theme strings from `[theme]` in `config.toml`. Each colour field
+/// is `Option<String>` so we can distinguish "user didn't touch this
+/// key" (inherit from the preset) from "user set it to the empty string"
+/// (explicit "no fg colour, terminal default"). The `preset` field
+/// chooses which built-in baseline the per-element overrides apply on
+/// top of; missing preset means [`Theme::preset_default`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// Named baseline. See [`Theme::preset_names`] for the built-in set.
+    pub preset: Option<String>,
     /// Colour of the `●` glyph for sessions in `NeedsInput`.
-    pub needs_input: String,
+    pub needs_input: Option<String>,
     /// Colour of the `◐` glyph for sessions currently `Working`.
-    pub working: String,
+    pub working: Option<String>,
     /// Colour of the `○` glyph for `Idle` sessions.
-    pub idle: String,
+    pub idle: Option<String>,
     /// Colour of the `·` glyph for `Unknown` (no signal yet) sessions.
-    pub unknown: String,
+    pub unknown: Option<String>,
     /// Colour of `⚒ Tool: …` lines in the preview pane.
-    pub tool_use: String,
+    pub tool_use: Option<String>,
     /// Colour of `↳ ok` lines in the preview pane.
-    pub tool_result_ok: String,
+    pub tool_result_ok: Option<String>,
     /// Colour of `↳ error` lines in the preview pane.
-    pub tool_result_err: String,
-}
-
-impl Default for ThemeConfig {
-    fn default() -> Self {
-        Self {
-            needs_input: String::new(),
-            working: String::new(),
-            idle: String::new(),
-            unknown: String::new(),
-            tool_use: "cyan".to_string(),
-            tool_result_ok: "green".to_string(),
-            tool_result_err: "red".to_string(),
-        }
-    }
+    pub tool_result_err: Option<String>,
 }
 
 /// Resolved theme: each field is the parsed `ratatui::Color` or `None`
@@ -130,27 +130,119 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Parse every field of `cfg` into a `Color`. Empty strings (and
-    /// the literal `"default"`) resolve to `None`. Unrecognised names
-    /// produce [`ConfigError::InvalidColor`] tagged with the offending
-    /// field name so the user can find it without grepping.
+    /// Names of the built-in presets, in the order they're listed in
+    /// user-facing error messages and docs.
+    #[must_use]
+    pub fn preset_names() -> &'static [&'static str] {
+        &["default", "bright", "mono"]
+    }
+
+    /// The "default" preset: matches the colour scheme that shipped
+    /// before presets existed. Cyan/green/red preview, attention
+    /// glyphs uncoloured. Used when `cfg.preset` is absent.
+    #[must_use]
+    pub fn preset_default() -> Self {
+        Self {
+            needs_input: None,
+            working: None,
+            idle: None,
+            unknown: None,
+            tool_use: Some(Color::Cyan),
+            tool_result_ok: Some(Color::Green),
+            tool_result_err: Some(Color::Red),
+        }
+    }
+
+    /// Loud, high-contrast palette. Every attention glyph carries a
+    /// colour, preview switches to `bright_*` variants. For terminals
+    /// that render bright variants distinctly from the base — most do.
+    #[must_use]
+    pub fn preset_bright() -> Self {
+        Self {
+            needs_input: Some(Color::LightRed),
+            working: Some(Color::LightYellow),
+            idle: Some(Color::DarkGray),
+            unknown: Some(Color::Gray),
+            tool_use: Some(Color::LightCyan),
+            tool_result_ok: Some(Color::LightGreen),
+            tool_result_err: Some(Color::LightRed),
+        }
+    }
+
+    /// Monochrome: no foreground colours at all. The structural
+    /// modifiers (bold for user prompts, dim for assistant prose) still
+    /// carry the distinctions. For users on terminals without colour,
+    /// or simply for a quieter palette.
+    #[must_use]
+    pub fn preset_mono() -> Self {
+        Self::default()
+    }
+
+    /// Resolve a preset by name. Used both as the baseline for
+    /// [`Theme::from_config`] and (transitively) by tests that want a
+    /// known preset without going through TOML.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidColor`] on the first malformed
-    /// colour string. Subsequent malformed fields are not reported in
-    /// the same pass — fixing the first error and re-loading surfaces
-    /// the next.
+    /// Returns [`ConfigError::UnknownThemePreset`] when `name` is not
+    /// in [`Theme::preset_names`].
+    pub fn preset(name: &str) -> Result<Self, ConfigError> {
+        match name {
+            "default" => Ok(Self::preset_default()),
+            "bright" => Ok(Self::preset_bright()),
+            "mono" => Ok(Self::preset_mono()),
+            _ => Err(ConfigError::UnknownThemePreset(name.to_string())),
+        }
+    }
+
+    /// Resolve a [`ThemeConfig`] into a `Theme`. First chooses a base
+    /// preset (default if `cfg.preset` is `None`), then overlays each
+    /// per-element field the user explicitly set — `Some(s)` from the
+    /// config takes precedence over the preset's value; `None` inherits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::UnknownThemePreset`] for an unrecognised
+    /// preset name and [`ConfigError::InvalidColor`] on the first
+    /// malformed colour string. Subsequent malformed fields are not
+    /// reported in the same pass.
     pub fn from_config(cfg: &ThemeConfig) -> Result<Self, ConfigError> {
+        let base = match cfg.preset.as_deref() {
+            None => Self::preset_default(),
+            Some(name) => Self::preset(name)?,
+        };
         Ok(Self {
-            needs_input: parse_color(&cfg.needs_input, "needs_input")?,
-            working: parse_color(&cfg.working, "working")?,
-            idle: parse_color(&cfg.idle, "idle")?,
-            unknown: parse_color(&cfg.unknown, "unknown")?,
-            tool_use: parse_color(&cfg.tool_use, "tool_use")?,
-            tool_result_ok: parse_color(&cfg.tool_result_ok, "tool_result_ok")?,
-            tool_result_err: parse_color(&cfg.tool_result_err, "tool_result_err")?,
+            needs_input: overlay("needs_input", cfg.needs_input.as_deref(), base.needs_input)?,
+            working: overlay("working", cfg.working.as_deref(), base.working)?,
+            idle: overlay("idle", cfg.idle.as_deref(), base.idle)?,
+            unknown: overlay("unknown", cfg.unknown.as_deref(), base.unknown)?,
+            tool_use: overlay("tool_use", cfg.tool_use.as_deref(), base.tool_use)?,
+            tool_result_ok: overlay(
+                "tool_result_ok",
+                cfg.tool_result_ok.as_deref(),
+                base.tool_result_ok,
+            )?,
+            tool_result_err: overlay(
+                "tool_result_err",
+                cfg.tool_result_err.as_deref(),
+                base.tool_result_err,
+            )?,
         })
+    }
+}
+
+/// Apply one user-set field on top of the preset's value. `None` means
+/// the user didn't touch this key, so the preset wins. `Some(s)` parses
+/// `s` (where empty / `"default"` both yield no colour, same as a
+/// stand-alone field).
+fn overlay(
+    field: &str,
+    user: Option<&str>,
+    fallback: Option<Color>,
+) -> Result<Option<Color>, ConfigError> {
+    match user {
+        Some(s) => parse_color(s, field),
+        None => Ok(fallback),
     }
 }
 
@@ -583,13 +675,14 @@ sound = true
     #[test]
     fn theme_parses_named_ansi_colours() {
         let cfg = ThemeConfig {
-            needs_input: "red".to_string(),
-            working: "yellow".to_string(),
-            idle: "gray".to_string(),
-            unknown: "magenta".to_string(),
-            tool_use: "blue".to_string(),
-            tool_result_ok: "green".to_string(),
-            tool_result_err: "white".to_string(),
+            needs_input: Some("red".to_string()),
+            working: Some("yellow".to_string()),
+            idle: Some("gray".to_string()),
+            unknown: Some("magenta".to_string()),
+            tool_use: Some("blue".to_string()),
+            tool_result_ok: Some("green".to_string()),
+            tool_result_err: Some("white".to_string()),
+            ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
         assert_eq!(theme.needs_input, Some(Color::Red));
@@ -604,7 +697,7 @@ sound = true
     #[test]
     fn theme_parses_bright_variants() {
         let cfg = ThemeConfig {
-            needs_input: "bright_red".to_string(),
+            needs_input: Some("bright_red".to_string()),
             ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
@@ -614,7 +707,7 @@ sound = true
     #[test]
     fn theme_parses_hex_colours() {
         let cfg = ThemeConfig {
-            needs_input: "#FF8800".to_string(),
+            needs_input: Some("#FF8800".to_string()),
             ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
@@ -622,11 +715,11 @@ sound = true
     }
 
     #[test]
-    fn theme_empty_string_and_default_keyword_both_yield_none() {
+    fn theme_empty_string_and_default_keyword_both_yield_none_overriding_preset() {
         let cfg = ThemeConfig {
-            tool_use: String::new(),
-            tool_result_ok: "default".to_string(),
-            tool_result_err: "DEFAULT".to_string(),
+            tool_use: Some(String::new()),
+            tool_result_ok: Some("default".to_string()),
+            tool_result_err: Some("DEFAULT".to_string()),
             ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
@@ -638,7 +731,7 @@ sound = true
     #[test]
     fn theme_rejects_unknown_colour_with_field_name_in_error() {
         let cfg = ThemeConfig {
-            needs_input: "puce".to_string(),
+            needs_input: Some("puce".to_string()),
             ..ThemeConfig::default()
         };
         let err = Theme::from_config(&cfg).expect_err("should reject");
@@ -648,6 +741,87 @@ sound = true
                 assert_eq!(value, "puce");
             }
             other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn theme_default_preset_matches_pre_m5_colours() {
+        let preset = Theme::preset("default").expect("default preset");
+        assert_eq!(preset, Theme::from_config(&ThemeConfig::default()).unwrap());
+    }
+
+    #[test]
+    fn theme_bright_preset_colours_every_attention_state() {
+        let preset = Theme::preset("bright").expect("bright preset");
+        assert!(preset.needs_input.is_some());
+        assert!(preset.working.is_some());
+        assert!(preset.idle.is_some());
+        assert!(preset.unknown.is_some());
+        assert!(preset.tool_use.is_some());
+    }
+
+    #[test]
+    fn theme_mono_preset_has_no_colours() {
+        let preset = Theme::preset("mono").expect("mono preset");
+        assert_eq!(preset, Theme::default());
+    }
+
+    #[test]
+    fn theme_preset_resolves_when_set_via_config() {
+        let cfg = ThemeConfig {
+            preset: Some("bright".to_string()),
+            ..ThemeConfig::default()
+        };
+        assert_eq!(
+            Theme::from_config(&cfg).unwrap(),
+            Theme::preset_bright(),
+            "no overrides set, so resolution equals the named preset",
+        );
+    }
+
+    #[test]
+    fn theme_per_field_overrides_apply_on_top_of_preset() {
+        // Start from `mono` (everything None) then override a single
+        // field. The other six fields stay None; only the overridden
+        // one carries a colour. Confirms layering, not just preset
+        // selection.
+        let cfg = ThemeConfig {
+            preset: Some("mono".to_string()),
+            needs_input: Some("red".to_string()),
+            ..ThemeConfig::default()
+        };
+        let theme = Theme::from_config(&cfg).expect("parse");
+        assert_eq!(theme.needs_input, Some(Color::Red));
+        assert_eq!(theme.working, None);
+        assert_eq!(theme.tool_use, None);
+    }
+
+    #[test]
+    fn theme_explicit_empty_override_resets_preset_value_to_none() {
+        // `bright` preset gives every preview field a colour; setting
+        // tool_use to "" should clear it specifically.
+        let cfg = ThemeConfig {
+            preset: Some("bright".to_string()),
+            tool_use: Some(String::new()),
+            ..ThemeConfig::default()
+        };
+        let theme = Theme::from_config(&cfg).expect("parse");
+        assert_eq!(theme.tool_use, None);
+        // Sibling fields still inherit from the bright preset.
+        assert_eq!(theme.tool_result_ok, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn theme_unknown_preset_reports_available_names_in_error() {
+        let cfg = ThemeConfig {
+            preset: Some("nonexistent".to_string()),
+            ..ThemeConfig::default()
+        };
+        let err = Theme::from_config(&cfg).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("nonexistent"), "got: {msg}");
+        for name in Theme::preset_names() {
+            assert!(msg.contains(name), "missing preset name {name:?}: {msg}");
         }
     }
 

@@ -41,6 +41,7 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### M5 — Customization
 
 - extend `[theme]` schema beyond foreground colours: background colours, per-element modifier overrides (currently bold/dim/reversed are hardcoded), and richer keys (e.g. `[theme.header]` bold = true, fg = "..."). Today's flat per-element fg-only schema covers the common dogfood case; the more expressive shape waits until a real user-pain signal asks for it. `#m5 #config #theme`
+- expand the preset library: today ships `default`/`bright`/`mono`. Candidates if dogfooding asks: `warm` (yellow/orange/red), `cool` (blue/cyan/green), `solarized`/`gruvbox`/`nord` mappings to common palette schemes. Adding one is a single function plus a name in `Theme::preset_names()`; defer until a specific request lands. `#m5 #config #theme`
 - design TOML schema for keybinds (action name → key combo) `#m5 #config`
 - reload-on-edit (watch config file, re-apply) `#m5 #config`
 - env-var expansion in `workspace_folders` (e.g. `$HOME/work`, `$WORK_DIR/repos`). M1 ships tilde expansion only; env vars deferred. `#m5 #config`

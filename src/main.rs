@@ -21,6 +21,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::config::Config;
+use agent_mux::dashboard::{
+    DisplayRow, build_display_rows, first_session_index, next_session_index, prev_session_index,
+};
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
@@ -190,8 +193,9 @@ impl App {
                 .map_err(io::Error::other)?;
 
         let mut list_state = ListState::default();
-        if !catalog.is_empty() {
-            list_state.select(Some(0));
+        let initial_rows = build_display_rows(catalog.sessions());
+        if let Some(i) = first_session_index(&initial_rows) {
+            list_state.select(Some(i));
         }
 
         let config = Config::load().unwrap_or_default();
@@ -255,7 +259,8 @@ impl App {
                         self.catalog.add(session);
                     }
                     if first_insert && !self.catalog.is_empty() {
-                        self.list_state.select(Some(0));
+                        let rows = build_display_rows(self.catalog.sessions());
+                        self.list_state.select(first_session_index(&rows));
                     }
                 }
                 RemoteDiscoveryResult::Failed { host_id, error } => {
@@ -384,7 +389,8 @@ impl App {
             return;
         }
         if self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
+            let rows = build_display_rows(self.catalog.sessions());
+            self.list_state.select(first_session_index(&rows));
         }
         if let Err(e) = self.watcher.add_target(id, transcript_path) {
             self.status = Some(format!("watch new transcript: {e}"));
@@ -393,8 +399,7 @@ impl App {
 
     fn attach_selected(&mut self) -> Option<SuspendCommand> {
         let result = {
-            let idx = self.list_state.selected()?;
-            let session = self.catalog.sessions().get(idx)?;
+            let session = self.selected_session()?;
             self.driver.attach(session)
         };
         match result {
@@ -415,8 +420,7 @@ impl App {
 
     fn spawn_terminal_selected(&mut self) -> Option<SuspendCommand> {
         let result = {
-            let idx = self.list_state.selected()?;
-            let session = self.catalog.sessions().get(idx)?;
+            let session = self.selected_session()?;
             let cwd = session.project_dir.clone();
             (self.driver.spawn_terminal(session), cwd)
         };
@@ -437,25 +441,31 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.catalog.is_empty() {
-            return;
+        let rows = build_display_rows(self.catalog.sessions());
+        if let Some(i) = next_session_index(self.list_state.selected(), &rows) {
+            self.list_state.select(Some(i));
         }
-        let i = self.list_state.selected().unwrap_or(0);
-        let next = (i + 1) % self.catalog.len();
-        self.list_state.select(Some(next));
     }
 
     fn prev(&mut self) {
-        if self.catalog.is_empty() {
-            return;
+        let rows = build_display_rows(self.catalog.sessions());
+        if let Some(i) = prev_session_index(self.list_state.selected(), &rows) {
+            self.list_state.select(Some(i));
         }
-        let i = self.list_state.selected().unwrap_or(0);
-        let prev = if i == 0 {
-            self.catalog.len() - 1
-        } else {
-            i - 1
+    }
+
+    /// Resolve the currently-selected list row to a session. Returns
+    /// `None` if no row is selected, the selected row is a header (the
+    /// navigation helpers shouldn't allow this but the lookup stays
+    /// defensive), or the underlying session index has gone out of
+    /// range (defensive against a catalog mutation racing a keypress).
+    fn selected_session(&self) -> Option<&Session> {
+        let idx = self.list_state.selected()?;
+        let rows = build_display_rows(self.catalog.sessions());
+        let DisplayRow::SessionRow(session_idx) = rows.get(idx)? else {
+            return None;
         };
-        self.list_state.select(Some(prev));
+        self.catalog.sessions().get(*session_idx)
     }
 }
 
@@ -591,11 +601,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(header, layout[0]);
 
     let title = format!(" sessions ({}) ", app.catalog.len());
-    let items: Vec<ListItem<'_>> = app
-        .catalog
-        .sessions()
+    let rows = build_display_rows(app.catalog.sessions());
+    let sessions_slice = app.catalog.sessions();
+    let items: Vec<ListItem<'_>> = rows
         .iter()
-        .map(|s| ListItem::new(format_session_row(s, app.home.as_deref())))
+        .map(|row| match row {
+            DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
+            DisplayRow::ProjectHeader(path) => {
+                ListItem::new(format_project_header(path, app.home.as_deref()))
+            }
+            DisplayRow::SessionRow(i) => ListItem::new(format_session_row(&sessions_slice[*i])),
+        })
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -669,23 +685,49 @@ fn compose_footer(
     )
 }
 
-fn format_session_row(session: &Session, home: Option<&Path>) -> Line<'static> {
+fn format_host_header(host: &HostId) -> Line<'static> {
+    // `── label ──` — a strong visual cue without consuming a full
+    // horizontal rule's worth of pixels. The List widget gives us the
+    // line width but not at format-line construction time; padding to
+    // the frame width would require switching to a custom widget. The
+    // short header reads cleanly even on narrow terminals.
+    Line::from(Span::styled(
+        format!("── {host} ──"),
+        Style::new().add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
+    // Indented one level under the host header; dimmed so it reads as
+    // group context rather than a focal row. Home-shortened so the
+    // ~ prefix doesn't waste horizontal space.
+    Line::from(Span::styled(
+        format!("  {}", display_path(project, home)),
+        Style::new().add_modifier(Modifier::DIM),
+    ))
+}
+
+fn format_session_row(session: &Session) -> Line<'static> {
     let glyph = attention_glyph(effective_attention(session));
-    let host = session.host.to_string();
-    let project = display_path(&session.project_dir, home);
     let age = humanize_elapsed(session.last_activity);
     let dim = Style::new().add_modifier(Modifier::DIM);
 
-    let mut spans = vec![Span::raw(glyph), Span::raw(" ")];
+    // Indented two levels under the project header. Project text is
+    // no longer per-row (the header carries it); for title-less
+    // sessions, fall back to a short session-id suffix so two
+    // unnamed sessions in the same project remain distinguishable.
+    let mut spans = vec![Span::raw("    "), Span::raw(glyph), Span::raw(" ")];
     if let Some(title) = &session.title {
         spans.push(Span::raw(title.clone()));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(project, dim));
     } else {
-        spans.push(Span::raw(project));
+        let id = &session.id.0;
+        let suffix = if id.len() > 6 {
+            &id[id.len() - 6..]
+        } else {
+            id.as_str()
+        };
+        spans.push(Span::styled(format!("({suffix})"), dim));
     }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(host, dim));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(age, dim));
     Line::from(spans)

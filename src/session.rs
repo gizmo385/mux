@@ -12,7 +12,7 @@ pub struct SessionId(pub String);
 /// behavioural backend (read transcripts, list files, etc.); this one
 /// is the per-session identifier that lets the catalog and dashboard
 /// refer to a host without holding a trait object.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostId(pub String);
 
 impl HostId {

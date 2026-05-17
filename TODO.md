@@ -14,7 +14,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 
 - M1 do-not-reproduce checklist (from user, 2026-05-16): (a) switching between worktree-backed sessions must not approach claude-squad's 10+ second cost — design every M1 code path with the "switching never blocks on I/O" discipline in mind; (b) M1 worktree creation must not bake in local-only assumptions that would later need to be unwound for remote session creation (post-M4). `#m1 #design`
 - add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (post-M4 discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#m1 #worktree`
-- add a positive-path test for `worktree::resolve_default_base_branch` that exercises the `origin/HEAD` resolver (requires a bare-remote fixture in the test). Current coverage only hits the `main`/`master` fallback and the empty-result negative case. `#m1 #test`
 - larger move on return-to-dashboard discoverability: in inside-tmux mode, name the agent-mux window predictably (e.g. `agent-mux`) so the hint can become "switch-client -t agent-mux" instead of the generic "prefix+s" picker. Deferred — the footer hint shipped first to see whether it's enough in dogfooding before introducing a window-naming convention. `#m1 #ui #attachment`
 
 ### M2 — Remote hosts

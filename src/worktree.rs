@@ -361,6 +361,50 @@ mod tests {
     }
 
     #[test]
+    fn resolve_default_base_branch_reads_origin_head() {
+        let tmp = TempDir::new().expect("tempdir");
+
+        // Bare remote with a distinctive default branch name so a positive
+        // result can't be explained by the main/master fallback.
+        let remote = tmp.path().join("remote.git");
+        fs::create_dir(&remote).expect("mkdir remote");
+        run_git(&remote, &["init", "-q", "--bare", "-b", "release"]).expect("git init bare");
+
+        // Seed repo to publish one commit so the bare remote has a real HEAD.
+        let seed = tmp.path().join("seed");
+        fs::create_dir(&seed).expect("mkdir seed");
+        run_git(&seed, &["init", "-q", "-b", "release"]).expect("git init seed");
+        run_git(&seed, &["config", "user.email", "test@example.com"]).expect("git config email");
+        run_git(&seed, &["config", "user.name", "test"]).expect("git config name");
+        run_git(&seed, &["config", "commit.gpgsign", "false"]).expect("git config gpgsign");
+        fs::write(seed.join("README.md"), "seed").expect("seed file");
+        run_git(&seed, &["add", "."]).expect("git add");
+        run_git(&seed, &["commit", "-q", "-m", "seed"]).expect("git commit");
+        run_git(
+            &seed,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )
+        .expect("add remote");
+        run_git(&seed, &["push", "-q", "origin", "release"]).expect("git push");
+
+        // git clone sets refs/remotes/origin/HEAD from the remote's HEAD.
+        let clone = tmp.path().join("clone");
+        run_git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                &remote.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        )
+        .expect("git clone");
+
+        let resolved = resolve_default_base_branch(&clone);
+        assert_eq!(resolved.as_deref(), Some("release"));
+    }
+
+    #[test]
     fn resolve_default_base_branch_returns_none_for_empty_repo() {
         let tmp = TempDir::new().expect("tempdir");
         let repo = tmp.path().join("empty");

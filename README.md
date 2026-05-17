@@ -4,7 +4,9 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-M1 complete (dogfooding phase). The dashboard runs (`cargo run`), discovers local Claude Code sessions, labels each one with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to cwd), shows live attention state (● needs-input, ◐ working, ○ idle), and:
+M1 complete. M2 (remote hosts) partial: with `[hosts.<name>]` entries in the config, the dashboard surfaces sessions from SSH-reachable machines at startup. **Limitations until the next M2 chunks land:** remote-session attention is frozen at the startup reading (no live updates), and pressing Enter on a remote session does not yet attach into the remote tmux.
+
+The dashboard runs (`cargo run`), discovers local Claude Code sessions, labels each one with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to cwd), shows live attention state (● needs-input, ◐ working, ○ idle), and:
 
 - `↑`/`↓` or `j`/`k` — navigate the list
 - `Enter` — switch into the tmux pane running the selected session; if there is no live pane, resume the conversation in a fresh `claude --resume` in the session's recorded cwd
@@ -18,9 +20,16 @@ Optional `~/.config/agent-mux/config.toml`:
 
 ```toml
 workspace_folders = ["~/workspace", "~/code"]
+
+# Remote hosts (M2 partial — see Status above).
+# Each table is one SSH-reachable machine whose Claude Code
+# sessions show up alongside your local ones at startup.
+[hosts.alpenglow]
+ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
+# transcript_root = "~/.claude/projects"  # default; tilde-expanded
 ```
 
-The `n` keybind picks from repos found in these folders (depth-1 scan; tilde expansion only — env vars not yet supported).
+The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; tilde expansion only — env vars not yet supported).
 
 ## Setup
 

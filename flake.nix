@@ -64,6 +64,20 @@
             clippy
             rust-analyzer
           ];
+          # On macOS, nix's stdenv sets DEVELOPER_DIR to its bundled Apple
+          # SDK. Apple's /usr/bin/python3 is a stub that resolves the real
+          # interpreter via DEVELOPER_DIR, and the nix SDK has no python3
+          # — so any python script invoked from inside the devShell (e.g.
+          # the user's Coder CLI wrapper used as an SSH ProxyCommand for
+          # *.coder hosts) fails with `error: tool 'python3' not found`,
+          # which surfaces as agent-mux's remote-host connect dying with
+          # exit 255. Unsetting lets the stub fall back to Command Line
+          # Tools; the nix cc-wrapper has its own header paths baked into
+          # NIX_CFLAGS_COMPILE so cargo builds (including objc2-* / Cocoa
+          # framework crates) still link cleanly. No-op on Linux.
+          shellHook = ''
+            unset DEVELOPER_DIR
+          '';
         };
       }
     );

@@ -61,6 +61,27 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 ### Post-M5
 
 - customizable notification sounds: today's M5 surface exposes a single `sound = true/false` flag mapping to the OS "default" sound. Real customization would mean per-host or per-event sound selection (different sound for needs-input vs. attention-flap; one host gets a chime, another gets a buzz). Wait for dogfooding to surface whether the binary toggle is enough; revisit if not. `#post-m5 #notifications #config`
+- remote session creation: M1's worktree-creation + spawn flow, extended to `[hosts.<name>]` SSH targets. Design sketched 2026-05-18 with user feedback on the open questions; consolidates the brief placeholder previously in the Cross-cutting section. The architectural seam: `Host` trait gains two write-side primitives (`run` for arbitrary commands, `write_file` for small files like `.agent-mux/task.toml`), the `Repo` struct gains a `host: HostId` field, `RepoRegistry` scans both local and remote workspaces through the host abstraction, and `WorktreeManager` plus the default-branch resolver route their `git` calls through `host.run` instead of shelling directly. After the plumbing, the new-session modal picker shows host-labeled rows from all configured hosts; submitting a remote repo creates the worktree on the remote and spawns `claude` there via the existing `AttachmentDriver::spawn_session` path (already host-aware from M2's attach work).
+
+  Config schema: `[hosts.<name>]` gains an optional `workspace_folders = [...]`. Tilde stays unexpanded so the remote shell resolves it (same convention as `transcript_root`). When a host omits the field, fall back to the top-level `workspace_folders` value — keeps "same workspaces local + remote" trivial; hosts with genuinely different layouts opt in by setting the per-host list explicitly.
+
+  Trait additions:
+    - `Host::run(cwd, program, args) -> io::Result<Output>` — arbitrary command. `LocalHost` uses `std::process::Command`; `SshHost` wraps it as `ssh master 'cd <cwd> && <quoted-cmd>'` so the `cwd` plumbing stays the trait's responsibility and callers don't need to know how each host handles working directory.
+    - `Host::write_file(path, content) -> io::Result<()>` — small-file write, paralleling `read_to_string`. `LocalHost` calls `fs::write`; `SshHost` pipes content via `ssh master 'cat > <path>'`. Separate primitive (not "pipe through `Host::run`") keeps the architecture's "narrow op per primitive" discipline intact and matches the read-side trait surface.
+
+  Open questions, resolved with user 2026-05-18:
+    1. **Remote repo scan UX.** Fold silently into the existing host-pending state. No separate "scanning remote repos…" indicator; remote repos appear in the picker when their host reaches `Connected`, same shape as M2's session-discovery disk cache + reconcile.
+    2. **Host offline at picker time.** Cached repos from prior runs still appear, but greyed out and not selectable until their host reaches `Connected`. Matches M2's attach UX (cached rows visible but inert until host is registered).
+    3. **Default workspace path.** Per above — fall back to top-level `workspace_folders` when a host doesn't override.
+    4. **`task.toml` write.** Dedicated `Host::write_file` trait method, not piped through `Host::run`.
+
+  Suggested shipping order (each commit independently green, daily-loop discipline):
+    1. **`feat(host): add Host::run + Host::write_file`** — pure plumbing. No callers switch yet. Tests pin `LocalHost` behaviour + the SSH command construction (incl. `cd <cwd>` injection, quoting).
+    2. **`feat(repo): make Repo host-aware + scan remote workspaces`** — adds `Repo.host`, extends `HostConfig` with `workspace_folders`, refactors `RepoRegistry::from_config` to take the host map. Disk cache at `~/.cache/agent-mux/repos/<host>.json` so the picker is instant on re-launch. Modal picker shows host labels and greys out rows whose host is in `pending_hosts` (per Q2). No worktree creation on remote yet — submitting a remote repo errors out clearly. User-visible UX improvement (host-labeled picker) lands here.
+    3. **`feat(worktree): create worktrees through Host::run`** — refactors `WorktreeManager` + default-branch resolver to host-aware. Local path unchanged in behaviour. After this commit, `n → pick remote repo → submit` creates the worktree on the right host.
+    4. **`feat(post-m5): remote session spawn end-to-end`** — wires the resulting remote worktree path into `AttachmentDriver::spawn_session`. Most of this is verification + tests; the host abstraction already routes `spawn_session` through `Host::ssh_argv` from M2.
+
+  `#post-m5 #remote #design`
 
 ### Cross-cutting / deferred decisions
 
@@ -69,7 +90,6 @@ Flat backlog. Each entry tagged with `#area`. Done items deleted, not struck thr
 - evaluate Claude Code hooks API (`Notification`, `Stop`) as a supplement or replacement for transcript tailing `#post-m0 #attention`
 - post-M5: diff view (what an agent has changed against the base branch) `#post-m5 #review`
 - post-M5: merge / discard workflow for completed sessions `#post-m5 #worktree`
-- post-M5: remote session *creation* (spawning new sessions on SSH hosts, not just attaching to existing ones) `#post-m5 #remote`
 - decide UX when agent-mux is launched from inside an existing tmux session vs from a bare shell `#m0 #ui`
 - flesh out `agent-mux-review` Layer 2 categories as project-specific rules emerge in `ARCHITECTURE.md` `#review #setup`
 - post-M2: switch-latency smoke test (or criterion benchmark) that fails if a focus-change round trip exceeds a budget (target: ≤ 50ms against an in-memory catalog populated with N sessions). Reason: claude-squad's 10+ second switching is the empirical failure mode we exist to avoid. Deferred from M0 — the budget needs to cover both local and remote switching, and setting a local-only number now risks rework once M2 lands. `#post-m2 #perf`

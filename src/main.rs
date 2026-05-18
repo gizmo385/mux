@@ -694,18 +694,19 @@ impl App {
     /// just session-switching — `git worktree add` can take seconds on a
     /// large repo, and that must not stall the dashboard.
     fn start_creating(&mut self, repo: Repo, task: String, base_branch: String) {
-        // Step 2 of the remote-session-creation arc plumbs the picker
-        // but not the worktree-creation path through `Host::run` yet.
-        // A remote selection should fail fast with a clear status
-        // rather than silently shelling `git worktree add` on the
-        // local FS against a path that doesn't exist there.
-        if !repo.host.is_local() {
+        // Worktree creation now routes through `Host::run` so the same
+        // code path serves local and remote — the trait dispatches.
+        // The host must be registered (i.e. for SSH targets, the
+        // `Connected` event must have fired); the picker greys out
+        // unregistered hosts to prevent us reaching here without one,
+        // but we double-check as a defensive measure.
+        let Some(host) = self.hosts.get(&repo.host).cloned() else {
             self.status = Some(format!(
-                "remote worktree creation not yet wired (host {})",
+                "host {} not connected yet — wait and try again",
                 repo.host.as_str()
             ));
             return;
-        }
+        };
         self.creating = Some(CreatingSession {
             repo_name: repo.name.clone(),
             task: task.clone(),
@@ -713,10 +714,11 @@ impl App {
         self.status = None;
         let tx = self.create_tx.clone();
         std::thread::spawn(move || {
-            let outcome = match WorktreeManager.create(&repo.path, &base_branch, &task) {
-                Ok(path) => NewSessionResult::Created(path),
-                Err(e) => NewSessionResult::Failed(format!("create worktree: {e}")),
-            };
+            let outcome =
+                match WorktreeManager.create(host.as_ref(), &repo.path, &base_branch, &task) {
+                    Ok(path) => NewSessionResult::Created(path),
+                    Err(e) => NewSessionResult::Failed(format!("create worktree: {e}")),
+                };
             let _ = tx.send(outcome);
         });
     }

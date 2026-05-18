@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::host::Host;
 
 const METADATA_PATH: &str = ".agent-mux/task.toml";
 
@@ -59,28 +60,36 @@ impl WorktreeManager {
         Self
     }
 
-    /// Create a worktree alongside the parent repo.
+    /// Create a worktree alongside the parent repo on `host`.
     ///
     /// The new worktree lives at `<repo-parent>/<repo-name>-<slug>` on a new
     /// branch named `<slug>` branched off `base_branch`. A `task.toml` file
-    /// inside the worktree records the task metadata.
+    /// inside the worktree records the task metadata. All git invocations
+    /// and the metadata write route through the [`Host`] trait, so the
+    /// same code path works for local and SSH-reachable hosts — the trait
+    /// dispatches.
     ///
     /// # Errors
     /// Returns [`WorktreeError`] for missing repo, git failure, empty-slug
     /// task name, path collision, or I/O failure while writing metadata.
     pub fn create(
         &self,
+        host: &dyn Host,
         repo: &Path,
         base_branch: &str,
         task: &str,
     ) -> Result<PathBuf, WorktreeError> {
-        let repo_root = repo_toplevel(repo)?;
+        let repo_root = repo_toplevel(host, repo)?;
         let slug = slugify(task).ok_or_else(|| WorktreeError::InvalidTaskName(task.to_string()))?;
         let path = worktree_path(&repo_root, &slug);
-        if path.exists() {
+        // Use the host's is_dir rather than `path.exists()` so the
+        // remote case works — the local FS doesn't know about a
+        // worktree the remote has on disk.
+        if host.is_dir(&path) {
             return Err(WorktreeError::PathExists(path));
         }
-        run_git(
+        run_git_via_host(
+            host,
             &repo_root,
             &[
                 "worktree",
@@ -92,6 +101,7 @@ impl WorktreeManager {
             ],
         )?;
         write_task_metadata(
+            host,
             &path,
             &TaskMetadata {
                 task: task.to_string(),
@@ -103,18 +113,18 @@ impl WorktreeManager {
     }
 }
 
-/// Resolve the repo's default branch name.
+/// Resolve the repo's default branch name on `host`.
 ///
 /// Tries `git symbolic-ref --short refs/remotes/origin/HEAD` and strips the
 /// `origin/` prefix; falls back to `main` then `master` if either exists as
 /// a local ref. Returns `None` if none resolve — the caller should prompt.
 #[must_use]
-pub fn resolve_default_base_branch(repo: &Path) -> Option<String> {
-    if let Some(name) = symbolic_ref_origin_head(repo) {
+pub fn resolve_default_base_branch(host: &dyn Host, repo: &Path) -> Option<String> {
+    if let Some(name) = symbolic_ref_origin_head(host, repo) {
         return Some(name);
     }
     for fallback in ["main", "master"] {
-        if branch_exists(repo, fallback) {
+        if branch_exists(host, repo, fallback) {
             return Some(fallback.to_string());
         }
     }
@@ -149,11 +159,28 @@ pub fn task_metadata_path(worktree: &Path) -> PathBuf {
     worktree.join(METADATA_PATH)
 }
 
-fn write_task_metadata(worktree: &Path, meta: &TaskMetadata) -> Result<(), WorktreeError> {
+fn write_task_metadata(
+    host: &dyn Host,
+    worktree: &Path,
+    meta: &TaskMetadata,
+) -> Result<(), WorktreeError> {
+    // `mkdir -p` is portable across local and SSH; building the path
+    // remotely avoids needing a dedicated `Host::create_dir_all`
+    // primitive for one caller. The dotfile name is fixed so this
+    // can't expand to a parent we didn't intend.
     let dir = worktree.join(".agent-mux");
-    fs::create_dir_all(&dir)?;
+    let dir_str = dir.to_string_lossy();
+    let mkdir = host
+        .run(None, "mkdir", &["-p", &dir_str])
+        .map_err(|e| WorktreeError::GitFailed(format!("mkdir {dir_str}: {e}")))?;
+    if !mkdir.status.success() {
+        return Err(WorktreeError::GitFailed(format!(
+            "mkdir {dir_str} failed: {}",
+            String::from_utf8_lossy(&mkdir.stderr).trim()
+        )));
+    }
     let serialized = toml::to_string(meta).map_err(WorktreeError::TomlSerialize)?;
-    fs::write(worktree.join(METADATA_PATH), serialized)?;
+    host.write_file(&worktree.join(METADATA_PATH), &serialized)?;
     Ok(())
 }
 
@@ -185,8 +212,8 @@ fn worktree_path(repo_root: &Path, slug: &str) -> PathBuf {
     parent.join(format!("{repo_name}-{slug}"))
 }
 
-fn repo_toplevel(repo: &Path) -> Result<PathBuf, WorktreeError> {
-    let stdout = run_git_stdout(repo, &["rev-parse", "--show-toplevel"])
+fn repo_toplevel(host: &dyn Host, repo: &Path) -> Result<PathBuf, WorktreeError> {
+    let stdout = run_git_stdout(host, repo, &["rev-parse", "--show-toplevel"])
         .map_err(|_| WorktreeError::NotARepo(repo.to_path_buf()))?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -195,8 +222,9 @@ fn repo_toplevel(repo: &Path) -> Result<PathBuf, WorktreeError> {
     Ok(PathBuf::from(trimmed))
 }
 
-fn symbolic_ref_origin_head(repo: &Path) -> Option<String> {
+fn symbolic_ref_origin_head(host: &dyn Host, repo: &Path) -> Option<String> {
     let stdout = run_git_stdout(
+        host,
         repo,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     )
@@ -208,22 +236,21 @@ fn symbolic_ref_origin_head(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn branch_exists(repo: &Path, name: &str) -> bool {
-    git_command(repo)
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{name}"),
-        ])
-        .status()
-        .is_ok_and(|s| s.success())
+fn branch_exists(host: &dyn Host, repo: &Path, name: &str) -> bool {
+    let refspec = format!("refs/heads/{name}");
+    host.run(
+        Some(repo),
+        "git",
+        &["show-ref", "--verify", "--quiet", &refspec],
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<(), WorktreeError> {
-    let output = git_command(cwd)
-        .args(args)
-        .output()
+/// Run `git <args>` on `host` in the directory `cwd`, expecting it to
+/// exit zero. Maps non-zero exit + stderr into [`WorktreeError::GitFailed`].
+fn run_git_via_host(host: &dyn Host, cwd: &Path, args: &[&str]) -> Result<(), WorktreeError> {
+    let output = host
+        .run(Some(cwd), "git", args)
         .map_err(|e| WorktreeError::GitFailed(e.to_string()))?;
     if !output.status.success() {
         return Err(WorktreeError::GitFailed(
@@ -233,10 +260,11 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), WorktreeError> {
     Ok(())
 }
 
-fn run_git_stdout(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = git_command(cwd)
-        .args(args)
-        .output()
+/// Same as [`run_git_via_host`] but returns captured stdout. Used for
+/// the read-only `git symbolic-ref` / `rev-parse` calls.
+fn run_git_stdout(host: &dyn Host, cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+    let output = host
+        .run(Some(cwd), "git", args)
         .map_err(|e| WorktreeError::GitFailed(e.to_string()))?;
     if !output.status.success() {
         return Err(WorktreeError::GitFailed(
@@ -244,26 +272,6 @@ fn run_git_stdout(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-// Strip GIT_* env vars that would redirect git's view of the repo. Critical
-// when this process (or its tests) is invoked inside a git hook, where
-// GIT_DIR/GIT_WORK_TREE/etc. point at the surrounding repo and silently
-// override `current_dir`.
-fn git_command(cwd: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(cwd);
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-        "GIT_PREFIX",
-    ] {
-        cmd.env_remove(var);
-    }
-    cmd
 }
 
 fn now_unix_seconds() -> u64 {
@@ -275,16 +283,42 @@ fn now_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::LocalHost;
+    use std::process::Command;
     use tempfile::TempDir;
 
+    /// Local-only test helper: shell git directly without going through
+    /// the `Host` trait so the repo-init scaffolding stays small. The
+    /// production worktree code routes everything through `Host::run`;
+    /// this helper is just for the surrounding test fixtures (init a
+    /// bare repo, seed a commit). Pinned to local `Command::new` so
+    /// tests don't accidentally exercise the trait dispatch we mean
+    /// to test below it.
+    fn run_git_directly(dir: &Path, args: &[&str]) {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir).args(args);
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+        ] {
+            cmd.env_remove(var);
+        }
+        let status = cmd.status().expect("spawn git");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
     fn init_repo(dir: &Path) {
-        run_git(dir, &["init", "-q", "-b", "main"]).expect("git init");
-        run_git(dir, &["config", "user.email", "test@example.com"]).expect("git config email");
-        run_git(dir, &["config", "user.name", "test"]).expect("git config name");
-        run_git(dir, &["config", "commit.gpgsign", "false"]).expect("git config gpgsign");
+        run_git_directly(dir, &["init", "-q", "-b", "main"]);
+        run_git_directly(dir, &["config", "user.email", "test@example.com"]);
+        run_git_directly(dir, &["config", "user.name", "test"]);
+        run_git_directly(dir, &["config", "commit.gpgsign", "false"]);
         fs::write(dir.join("README.md"), "seed").expect("seed file");
-        run_git(dir, &["add", "."]).expect("git add");
-        run_git(dir, &["commit", "-q", "-m", "seed"]).expect("git commit");
+        run_git_directly(dir, &["add", "."]);
+        run_git_directly(dir, &["commit", "-q", "-m", "seed"]);
     }
 
     #[test]
@@ -318,8 +352,9 @@ mod tests {
         fs::create_dir(&repo).expect("mkdir proj");
         init_repo(&repo);
 
+        let host = LocalHost::new();
         let path = WorktreeManager::new()
-            .create(&repo, "main", "refactor parser")
+            .create(&host, &repo, "main", "refactor parser")
             .expect("create worktree");
 
         assert!(path.is_dir(), "worktree dir should exist: {path:?}");
@@ -341,12 +376,13 @@ mod tests {
         fs::create_dir(&repo).expect("mkdir proj");
         init_repo(&repo);
 
+        let host = LocalHost::new();
         let manager = WorktreeManager::new();
         manager
-            .create(&repo, "main", "task one")
+            .create(&host, &repo, "main", "task one")
             .expect("first create");
         let err = manager
-            .create(&repo, "main", "task one")
+            .create(&host, &repo, "main", "task one")
             .expect_err("second create should fail");
         assert!(matches!(err, WorktreeError::PathExists(_)), "got: {err:?}");
     }
@@ -358,8 +394,9 @@ mod tests {
         fs::create_dir(&repo).expect("mkdir proj");
         init_repo(&repo);
 
+        let host = LocalHost::new();
         let err = WorktreeManager::new()
-            .create(&repo, "main", "!!!")
+            .create(&host, &repo, "main", "!!!")
             .expect_err("should reject");
         assert!(
             matches!(err, WorktreeError::InvalidTaskName(_)),
@@ -374,7 +411,8 @@ mod tests {
         fs::create_dir(&repo).expect("mkdir proj");
         init_repo(&repo);
 
-        let resolved = resolve_default_base_branch(&repo);
+        let host = LocalHost::new();
+        let resolved = resolve_default_base_branch(&host, &repo);
         assert_eq!(resolved.as_deref(), Some("main"));
     }
 
@@ -386,28 +424,27 @@ mod tests {
         // result can't be explained by the main/master fallback.
         let remote = tmp.path().join("remote.git");
         fs::create_dir(&remote).expect("mkdir remote");
-        run_git(&remote, &["init", "-q", "--bare", "-b", "release"]).expect("git init bare");
+        run_git_directly(&remote, &["init", "-q", "--bare", "-b", "release"]);
 
         // Seed repo to publish one commit so the bare remote has a real HEAD.
         let seed = tmp.path().join("seed");
         fs::create_dir(&seed).expect("mkdir seed");
-        run_git(&seed, &["init", "-q", "-b", "release"]).expect("git init seed");
-        run_git(&seed, &["config", "user.email", "test@example.com"]).expect("git config email");
-        run_git(&seed, &["config", "user.name", "test"]).expect("git config name");
-        run_git(&seed, &["config", "commit.gpgsign", "false"]).expect("git config gpgsign");
+        run_git_directly(&seed, &["init", "-q", "-b", "release"]);
+        run_git_directly(&seed, &["config", "user.email", "test@example.com"]);
+        run_git_directly(&seed, &["config", "user.name", "test"]);
+        run_git_directly(&seed, &["config", "commit.gpgsign", "false"]);
         fs::write(seed.join("README.md"), "seed").expect("seed file");
-        run_git(&seed, &["add", "."]).expect("git add");
-        run_git(&seed, &["commit", "-q", "-m", "seed"]).expect("git commit");
-        run_git(
+        run_git_directly(&seed, &["add", "."]);
+        run_git_directly(&seed, &["commit", "-q", "-m", "seed"]);
+        run_git_directly(
             &seed,
             &["remote", "add", "origin", &remote.to_string_lossy()],
-        )
-        .expect("add remote");
-        run_git(&seed, &["push", "-q", "origin", "release"]).expect("git push");
+        );
+        run_git_directly(&seed, &["push", "-q", "origin", "release"]);
 
         // git clone sets refs/remotes/origin/HEAD from the remote's HEAD.
         let clone = tmp.path().join("clone");
-        run_git(
+        run_git_directly(
             tmp.path(),
             &[
                 "clone",
@@ -415,10 +452,10 @@ mod tests {
                 &remote.to_string_lossy(),
                 &clone.to_string_lossy(),
             ],
-        )
-        .expect("git clone");
+        );
 
-        let resolved = resolve_default_base_branch(&clone);
+        let host = LocalHost::new();
+        let resolved = resolve_default_base_branch(&host, &clone);
         assert_eq!(resolved.as_deref(), Some("release"));
     }
 
@@ -427,8 +464,9 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let repo = tmp.path().join("empty");
         fs::create_dir(&repo).expect("mkdir empty");
-        run_git(&repo, &["init", "-q", "-b", "trunk"]).expect("git init");
+        run_git_directly(&repo, &["init", "-q", "-b", "trunk"]);
         // No commit, no main/master branch, no origin. Resolver should give up.
-        assert_eq!(resolve_default_base_branch(&repo), None);
+        let host = LocalHost::new();
+        assert_eq!(resolve_default_base_branch(&host, &repo), None);
     }
 }

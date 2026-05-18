@@ -7,6 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
+use crate::host::LocalHost;
 use crate::repo::Repo;
 use crate::session::HostId;
 use crate::worktree;
@@ -151,7 +152,14 @@ fn handle_picking(
             // `Host::run` so remote default-branch resolution works
             // too.
             let branch = if repo.host.is_local() {
-                worktree::resolve_default_base_branch(&repo.path).unwrap_or_default()
+                // Synchronous local git call; fast. Remote default-
+                // branch resolution would require an SSH round-trip
+                // mid-keypress which would block the UI; the field
+                // stays empty for remote repos and the user types
+                // their branch. A future pass can pre-resolve remote
+                // branches asynchronously during workspace scan.
+                let host = LocalHost::new();
+                worktree::resolve_default_base_branch(&host, &repo.path).unwrap_or_default()
             } else {
                 String::new()
             };

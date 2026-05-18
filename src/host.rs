@@ -245,6 +245,23 @@ impl Host for LocalHost {
         if let Some(d) = cwd {
             cmd.current_dir(d);
         }
+        // Always strip git-pointer env vars so a process running inside
+        // a git hook (or a `cargo test` invocation from one) can't
+        // accidentally see GIT_DIR / GIT_WORK_TREE / etc. set by the
+        // outer git invocation and silently override `current_dir`.
+        // Stripping is harmless for non-git programs — they ignore
+        // these names. SSH hosts don't need this because ssh login
+        // shells start with a fresh env.
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd.output()
     }
 

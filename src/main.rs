@@ -244,8 +244,12 @@ struct CreatingSession {
 }
 
 /// Result from the background create thread. Drained on every tick.
+/// `Created` carries both the worktree path and the `HostId` it was
+/// created on so the main thread can route `spawn_session` through the
+/// right `Arc<dyn Host>` — the path alone doesn't tell us whether to
+/// invoke claude locally or via SSH.
 enum NewSessionResult {
-    Created(PathBuf),
+    Created { host_id: HostId, path: PathBuf },
     Failed(String),
 }
 
@@ -713,10 +717,11 @@ impl App {
         });
         self.status = None;
         let tx = self.create_tx.clone();
+        let host_id = repo.host.clone();
         std::thread::spawn(move || {
             let outcome =
                 match WorktreeManager.create(host.as_ref(), &repo.path, &base_branch, &task) {
-                    Ok(path) => NewSessionResult::Created(path),
+                    Ok(path) => NewSessionResult::Created { host_id, path },
                     Err(e) => NewSessionResult::Failed(format!("create worktree: {e}")),
                 };
             let _ = tx.send(outcome);
@@ -731,21 +736,37 @@ impl App {
         while let Ok(result) = self.create_rx.try_recv() {
             self.creating = None;
             match result {
-                NewSessionResult::Created(path) => match self.driver.spawn_session(&path) {
-                    Ok(AttachOutcome::Done) => {
-                        self.status = Some(format!("started new session in {}", path.display()));
-                    }
-                    Ok(AttachOutcome::SuspendAndRun(cmd)) => {
-                        self.status = None;
-                        return Some(cmd);
-                    }
-                    Err(e) => {
+                NewSessionResult::Created { host_id, path } => {
+                    // `spawn_session` needs the host to know whether to
+                    // run claude locally or wrap it in `ssh -t target
+                    // tmux new-session …`. The host should still be in
+                    // `App.hosts` (we held an Arc during the create
+                    // thread); the lookup-miss path is defensive.
+                    let Some(host) = self.hosts.get(&host_id).cloned() else {
                         self.status = Some(format!(
-                            "worktree created at {} but spawn failed: {e}",
-                            path.display()
+                            "worktree created at {} but host {} dropped — spawn aborted",
+                            path.display(),
+                            host_id.as_str()
                         ));
+                        continue;
+                    };
+                    match self.driver.spawn_session(&path, host.as_ref()) {
+                        Ok(AttachOutcome::Done) => {
+                            self.status =
+                                Some(format!("started new session in {}", path.display()));
+                        }
+                        Ok(AttachOutcome::SuspendAndRun(cmd)) => {
+                            self.status = None;
+                            return Some(cmd);
+                        }
+                        Err(e) => {
+                            self.status = Some(format!(
+                                "worktree created at {} but spawn failed: {e}",
+                                path.display()
+                            ));
+                        }
                     }
-                },
+                }
                 NewSessionResult::Failed(msg) => {
                     self.status = Some(msg);
                 }

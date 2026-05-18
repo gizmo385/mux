@@ -75,18 +75,23 @@ pub trait AttachmentDriver {
 
     /// Launch a fresh `claude` process in a new tmux window at `cwd`, and
     /// switch focus to it. Used by the new-session flow after the
-    /// `WorktreeManager` has created the worktree.
+    /// `WorktreeManager` has created the worktree on `host`.
     ///
-    /// The resulting Claude Code session will surface in the dashboard
-    /// shortly after via the existing transcript-discovery pipeline — this
-    /// method does not return a `SessionId`.
+    /// For local hosts, `cwd` is a local path and `claude` runs in a new
+    /// local tmux window (or a fresh tmux session if outside tmux). For
+    /// remote hosts, `cwd` is a path on the *remote* and the command
+    /// runs through `Host::ssh_argv` over the existing `ControlMaster`
+    /// — same dispatch shape as the M2 attach path.
     ///
-    /// Local-only in M2: remote session *creation* (the new-session flow
-    /// running against an SSH host) is post-M5.
+    /// The resulting Claude Code session surfaces in the dashboard
+    /// shortly after via the existing transcript-discovery pipeline —
+    /// this method does not return a `SessionId`.
     ///
     /// # Errors
-    /// Returns `AttachError::TmuxCommandFailed` if tmux returns non-zero.
-    fn spawn_session(&self, cwd: &Path) -> Result<AttachOutcome, AttachError>;
+    /// Returns `AttachError::TmuxCommandFailed` if tmux returns non-zero,
+    /// or `AttachError::RemoteUnsupported` if `host` is unexpectedly
+    /// local-shaped (e.g. an `ssh_argv` impl that returns `None`).
+    fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -120,8 +125,19 @@ impl AttachmentDriver for TmuxDriver {
         }
     }
 
-    fn spawn_session(&self, cwd: &Path) -> Result<AttachOutcome, AttachError> {
-        Self::launch_in_new_window(cwd, "claude")
+    fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+        if host.id().is_local() {
+            Self::launch_in_new_window(cwd, "claude")
+        } else {
+            // Fresh remote tmux session running claude. No `-A` here
+            // (unlike `resume_remote`): this is the initial spawn so
+            // there's no pre-existing session to attach to. tmux
+            // auto-names the session; the user reaches it later via
+            // the dashboard's normal attach path once the new
+            // transcript surfaces in `~/.claude/projects/`.
+            let cwd_str = cwd.to_string_lossy();
+            Self::run_remote_interactive(host, &["tmux", "new-session", "-c", &cwd_str, "claude"])
+        }
     }
 }
 

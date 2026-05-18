@@ -457,6 +457,11 @@ impl Config {
     /// `$XDG_CONFIG_HOME/agent-mux/config.toml` if set). Missing file is not
     /// an error — returns a default `Config` with an empty workspace list.
     ///
+    /// On macOS the platform-native `~/Library/Application Support/agent-mux/`
+    /// is also searched as a final fallback, but the XDG-style `~/.config`
+    /// path takes precedence so the documented location matches reality
+    /// across Linux *and* macOS.
+    ///
     /// # Errors
     /// [`ConfigError::Io`] for unreadable files (other than not-found);
     /// [`ConfigError::Parse`] if the TOML is malformed;
@@ -497,8 +502,57 @@ impl Config {
     }
 }
 
+/// Paths agent-mux searches for `config.toml`, in priority order. The
+/// first existing entry is the one [`Config::load`] reads; if none
+/// exist, the first entry is still useful as the path to surface in
+/// "no config found, looked here:" diagnostics.
+///
+/// Exposed so the `config` subcommand can show what it searched.
+#[must_use]
+pub fn config_search_paths() -> Vec<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    config_search_paths_from(
+        xdg.as_deref(),
+        dirs::home_dir().as_deref(),
+        dirs::config_dir().as_deref(),
+    )
+}
+
+/// Pure helper backing [`config_search_paths`]. Takes the three
+/// inputs explicitly so the precedence is unit-testable without
+/// poking environment variables.
+fn config_search_paths_from(
+    xdg_config_home: Option<&Path>,
+    home_dir: Option<&Path>,
+    platform_config_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Some(xdg) = xdg_config_home {
+        push(xdg.join("agent-mux").join("config.toml"));
+    }
+    if let Some(home) = home_dir {
+        push(home.join(".config").join("agent-mux").join("config.toml"));
+    }
+    if let Some(platform) = platform_config_dir {
+        push(platform.join("agent-mux").join("config.toml"));
+    }
+    out
+}
+
 fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("agent-mux").join("config.toml"))
+    let candidates = config_search_paths();
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn expand(p: &Path) -> PathBuf {
@@ -1049,6 +1103,67 @@ tool_use = "#aabbcc"
         assert_eq!(theme.tool_use, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
         // Defaults still in place for un-overridden fields.
         assert_eq!(theme.tool_result_ok, Some(Color::Green));
+    }
+
+    #[test]
+    fn search_paths_xdg_first_then_dot_config_then_platform() {
+        // All three inputs distinct: every candidate appears in
+        // priority order. macOS-style platform dir at the tail.
+        let xdg = PathBuf::from("/x");
+        let home = PathBuf::from("/h");
+        let platform = PathBuf::from("/h/Library/Application Support");
+        let paths = config_search_paths_from(Some(&xdg), Some(&home), Some(&platform));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/x/agent-mux/config.toml"),
+                PathBuf::from("/h/.config/agent-mux/config.toml"),
+                PathBuf::from("/h/Library/Application Support/agent-mux/config.toml"),
+            ],
+        );
+    }
+
+    #[test]
+    fn search_paths_dedup_linux_platform_overlap() {
+        // On Linux dirs::config_dir() == $HOME/.config; the dedup
+        // keeps the higher-priority entry and drops the duplicate
+        // so the resulting list has no repeats.
+        let home = PathBuf::from("/h");
+        let platform = PathBuf::from("/h/.config");
+        let paths = config_search_paths_from(None, Some(&home), Some(&platform));
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/h/.config/agent-mux/config.toml")],
+        );
+    }
+
+    #[test]
+    fn search_paths_drops_missing_inputs() {
+        // No env var, no home dir resolved, platform dir present:
+        // only the platform path survives.
+        let platform = PathBuf::from("/Library/Application Support");
+        let paths = config_search_paths_from(None, None, Some(&platform));
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(
+                "/Library/Application Support/agent-mux/config.toml"
+            )],
+        );
+    }
+
+    #[test]
+    fn search_paths_xdg_takes_priority_over_dot_config() {
+        // `$XDG_CONFIG_HOME` pointing somewhere other than
+        // `$HOME/.config` is the canonical "redirect my config"
+        // signal — it must appear before the dot-config fallback.
+        let xdg = PathBuf::from("/custom/xdg");
+        let home = PathBuf::from("/h");
+        let paths = config_search_paths_from(Some(&xdg), Some(&home), None);
+        assert_eq!(
+            paths.first(),
+            Some(&PathBuf::from("/custom/xdg/agent-mux/config.toml"))
+        );
+        assert!(paths.contains(&PathBuf::from("/h/.config/agent-mux/config.toml")));
     }
 
     #[test]

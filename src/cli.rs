@@ -12,10 +12,11 @@
 //! `io::stdout()`.
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use ratatui::style::Color;
 
-use crate::config::Theme;
+use crate::config::{Config, ConfigError, Theme};
 
 /// ANSI reset escape. After every coloured glyph or label we restore the
 /// terminal's default so nothing bleeds into the next line — important
@@ -155,6 +156,129 @@ fn write_ansi_fg<W: Write>(out: &mut W, c: Color) -> io::Result<()> {
     }
 }
 
+/// Print the current resolved config state followed by the reference
+/// documentation. The status section shows which path agent-mux loaded
+/// (or searched, if none existed) and the parsed values — the answer
+/// to "is my config actually being read?" without spelunking through
+/// logs.
+///
+/// `searched` is the priority-ordered list of paths agent-mux looked
+/// at; `loaded_from` is `Some(path)` when one of them existed and was
+/// read, `None` when every candidate was absent. `result` is the
+/// outcome of the load — `Err` paths still show what failed before
+/// the reference section.
+///
+/// # Errors
+///
+/// Propagates any `io::Error` from `out`.
+pub fn print_config<W: Write>(
+    out: &mut W,
+    searched: &[PathBuf],
+    loaded_from: Option<&Path>,
+    result: &Result<Config, ConfigError>,
+) -> io::Result<()> {
+    print_config_status(out, searched, loaded_from, result)?;
+    writeln!(out)?;
+    print_config_reference(out)
+}
+
+/// Print only the status section: which path was loaded, parsed
+/// values (or the load error). Factored from [`print_config`] so the
+/// reference docs can be omitted in contexts that just want the
+/// debugging view (none today, but the split keeps the layers
+/// independently testable).
+///
+/// # Errors
+///
+/// Propagates any `io::Error` from `out`.
+pub fn print_config_status<W: Write>(
+    out: &mut W,
+    searched: &[PathBuf],
+    loaded_from: Option<&Path>,
+    result: &Result<Config, ConfigError>,
+) -> io::Result<()> {
+    writeln!(out, "Current configuration")?;
+    writeln!(out, "─────────────────────")?;
+    if let Some(p) = loaded_from {
+        writeln!(out, "  loaded from: {}", p.display())?;
+    } else {
+        writeln!(out, "  no config file found. searched:")?;
+        if searched.is_empty() {
+            writeln!(out, "    (no candidate paths — $HOME unresolved)")?;
+        } else {
+            for p in searched {
+                writeln!(out, "    - {}", p.display())?;
+            }
+        }
+        writeln!(out, "  using built-in defaults.")?;
+    }
+    match result {
+        Ok(cfg) => print_parsed_config(out, cfg)?,
+        Err(e) => {
+            writeln!(out, "  parse failed: {e}")?;
+            writeln!(out, "  using built-in defaults.")?;
+        }
+    }
+    Ok(())
+}
+
+fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
+    writeln!(
+        out,
+        "  workspace_folders ({}):",
+        cfg.workspace_folders.len()
+    )?;
+    if cfg.workspace_folders.is_empty() {
+        writeln!(out, "    (none — `n` to create a session will be disabled)")?;
+    } else {
+        for f in &cfg.workspace_folders {
+            writeln!(out, "    - {}", f.display())?;
+        }
+    }
+    writeln!(out, "  hosts ({}):", cfg.hosts.len())?;
+    if cfg.hosts.is_empty() {
+        writeln!(out, "    (none — only the local host will show sessions)")?;
+    } else {
+        for (name, h) in &cfg.hosts {
+            writeln!(
+                out,
+                "    - {name}: ssh={:?}, transcript_root={}",
+                h.ssh,
+                h.transcript_root.display()
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "  notifications: enabled={}, sound={}, disabled_hosts={:?}",
+        cfg.notifications.enabled, cfg.notifications.sound, cfg.notifications.disabled_hosts,
+    )?;
+    let preset = cfg.theme.preset.as_deref().unwrap_or("default");
+    let overrides = theme_override_count(&cfg.theme);
+    writeln!(
+        out,
+        "  theme: preset={preset:?}, per-field overrides={overrides}",
+    )?;
+    Ok(())
+}
+
+fn theme_override_count(t: &crate::config::ThemeConfig) -> usize {
+    [
+        &t.needs_input,
+        &t.working,
+        &t.idle,
+        &t.unknown,
+        &t.tool_use,
+        &t.tool_result_ok,
+        &t.tool_result_err,
+        &t.user_fg,
+        &t.assistant_fg,
+    ]
+    .iter()
+    .filter(|f| f.is_some())
+    .count()
+}
+
 /// Print a reference of every config key with its default and a
 /// one-line description. The output is a self-contained TOML skeleton
 /// the user can copy verbatim into `config.toml` and tune from.
@@ -162,7 +286,9 @@ fn write_ansi_fg<W: Write>(out: &mut W, c: Color) -> io::Result<()> {
 /// # Errors
 ///
 /// Propagates any `io::Error` from `out`.
-pub fn print_config<W: Write>(out: &mut W) -> io::Result<()> {
+pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
+    writeln!(out, "Reference")?;
+    writeln!(out, "─────────")?;
     writeln!(out, "Configuration: ~/.config/agent-mux/config.toml")?;
     writeln!(
         out,
@@ -383,7 +509,7 @@ mod tests {
 
     #[test]
     fn config_includes_every_section() {
-        let out = run(print_config);
+        let out = run(print_config_reference);
         for section in ["workspace_folders", "[hosts", "[notifications]", "[theme]"] {
             assert!(out.contains(section), "missing section {section:?}:\n{out}");
         }
@@ -391,7 +517,7 @@ mod tests {
 
     #[test]
     fn config_lists_every_preset_name() {
-        let out = run(print_config);
+        let out = run(print_config_reference);
         for name in Theme::preset_names() {
             assert!(out.contains(name), "missing preset name {name:?}:\n{out}");
         }
@@ -399,7 +525,7 @@ mod tests {
 
     #[test]
     fn config_documents_every_theme_field() {
-        let out = run(print_config);
+        let out = run(print_config_reference);
         for field in [
             "preset",
             "needs_input",
@@ -416,13 +542,117 @@ mod tests {
 
     #[test]
     fn config_documents_every_notifications_field() {
-        let out = run(print_config);
+        let out = run(print_config_reference);
         for field in ["enabled", "sound", "disabled_hosts"] {
             assert!(
                 out.contains(field),
                 "notifications.{field} not documented:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn status_reports_loaded_path_and_parsed_values() {
+        // Happy path: config exists, parsed cleanly. The status block
+        // names the path, the workspace folders, and each configured
+        // host so a user can verify the file they edited is the one
+        // agent-mux read.
+        let cfg = Config {
+            workspace_folders: vec![PathBuf::from("/h/work")],
+            hosts: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "devbox".to_string(),
+                    crate::config::HostConfig {
+                        ssh: "devbox.internal".to_string(),
+                        transcript_root: PathBuf::from("~/.claude/projects"),
+                    },
+                );
+                m
+            },
+            ..Config::default()
+        };
+        let path = PathBuf::from("/h/.config/agent-mux/config.toml");
+        let out =
+            run(|w| print_config_status(w, std::slice::from_ref(&path), Some(&path), &Ok(cfg)));
+        assert!(
+            out.contains("/h/.config/agent-mux/config.toml"),
+            "missing loaded path:\n{out}"
+        );
+        assert!(out.contains("/h/work"), "missing workspace folder:\n{out}");
+        assert!(out.contains("devbox"), "missing host name:\n{out}");
+        assert!(
+            out.contains("devbox.internal"),
+            "missing ssh target:\n{out}"
+        );
+    }
+
+    #[test]
+    fn status_reports_when_no_config_file_exists() {
+        // The bug this output is meant to catch: the user edited
+        // ~/.config/agent-mux/config.toml but agent-mux was looking
+        // at ~/Library/Application Support/. The status section
+        // must enumerate every searched path so the mismatch is
+        // visible at a glance.
+        let searched = vec![
+            PathBuf::from("/h/.config/agent-mux/config.toml"),
+            PathBuf::from("/h/Library/Application Support/agent-mux/config.toml"),
+        ];
+        let out = run(|w| print_config_status(w, &searched, None, &Ok(Config::default())));
+        assert!(
+            out.contains("no config file found"),
+            "missing not-found marker:\n{out}"
+        );
+        for p in &searched {
+            let s = p.display().to_string();
+            assert!(out.contains(&s), "missing searched path {s:?}:\n{out}");
+        }
+        assert!(
+            out.contains("built-in defaults"),
+            "missing defaults notice:\n{out}"
+        );
+    }
+
+    #[test]
+    fn status_reports_parse_error() {
+        // A malformed TOML file is the third common failure mode
+        // (after "wrong path" and "missing file"). The status block
+        // should surface the parser's message so the user knows
+        // where to look.
+        let path = PathBuf::from("/h/.config/agent-mux/config.toml");
+        let err: Result<Config, ConfigError> = match toml::from_str::<Config>("not = valid = toml")
+        {
+            Err(e) => Err(ConfigError::Parse(e)),
+            Ok(_) => panic!("test fixture should be malformed TOML"),
+        };
+        let out = run(|w| print_config_status(w, std::slice::from_ref(&path), Some(&path), &err));
+        assert!(
+            out.contains("parse failed"),
+            "missing parse-failed marker:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_prints_status_then_reference() {
+        // `agent-mux config` shows the live state up top so the
+        // most useful info is visible before the reference scroll.
+        let path = PathBuf::from("/h/.config/agent-mux/config.toml");
+        let out = run(|w| {
+            print_config(
+                w,
+                std::slice::from_ref(&path),
+                Some(&path),
+                &Ok(Config::default()),
+            )
+        });
+        let status_at = out
+            .find("Current configuration")
+            .expect("status header present");
+        let ref_at = out.find("Reference").expect("reference header present");
+        assert!(
+            status_at < ref_at,
+            "status section must precede reference:\n{out}"
+        );
     }
 
     #[test]

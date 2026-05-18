@@ -22,7 +22,7 @@ use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, Tmu
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
-use agent_mux::config::{Config, Theme};
+use agent_mux::config::{self, Config, Theme};
 use agent_mux::dashboard::{
     DisplayRow, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
     build_display_rows_filtered, compose_preview_pane_lines, first_session_index, matches_query,
@@ -79,7 +79,15 @@ fn main() -> io::Result<()> {
     match argv.first().map(String::as_str) {
         None => run_tui(),
         Some("themes") => cli::print_themes(&mut stdout, stdout_is_terminal()),
-        Some("config") => cli::print_config(&mut stdout),
+        Some("config") => {
+            let searched = config::config_search_paths();
+            let loaded_from = searched.iter().find(|p| p.exists()).cloned();
+            let result = match &loaded_from {
+                Some(p) => Config::load_from(p),
+                None => Ok(Config::default()),
+            };
+            cli::print_config(&mut stdout, &searched, loaded_from.as_deref(), &result)
+        }
         Some("help" | "--help" | "-h") => cli::print_help(&mut stdout),
         Some(other) => {
             let mut stderr = io::stderr();

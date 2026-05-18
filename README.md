@@ -95,7 +95,7 @@ After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hoo
 `agent-mux` with no arguments launches the dashboard. Two read-only subcommands surface what's tunable without making the user dig through this README:
 
 - `agent-mux themes` — coloured browser of every built-in theme preset, each element rendered in its actual colour so you can pick a palette by eye before editing the config.
-- `agent-mux config` — printable reference of every config key with its default and a one-line description. Output is a copy-pasteable TOML skeleton.
+- `agent-mux config` — prints the current resolved config (which path was loaded, parsed `workspace_folders` / `hosts` / `notifications` / theme) followed by a reference TOML skeleton documenting every key with its default. The status block answers "is my config actually being read?" without log-spelunking; the reference is copy-pasteable into `~/.config/agent-mux/config.toml`.
 - `agent-mux help` / `--help` — subcommand overview.
 
 Stdout-detection: `themes` emits ANSI escapes only when stdout is a real terminal; piping to `less -R` works, piping to a non-`-R` pager or a file produces plain text.

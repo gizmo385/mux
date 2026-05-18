@@ -518,18 +518,26 @@ impl Host for SshHost {
         // Build one shell-script string the remote shell evaluates as a
         // single command. The `cd <cwd> && ` prefix puts cwd-handling
         // on the remote side so callers don't branch on host kind —
-        // same shape as Command::current_dir on the local side. Every
-        // token gets single-quoted via shell_join_quoted so spaces /
-        // globs / leading `#` round-trip verbatim (same protection as
-        // `ssh_argv`).
+        // same shape as Command::current_dir on the local side. Each
+        // token is quoted via shell_quote_path (not shell_single_quote),
+        // matching how cwd above is treated: a leading `~/` in an arg
+        // stays outside the quotes so the remote shell expands it to
+        // the *remote* user's home. Without this, `Host::run(None,
+        // "find", &["~/workspace", …])` ships `'~/workspace'` and the
+        // tilde is taken literally — see TODO entry "remote workspace
+        // scan returns no repos when workspace_folders paths use ~/".
+        // Non-tilde args still get plain single-quoting, so spaces /
+        // globs / leading `#` round-trip verbatim.
         let mut script = String::new();
         if let Some(d) = cwd {
             let _ = write!(script, "cd {} && ", shell_quote_path(&d.to_string_lossy()));
         }
-        let mut tokens: Vec<&str> = Vec::with_capacity(args.len() + 1);
-        tokens.push(program);
-        tokens.extend(args.iter().copied());
-        script.push_str(&shell_join_quoted(tokens));
+        let quoted = std::iter::once(program)
+            .chain(args.iter().copied())
+            .map(shell_quote_path)
+            .collect::<Vec<_>>()
+            .join(" ");
+        script.push_str(&quoted);
         self.ssh_command().arg(&script).output()
     }
 
@@ -1475,6 +1483,46 @@ mod tests {
         assert!(
             invoked.contains("cd '/srv/work/repo' && 'git' 'status'"),
             "got: {invoked}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_run_preserves_remote_tilde_in_args_so_workspace_scan_finds_repos() {
+        // Regression: scan_host_workspaces builds `find ~/workspace
+        // -mindepth 1 …` via Host::run(None, "find", &[folder, …]).
+        // When per-arg quoting fully single-quoted every token, the
+        // remote shell saw `find '~/workspace' …` — POSIX `~` only
+        // expands at the start of an *unquoted* word, so find exited
+        // non-zero and the remote repo picker showed nothing. Pin the
+        // tilde-preserving shape on a `find`-style call so the bug
+        // can't silently come back.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh(&log);
+        let host =
+            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+
+        host.run(
+            None,
+            "find",
+            &[
+                "~/workspace",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-type",
+                "d",
+            ],
+        )
+        .expect("run");
+
+        let invoked = read_log_lines(&log).last().cloned().expect("log");
+        assert!(
+            invoked.contains("'find' ~/'workspace' '-mindepth' '1' '-maxdepth' '1' '-type' 'd'"),
+            "tilde-prefixed arg must stay unquoted at the `~/` so the \
+             remote shell expands it. got: {invoked}"
         );
     }
 

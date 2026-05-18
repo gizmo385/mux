@@ -118,6 +118,29 @@ curl -L https://github.com/gizmo385/mux/releases/download/latest/agent-mux-aarch
 
 Tagged releases (when present) are the stable pin; `latest` tracks `main` and is overwritten on every push.
 
+## Install via nix flake
+
+The repository is a flake. From another flake, add it as an input and reference `packages.<system>.default`:
+
+```nix
+{
+  inputs.agent-mux.url = "github:gizmo385/mux";
+
+  # in a home-manager / nixos module:
+  # home.packages = [ inputs.agent-mux.packages.${pkgs.system}.default ];
+}
+```
+
+Pinning is the consumer's `flake.lock` — `nix flake update agent-mux` to pull a new commit, otherwise the same SHA every rebuild. `latest`-the-release staying mutable doesn't affect this path; the flake input resolves to a commit, not a release tag.
+
+For one-shot or non-flake usage:
+
+- `nix run github:gizmo385/mux` — try it without installing.
+- `nix profile install github:gizmo385/mux` — persistent install into the user profile; `nix profile upgrade` to pull a new build.
+- `nix develop` inside a clone — shell with cargo/clippy/rustfmt/rust-analyzer.
+
+Runtime dependencies (`tmux`, `ssh`, `git`, `claude`) are intentionally not in the closure — supply them from your normal environment.
+
 ## Documents
 
 - `SPEC.md` — what this project is.

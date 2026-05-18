@@ -14,3 +14,7 @@
 
 # rust
 target/
+
+# nix
+result
+result-*

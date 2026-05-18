@@ -67,6 +67,24 @@ pub struct HostConfig {
     pub ssh: String,
     #[serde(default = "default_transcript_root")]
     pub transcript_root: PathBuf,
+    /// Per-host workspace folders, scanned through this host's `Host`
+    /// impl when it connects. `None` (the default) means "inherit the
+    /// top-level `workspace_folders`" — keeps the "same workspaces
+    /// local + remote" case trivial. Tilde is kept unexpanded so the
+    /// remote shell resolves it against the *remote* user's home,
+    /// same convention as [`HostConfig::transcript_root`].
+    #[serde(default)]
+    pub workspace_folders: Option<Vec<PathBuf>>,
+}
+
+impl HostConfig {
+    /// Effective workspace folders for this host: the per-host list
+    /// if set, otherwise the top-level fallback. Centralised so the
+    /// fallback logic doesn't get duplicated at every call site.
+    #[must_use]
+    pub fn effective_workspace_folders<'a>(&'a self, fallback: &'a [PathBuf]) -> &'a [PathBuf] {
+        self.workspace_folders.as_deref().unwrap_or(fallback)
+    }
 }
 
 fn default_transcript_root() -> PathBuf {
@@ -680,6 +698,66 @@ ssh = "devbox"
         // Default is `~/.claude/projects`, kept as-is — the tilde must
         // resolve against the *remote* user's home, not ours.
         assert_eq!(host.transcript_root, PathBuf::from("~/.claude/projects"));
+        // `workspace_folders` defaults to None — the host inherits the
+        // top-level fallback (see `effective_workspace_folders`).
+        assert_eq!(host.workspace_folders, None);
+    }
+
+    #[test]
+    fn load_from_parses_per_host_workspace_folders() {
+        // Per-host override: a host with its own list overrides the
+        // top-level value rather than appending. Tilde stays unexpanded
+        // because the remote shell does the expansion (same convention
+        // as `transcript_root`).
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+workspace_folders = ["/home/dev/work"]
+
+[hosts.gizmo]
+ssh = "gizmo"
+workspace_folders = ["~/workspace", "~/src"]
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let host = cfg.hosts.get("gizmo").expect("gizmo host");
+        assert_eq!(
+            host.workspace_folders.as_deref(),
+            Some(&[PathBuf::from("~/workspace"), PathBuf::from("~/src")][..]),
+        );
+    }
+
+    #[test]
+    fn effective_workspace_folders_falls_back_to_top_level() {
+        // The resolved decision-3 behaviour: an omitted per-host list
+        // inherits the top-level value, which is the common case for
+        // users who want the same workspaces local + remote.
+        let host = HostConfig {
+            ssh: "gizmo".into(),
+            transcript_root: PathBuf::from("~/.claude/projects"),
+            workspace_folders: None,
+        };
+        let top_level = vec![PathBuf::from("/work"), PathBuf::from("/src")];
+        let effective = host.effective_workspace_folders(&top_level);
+        assert_eq!(effective, top_level.as_slice());
+    }
+
+    #[test]
+    fn effective_workspace_folders_uses_per_host_when_set() {
+        // When the per-host list is set (even empty), it wins. Empty
+        // is a legitimate "this host has *no* workspaces" signal, not
+        // a "fall back to top-level" signal.
+        let host = HostConfig {
+            ssh: "gizmo".into(),
+            transcript_root: PathBuf::from("~/.claude/projects"),
+            workspace_folders: Some(vec![PathBuf::from("~/scratch")]),
+        };
+        let top_level = vec![PathBuf::from("/work")];
+        let effective = host.effective_workspace_folders(&top_level);
+        assert_eq!(effective, &[PathBuf::from("~/scratch")][..]);
     }
 
     #[test]

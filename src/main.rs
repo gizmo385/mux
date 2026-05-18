@@ -34,7 +34,7 @@ use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
 use agent_mux::preview::parse_preview;
-use agent_mux::repo::{Repo, RepoRegistry};
+use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
 use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent};
 use agent_mux::worktree::WorktreeManager;
@@ -176,6 +176,14 @@ struct App {
     create_tx: Sender<NewSessionResult>,
     create_rx: Receiver<NewSessionResult>,
     creating: Option<CreatingSession>,
+    /// Channel for background remote-workspace scan results. Each
+    /// `Connected` event spawns a scan thread for the host's
+    /// `effective_workspace_folders`; the result lands here and
+    /// reconciles into the [`RepoRegistry`] in the main loop. Kept
+    /// separate from `remote_rx` so a slow workspace scan can't
+    /// back-pressure session discovery.
+    repo_scan_tx: Sender<RepoScanResult>,
+    repo_scan_rx: Receiver<RepoScanResult>,
     /// Background SSH discovery results stream in here for the lifetime of
     /// the app — one message per configured host (success or failure).
     /// Drained each tick; once every configured host has reported, the
@@ -239,6 +247,17 @@ struct CreatingSession {
 enum NewSessionResult {
     Created(PathBuf),
     Failed(String),
+}
+
+/// One remote host's freshly-scanned repo list, returned from the
+/// background thread spawned on `Connected`. Drained each tick; the
+/// dashboard `reconcile_host`s the registry with the result so the
+/// next picker-open shows live remote repos. An empty `repos` is a
+/// valid value (host has no workspaces configured, or none of the
+/// configured ones contain repos).
+struct RepoScanResult {
+    host_id: HostId,
+    repos: Vec<Repo>,
 }
 
 /// Payload sent from a preview-fetch thread back to the main loop. The
@@ -343,6 +362,7 @@ impl App {
 
         let registry = RepoRegistry::from_config(&config);
         let (create_tx, create_rx) = channel();
+        let (repo_scan_tx, repo_scan_rx) = channel();
 
         let mut hosts: HashMap<HostId, Arc<dyn Host>> = HashMap::new();
         hosts.insert(local_host.id().clone(), Arc::clone(&local_host));
@@ -399,6 +419,8 @@ impl App {
             modal: None,
             create_tx,
             create_rx,
+            repo_scan_tx,
+            repo_scan_rx,
             creating: None,
             remote_rx,
             pending_hosts,
@@ -577,7 +599,29 @@ impl App {
                     // poll) so a slow `tmux list-panes` over ssh
                     // can't backpressure the attention pipeline.
                     self.watcher
-                        .start_pane_polling_host(host, REMOTE_POLL_INTERVAL);
+                        .start_pane_polling_host(Arc::clone(&host), REMOTE_POLL_INTERVAL);
+                    // Remote workspace scan: separate background thread
+                    // so a slow `find` over the proxy can't delay the
+                    // user noticing the host is up. Results land in
+                    // `repo_scan_rx` and reconcile into the registry
+                    // in the next event-loop drain.
+                    if let Some(host_cfg) = self.config.hosts.get(host_id.as_str()) {
+                        let folders = host_cfg
+                            .effective_workspace_folders(&self.config.workspace_folders)
+                            .to_vec();
+                        if !folders.is_empty() {
+                            let host_for_scan = Arc::clone(&host);
+                            let tx = self.repo_scan_tx.clone();
+                            let host_id_for_scan = host_id.clone();
+                            std::thread::spawn(move || {
+                                let repos = scan_host_workspaces(host_for_scan.as_ref(), &folders);
+                                let _ = tx.send(RepoScanResult {
+                                    host_id: host_id_for_scan,
+                                    repos,
+                                });
+                            });
+                        }
+                    }
                 }
                 RemoteDiscoveryResult::Ready { host_id, sessions } => {
                     self.pending_hosts = self.pending_hosts.saturating_sub(1);
@@ -599,6 +643,16 @@ impl App {
         }
     }
 
+    /// Drain finished remote workspace scans into the registry. Each
+    /// host's slice is replaced wholesale via `reconcile_host`, so
+    /// re-running a scan (e.g. on a future reconnect) idempotently
+    /// refreshes that host without disturbing the others.
+    fn drain_repo_scans(&mut self) {
+        while let Ok(result) = self.repo_scan_rx.try_recv() {
+            self.registry.reconcile_host(&result.host_id, result.repos);
+        }
+    }
+
     fn open_new_session(&mut self) {
         self.registry
             .refresh_if_stale(&self.config, REPO_REFRESH_TTL);
@@ -609,7 +663,14 @@ impl App {
             );
             return;
         }
-        self.modal = Some(NewSessionModal::new(self.registry.repos().to_vec()));
+        // Hosts with an `Arc<dyn Host>` currently registered in
+        // `App.hosts` are eligible for selection; others render
+        // dimmed in the picker until their `Connected` event lands.
+        let ready_hosts: HashSet<HostId> = self.hosts.keys().cloned().collect();
+        self.modal = Some(NewSessionModal::new(
+            self.registry.repos().to_vec(),
+            ready_hosts,
+        ));
         self.status = None;
     }
 
@@ -633,6 +694,18 @@ impl App {
     /// just session-switching — `git worktree add` can take seconds on a
     /// large repo, and that must not stall the dashboard.
     fn start_creating(&mut self, repo: Repo, task: String, base_branch: String) {
+        // Step 2 of the remote-session-creation arc plumbs the picker
+        // but not the worktree-creation path through `Host::run` yet.
+        // A remote selection should fail fast with a clear status
+        // rather than silently shelling `git worktree add` on the
+        // local FS against a path that doesn't exist there.
+        if !repo.host.is_local() {
+            self.status = Some(format!(
+                "remote worktree creation not yet wired (host {})",
+                repo.host.as_str()
+            ));
+            return;
+        }
         self.creating = Some(CreatingSession {
             repo_name: repo.name.clone(),
             task: task.clone(),
@@ -927,6 +1000,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         let has_event = event::poll(TICK)?;
         app.drain_updates();
         app.drain_remote_discoveries();
+        app.drain_repo_scans();
         if let Some(cmd) = app.drain_creates()
             && let Some(err) = suspend_and_run(terminal, &cmd)?
         {

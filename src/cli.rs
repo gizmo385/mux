@@ -566,6 +566,7 @@ mod tests {
                     crate::config::HostConfig {
                         ssh: "devbox.internal".to_string(),
                         transcript_root: PathBuf::from("~/.claude/projects"),
+                        workspace_folders: None,
                     },
                 );
                 m

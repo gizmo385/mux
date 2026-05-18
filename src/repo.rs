@@ -1,22 +1,28 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
+use crate::host::{Host, LocalHost};
+use crate::session::HostId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repo {
+    /// Which host owns the repo. `HostId::local()` for the local
+    /// filesystem; the `[hosts.<name>]` config key for remote repos.
+    /// Lets the new-session flow route `git worktree add` through the
+    /// right host without an `is_local()` branch outside the trait.
+    pub host: HostId,
     pub path: PathBuf,
     pub name: String,
 }
 
 impl Repo {
-    fn new(path: PathBuf) -> Self {
+    fn new(host: HostId, path: PathBuf) -> Self {
         let name = path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
             |n| n.to_string_lossy().into_owned(),
         );
-        Self { path, name }
+        Self { host, path, name }
     }
 }
 
@@ -36,43 +42,49 @@ impl Default for RepoRegistry {
 }
 
 impl RepoRegistry {
-    /// Scan each workspace folder one level deep and collect every direct
-    /// child whose `.git` is a directory (i.e. an actual repo, not a
-    /// worktree pointer file). Result is sorted and de-duplicated by path,
-    /// so multiple workspace folders pointing at overlapping directories
-    /// don't surface the same repo twice.
+    /// Build the registry from config, scanning the *local* host
+    /// synchronously. Remote hosts are not scanned here because their
+    /// `Host` impls aren't available until each `[hosts.<name>]`
+    /// reaches `Connected` — at which point [`Self::reconcile_host`]
+    /// merges that host's slice in. Same shape as the M2 session
+    /// catalog: local appears on first frame, remote streams in.
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        let mut repos: Vec<Repo> = config
-            .workspace_folders
-            .iter()
-            .flat_map(|f| scan_one_folder(f))
-            .collect();
-        repos.sort_by(|a, b| a.path.cmp(&b.path));
-        repos.dedup_by(|a, b| a.path == b.path);
+        let local = LocalHost::new();
+        let repos = scan_host_workspaces(&local, &config.workspace_folders);
         Self {
-            repos,
+            repos: dedup_sorted(repos),
             last_scanned: SystemTime::now(),
         }
     }
 
-    /// Re-scan from the (possibly updated) Config. Replaces the cached list.
+    /// Re-scan from the (possibly updated) Config. Replaces the cached
+    /// local slice; remote slices added via `reconcile_host` are
+    /// dropped on refresh (they'll be re-added next Connect tick).
     pub fn refresh(&mut self, config: &Config) {
         *self = Self::from_config(config);
     }
 
     /// Re-scan only if the cached snapshot is older than `ttl`. Returns
     /// `true` if a refresh actually ran. Called by the Dashboard before
-    /// opening the new-session picker: a depth-1 directory walk is cheap
-    /// enough to run synchronously, so we don't bother with the "render
-    /// from cache, refresh async" dance `ARCHITECTURE.md` allowed for —
-    /// that escape hatch is reserved for scans that grow expensive.
+    /// opening the new-session picker.
     pub fn refresh_if_stale(&mut self, config: &Config, ttl: Duration) -> bool {
         if self.last_scanned.elapsed().is_ok_and(|e| e < ttl) {
             return false;
         }
         self.refresh(config);
         true
+    }
+
+    /// Replace this host's slice of the registry with `repos`. Called
+    /// from the main thread after a background remote-workspace scan
+    /// completes for a newly-connected host. Entries belonging to
+    /// other hosts are untouched; the resulting list is re-sorted and
+    /// de-duplicated against itself.
+    pub fn reconcile_host(&mut self, host: &HostId, repos: Vec<Repo>) {
+        self.repos.retain(|r| &r.host != host);
+        self.repos.extend(repos);
+        self.repos = dedup_sorted(std::mem::take(&mut self.repos));
     }
 
     #[must_use]
@@ -91,33 +103,90 @@ impl RepoRegistry {
     }
 }
 
-fn scan_one_folder(folder: &Path) -> Vec<Repo> {
-    // Missing or unreadable workspace folder is a soft failure: it disappears
-    // from the registry rather than failing the whole scan. The picker shows
-    // whichever folders did resolve.
-    let Ok(entries) = fs::read_dir(folder) else {
-        return Vec::new();
-    };
+/// Scan `folders` on `host` for direct children that contain a real
+/// `.git/` directory (not a worktree pointer file). One trip across
+/// the trait per folder: `Host::run("find", …)` to list candidates,
+/// then `Host::is_dir_many` to batch the `.git` check. The same code
+/// path serves local and remote — the trait dispatches.
+///
+/// Soft-fails per folder: a missing or unreadable workspace folder
+/// disappears from the result rather than failing the whole scan.
+/// Matches the M1 contract.
+#[must_use]
+pub fn scan_host_workspaces(host: &dyn Host, folders: &[PathBuf]) -> Vec<Repo> {
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && is_git_repo(&path) {
-            out.push(Repo::new(path));
+    for folder in folders {
+        let candidates = list_immediate_subdirs(host, folder);
+        if candidates.is_empty() {
+            continue;
+        }
+        let git_paths: Vec<PathBuf> = candidates.iter().map(|c| c.join(".git")).collect();
+        let git_path_refs: Vec<&Path> = git_paths.iter().map(PathBuf::as_path).collect();
+        let Ok(git_present) = host.is_dir_many(&git_path_refs) else {
+            continue;
+        };
+        for (candidate, has_git) in candidates.into_iter().zip(git_present) {
+            if has_git {
+                out.push(Repo::new(host.id().clone(), candidate));
+            }
         }
     }
     out
 }
 
-fn is_git_repo(dir: &Path) -> bool {
-    dir.join(".git").is_dir()
+/// List immediate sub-directories of `folder` on `host` via
+/// `find <folder> -mindepth 1 -maxdepth 1 -type d -print0`. Both
+/// GNU find (Linux) and BSD find (macOS) accept these flags, so the
+/// same invocation works whether `host` is local or remote. A
+/// non-zero exit (missing folder, permission error) yields an empty
+/// vec — mirrors `scan_one_folder`'s old soft-fail behaviour.
+fn list_immediate_subdirs(host: &dyn Host, folder: &Path) -> Vec<PathBuf> {
+    let folder_str = folder.to_string_lossy();
+    let Ok(output) = host.run(
+        None,
+        "find",
+        &[
+            &folder_str,
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            "1",
+            "-type",
+            "d",
+            "-print0",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| PathBuf::from(String::from_utf8_lossy(chunk).into_owned()))
+        .collect()
+}
+
+fn dedup_sorted(mut repos: Vec<Repo>) -> Vec<Repo> {
+    repos.sort_by(|a, b| {
+        a.host
+            .as_str()
+            .cmp(b.host.as_str())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    repos.dedup_by(|a, b| a.host == b.host && a.path == b.path);
+    repos
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
-    fn make_repo(parent: &Path, name: &str) -> PathBuf {
+    fn make_repo_dir(parent: &Path, name: &str) -> PathBuf {
         let p = parent.join(name);
         fs::create_dir_all(p.join(".git")).expect("mkdir .git");
         p
@@ -138,51 +207,36 @@ mod tests {
     }
 
     #[test]
-    fn is_git_repo_recognises_directory() {
+    fn scan_finds_only_repos_among_children_via_host_trait() {
+        // The scanner routes through Host::run + is_dir_many so the
+        // same code path serves local and remote. Pin the result for
+        // a local host: real repos are kept, worktree pointers (.git
+        // is a file, not a dir) are filtered, plain directories are
+        // filtered. Repos carry the scanning host's id.
         let tmp = TempDir::new().expect("tempdir");
-        let repo = make_repo(tmp.path(), "proj");
-        assert!(is_git_repo(&repo));
-    }
-
-    #[test]
-    fn is_git_repo_rejects_worktree_pointer() {
-        let tmp = TempDir::new().expect("tempdir");
-        let wt = make_worktree_pointer(tmp.path(), "proj-task");
-        assert!(!is_git_repo(&wt));
-    }
-
-    #[test]
-    fn is_git_repo_rejects_plain_directory() {
-        let tmp = TempDir::new().expect("tempdir");
-        let dir = make_plain_dir(tmp.path(), "notes");
-        assert!(!is_git_repo(&dir));
-    }
-
-    #[test]
-    fn scan_finds_only_repos_among_children() {
-        let tmp = TempDir::new().expect("tempdir");
-        make_repo(tmp.path(), "a");
-        make_repo(tmp.path(), "b");
+        make_repo_dir(tmp.path(), "a");
+        make_repo_dir(tmp.path(), "b");
         make_worktree_pointer(tmp.path(), "a-task");
         make_plain_dir(tmp.path(), "notes");
 
-        let mut found: Vec<String> = scan_one_folder(tmp.path())
-            .into_iter()
-            .map(|r| r.name)
-            .collect();
-        found.sort();
-        assert_eq!(found, vec!["a".to_string(), "b".to_string()]);
+        let host = LocalHost::new();
+        let mut repos = scan_host_workspaces(&host, &[tmp.path().to_path_buf()]);
+        repos.sort_by(|x, y| x.name.cmp(&y.name));
+        let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        for r in &repos {
+            assert!(r.host.is_local(), "repo carried wrong host: {:?}", r.host);
+        }
     }
 
     #[test]
     fn scan_does_not_recurse() {
         let tmp = TempDir::new().expect("tempdir");
         let nested_parent = make_plain_dir(tmp.path(), "clients");
-        make_repo(&nested_parent, "big-client-repo");
+        make_repo_dir(&nested_parent, "big-client-repo");
 
-        // `clients` is a plain dir, so it's not in the result. The repo nested
-        // beneath it is invisible to a depth-1 scan.
-        let found = scan_one_folder(tmp.path());
+        let host = LocalHost::new();
+        let found = scan_host_workspaces(&host, &[tmp.path().to_path_buf()]);
         assert!(
             found.is_empty(),
             "depth-1 scan should not recurse: {found:?}"
@@ -193,16 +247,18 @@ mod tests {
     fn scan_returns_empty_for_missing_folder() {
         let tmp = TempDir::new().expect("tempdir");
         let missing = tmp.path().join("does-not-exist");
-        assert!(scan_one_folder(&missing).is_empty());
+        let host = LocalHost::new();
+        let found = scan_host_workspaces(&host, &[missing]);
+        assert!(found.is_empty());
     }
 
     #[test]
-    fn from_config_aggregates_across_folders() {
+    fn from_config_aggregates_across_local_workspace_folders() {
         let tmp = TempDir::new().expect("tempdir");
         let work = make_plain_dir(tmp.path(), "work");
         let code = make_plain_dir(tmp.path(), "code");
-        make_repo(&work, "alpha");
-        make_repo(&code, "beta");
+        make_repo_dir(&work, "alpha");
+        make_repo_dir(&code, "beta");
 
         let cfg = Config {
             workspace_folders: vec![work, code],
@@ -212,15 +268,15 @@ mod tests {
         let mut names: Vec<String> = reg.repos().iter().map(|r| r.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(reg.repos().iter().all(|r| r.host.is_local()));
     }
 
     #[test]
     fn from_config_dedups_overlapping_folders() {
         let tmp = TempDir::new().expect("tempdir");
         let work = make_plain_dir(tmp.path(), "work");
-        make_repo(&work, "shared");
+        make_repo_dir(&work, "shared");
 
-        // Same folder listed twice — the repo should only appear once.
         let cfg = Config {
             workspace_folders: vec![work.clone(), work],
             ..Default::default()
@@ -247,7 +303,7 @@ mod tests {
         let mut reg = RepoRegistry::from_config(&cfg);
         assert!(reg.is_empty());
 
-        make_repo(&work, "fresh");
+        make_repo_dir(&work, "fresh");
         reg.refresh(&cfg);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.repos()[0].name, "fresh");
@@ -264,8 +320,7 @@ mod tests {
         let mut reg = RepoRegistry::from_config(&cfg);
         assert!(reg.is_empty());
 
-        make_repo(&work, "added-after-boot");
-        // 1h TTL against a sub-millisecond-old cache: should not refresh.
+        make_repo_dir(&work, "added-after-boot");
         let did_refresh = reg.refresh_if_stale(&cfg, Duration::from_hours(1));
         assert!(!did_refresh);
         assert!(reg.is_empty(), "stale-cache value still served");
@@ -281,8 +336,7 @@ mod tests {
         };
         let mut reg = RepoRegistry::from_config(&cfg);
 
-        make_repo(&work, "added-after-boot");
-        // Zero TTL: any cache age counts as stale.
+        make_repo_dir(&work, "added-after-boot");
         let did_refresh = reg.refresh_if_stale(&cfg, Duration::ZERO);
         assert!(did_refresh);
         assert_eq!(reg.len(), 1);
@@ -290,8 +344,79 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_host_adds_remote_repos_alongside_local() {
+        // The post-Connected flow: local repos seeded from
+        // `from_config`, then `reconcile_host` overlays a remote
+        // host's slice. Both kinds coexist in the registry; the
+        // picker decides how to render them.
+        let tmp = TempDir::new().expect("tempdir");
+        let work = make_plain_dir(tmp.path(), "work");
+        make_repo_dir(&work, "local-repo");
+        let cfg = Config {
+            workspace_folders: vec![work],
+            ..Default::default()
+        };
+        let mut reg = RepoRegistry::from_config(&cfg);
+        assert_eq!(reg.len(), 1);
+
+        let remote = HostId("gizmo".into());
+        reg.reconcile_host(
+            &remote,
+            vec![
+                Repo::new(remote.clone(), PathBuf::from("/srv/work/alpha")),
+                Repo::new(remote.clone(), PathBuf::from("/srv/work/beta")),
+            ],
+        );
+        assert_eq!(reg.len(), 3);
+        let mut by_host = reg
+            .repos()
+            .iter()
+            .map(|r| (r.host.as_str(), r.name.as_str()))
+            .collect::<Vec<_>>();
+        by_host.sort_unstable();
+        assert_eq!(
+            by_host,
+            vec![
+                ("gizmo", "alpha"),
+                ("gizmo", "beta"),
+                (HostId::local().as_str(), "local-repo")
+            ],
+        );
+    }
+
+    #[test]
+    fn reconcile_host_replaces_only_that_hosts_slice() {
+        // Calling reconcile_host twice for the same host replaces its
+        // entries; entries for *other* hosts are untouched. Critical
+        // for the polling/refresh path — a second connect must not
+        // duplicate rows or drop other hosts' rows.
+        let mut reg = RepoRegistry::default();
+        let alpha = HostId("alpha".into());
+        let beta = HostId("beta".into());
+        reg.reconcile_host(&alpha, vec![Repo::new(alpha.clone(), PathBuf::from("/a1"))]);
+        reg.reconcile_host(&beta, vec![Repo::new(beta.clone(), PathBuf::from("/b1"))]);
+        reg.reconcile_host(
+            &alpha,
+            vec![
+                Repo::new(alpha.clone(), PathBuf::from("/a2")),
+                Repo::new(alpha.clone(), PathBuf::from("/a3")),
+            ],
+        );
+        let paths: Vec<_> = reg
+            .repos()
+            .iter()
+            .map(|r| (r.host.as_str(), r.path.display().to_string()))
+            .collect();
+        // alpha replaced; beta intact.
+        assert!(paths.contains(&("alpha", "/a2".to_string())));
+        assert!(paths.contains(&("alpha", "/a3".to_string())));
+        assert!(paths.contains(&("beta", "/b1".to_string())));
+        assert!(!paths.contains(&("alpha", "/a1".to_string())));
+    }
+
+    #[test]
     fn repo_name_derives_from_directory() {
-        let r = Repo::new(PathBuf::from("/work/agent-mux"));
+        let r = Repo::new(HostId::local(), PathBuf::from("/work/agent-mux"));
         assert_eq!(r.name, "agent-mux");
     }
 }

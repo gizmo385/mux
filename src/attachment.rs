@@ -554,6 +554,17 @@ mod tests {
         fn is_dir_many(&self, _: &[&Path]) -> std::io::Result<Vec<bool>> {
             unreachable!()
         }
+        fn run(
+            &self,
+            _: Option<&Path>,
+            _: &str,
+            _: &[&str],
+        ) -> std::io::Result<std::process::Output> {
+            unreachable!()
+        }
+        fn write_file(&self, _: &Path, _: &str) -> std::io::Result<()> {
+            unreachable!()
+        }
         fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>> {
             self.calls
                 .lock()

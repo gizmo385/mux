@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::session::HostId;
@@ -97,6 +97,47 @@ pub trait Host: Send + Sync {
     /// exist (or isn't a directory) lands as `false` in its slot,
     /// matching the single-path [`Host::is_dir`] contract.
     fn is_dir_many(&self, paths: &[&Path]) -> io::Result<Vec<bool>>;
+
+    /// Run an arbitrary command on this host, optionally `cd`-ing
+    /// to `cwd` first. Returns the full process [`Output`] (status,
+    /// stdout, stderr) so callers can dispatch on exit code without
+    /// a one-size-fits-all "success-or-error" baked into the trait
+    /// — `git symbolic-ref` exiting 1 is a "fall back to main"
+    /// signal, while `git worktree add` exiting 1 should propagate
+    /// stderr to the user.
+    ///
+    /// The seam that lets [`crate::worktree::WorktreeManager`] and
+    /// the default-branch resolver run `git` against the right host
+    /// without an `if is_local()` branch outside the trait. `LocalHost`
+    /// uses `Command::current_dir`; `SshHost` prefixes the shell
+    /// command line with `cd <quoted cwd> && ` so the *remote* shell
+    /// handles directory changes, keeping the trait surface
+    /// host-agnostic.
+    ///
+    /// # Errors
+    /// Returns `io::Error` only for transport-level failures
+    /// (couldn't spawn the local process; the SSH `ssh` subprocess
+    /// failed to start; the OS killed the wrapper). Non-zero exit
+    /// status of the *target* command is **not** an error — inspect
+    /// `Output::status` directly.
+    fn run(&self, cwd: Option<&Path>, program: &str, args: &[&str]) -> io::Result<Output>;
+
+    /// Write `content` to `path`, overwriting if it exists. The
+    /// write-side counterpart to [`Host::read_to_string`]. Intended
+    /// for small files (`.agent-mux/task.toml` is the motivating
+    /// case — remote worktree creation needs to drop metadata
+    /// alongside the worktree directory).
+    ///
+    /// Not atomic. If the operation is interrupted mid-write, `path`
+    /// may end up partially written. Acceptable for the
+    /// session-creation use case because a retry creates a fresh
+    /// worktree from scratch anyway. An atomic `tmp + rename` shape
+    /// can drop in later behind the same trait method when a caller
+    /// needs durability guarantees.
+    ///
+    /// # Errors
+    /// Propagates I/O errors from the local FS or the SSH transport.
+    fn write_file(&self, path: &Path, content: &str) -> io::Result<()>;
 
     /// Build the argv that runs `remote_cmd` against this host.
     /// Returns `None` for local hosts (the caller runs `remote_cmd`
@@ -198,6 +239,19 @@ impl Host for LocalHost {
         Ok(paths.iter().map(|p| p.is_dir()).collect())
     }
 
+    fn run(&self, cwd: Option<&Path>, program: &str, args: &[&str]) -> io::Result<Output> {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
+        cmd.output()
+    }
+
+    fn write_file(&self, path: &Path, content: &str) -> io::Result<()> {
+        fs::write(path, content)
+    }
+
     fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
         None
     }
@@ -295,7 +349,7 @@ impl SshHost {
         cmd
     }
 
-    fn run(&self, remote_cmd: &str) -> io::Result<Vec<u8>> {
+    fn exec_script(&self, remote_cmd: &str) -> io::Result<Vec<u8>> {
         let output = self.ssh_command().arg(remote_cmd).output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -346,19 +400,19 @@ impl Host for SshHost {
                     -printf '%T@ %p\\0' 2>/dev/null; \
              fi"
         );
-        let stdout = self.run(&cmd)?;
+        let stdout = self.exec_script(&cmd)?;
         parse_find_output(&stdout)
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         let quoted = shell_quote_path(&path.to_string_lossy());
-        let stdout = self.run(&format!("cat {quoted}"))?;
+        let stdout = self.exec_script(&format!("cat {quoted}"))?;
         String::from_utf8(stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn read_tail(&self, path: &Path, n_bytes: u64) -> io::Result<String> {
         let quoted = shell_quote_path(&path.to_string_lossy());
-        let stdout = self.run(&format!("tail -c {n_bytes} {quoted}"))?;
+        let stdout = self.exec_script(&format!("tail -c {n_bytes} {quoted}"))?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
@@ -398,7 +452,7 @@ impl Host for SshHost {
                 fi; "
             );
         }
-        let stdout = self.run(&script)?;
+        let stdout = self.exec_script(&script)?;
         parse_read_many_output(&stdout, paths.len())
     }
 
@@ -413,7 +467,7 @@ impl Host for SshHost {
             let quoted = shell_quote_path(&p.to_string_lossy());
             let _ = write!(script, "if [ -d {quoted} ]; then echo Y; else echo N; fi; ");
         }
-        let stdout = self.run(&script)?;
+        let stdout = self.exec_script(&script)?;
         let mut out = Vec::with_capacity(paths.len());
         for line in stdout.split(|&b| b == b'\n') {
             if line.is_empty() {
@@ -441,6 +495,60 @@ impl Host for SshHost {
             )));
         }
         Ok(out)
+    }
+
+    fn run(&self, cwd: Option<&Path>, program: &str, args: &[&str]) -> io::Result<Output> {
+        // Build one shell-script string the remote shell evaluates as a
+        // single command. The `cd <cwd> && ` prefix puts cwd-handling
+        // on the remote side so callers don't branch on host kind —
+        // same shape as Command::current_dir on the local side. Every
+        // token gets single-quoted via shell_join_quoted so spaces /
+        // globs / leading `#` round-trip verbatim (same protection as
+        // `ssh_argv`).
+        let mut script = String::new();
+        if let Some(d) = cwd {
+            let _ = write!(script, "cd {} && ", shell_quote_path(&d.to_string_lossy()));
+        }
+        let mut tokens: Vec<&str> = Vec::with_capacity(args.len() + 1);
+        tokens.push(program);
+        tokens.extend(args.iter().copied());
+        script.push_str(&shell_join_quoted(tokens));
+        self.ssh_command().arg(&script).output()
+    }
+
+    fn write_file(&self, path: &Path, content: &str) -> io::Result<()> {
+        // `cat > <path>` consumes stdin and writes verbatim, so the
+        // local-side `child.stdin.write_all(content)` is what actually
+        // delivers the bytes — no shell-escaping of the content needed,
+        // which would be a quoting nightmare for arbitrary TOML / JSON.
+        let quoted = shell_quote_path(&path.to_string_lossy());
+        let mut cmd = self.ssh_command();
+        cmd.arg(format!("cat > {quoted}"));
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
+        {
+            use std::io::Write as _;
+            let stdin = child
+                .stdin
+                .as_mut()
+                .expect("stdin piped — Stdio::piped guarantees Some");
+            stdin.write_all(content.as_bytes())?;
+        }
+        // Close stdin by dropping the handle so the remote `cat`
+        // sees EOF and exits.
+        drop(child.stdin.take());
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "ssh write_file({}) failed on {}: {}",
+                path.display(),
+                self.ssh_target,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 
     fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>> {
@@ -1233,5 +1341,200 @@ mod tests {
         let wire = b"GARBAGE\n";
         let err = super::parse_read_many_output(wire, 1).expect_err("should error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- Host::run / Host::write_file ----
+
+    #[test]
+    fn local_run_returns_full_output_with_status_and_stdout() {
+        // `echo` is on PATH on every supported platform. Pin: the
+        // returned `Output` carries the bytes the child wrote, and a
+        // `status.success()` matching the exit code. Caller dispatches
+        // on status — the trait doesn't fold non-zero into Err.
+        let host = LocalHost::new();
+        let out = host
+            .run(None, "echo", &["hello", "world"])
+            .expect("echo runs");
+        assert!(out.status.success(), "echo should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("hello world"), "got: {stdout:?}");
+    }
+
+    #[test]
+    fn local_run_honours_cwd() {
+        // The cwd parameter must actually scope the spawned process —
+        // a future refactor that drops `Command::current_dir` would
+        // silently keep working in test if cwd were ignored, so pin it.
+        let tmp = TempDir::new().expect("tempdir");
+        let host = LocalHost::new();
+        let out = host.run(Some(tmp.path()), "pwd", &[]).expect("pwd runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // macOS resolves /var/folders via a symlink to /private/var/...,
+        // so canonicalise both sides before comparison.
+        let want = std::fs::canonicalize(tmp.path()).expect("canon want");
+        let got = std::fs::canonicalize(stdout.trim()).expect("canon got");
+        assert_eq!(got, want, "raw stdout: {stdout:?}");
+    }
+
+    #[test]
+    fn local_run_propagates_io_error_for_nonexistent_program() {
+        // Transport-level failure: program not on PATH. Distinct from
+        // "program ran and exited non-zero" — the trait surfaces this
+        // as Err so callers can tell "couldn't even start" from "ran
+        // and reported a problem".
+        let host = LocalHost::new();
+        let err = host
+            .run(None, "this-program-deliberately-does-not-exist", &[])
+            .expect_err("should error");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn local_write_file_creates_new_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("note.toml");
+        let host = LocalHost::new();
+        host.write_file(&path, "task = \"hello\"\n").expect("write");
+        assert_eq!(
+            fs::read_to_string(&path).expect("readback"),
+            "task = \"hello\"\n"
+        );
+    }
+
+    #[test]
+    fn local_write_file_overwrites_existing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("note.toml");
+        write_file(&path, "old content");
+        let host = LocalHost::new();
+        host.write_file(&path, "new content").expect("write");
+        assert_eq!(fs::read_to_string(&path).expect("readback"), "new content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_run_quotes_program_and_args_for_remote_shell() {
+        // SSH joins post-target args with spaces; the remote shell
+        // re-tokenises. The trait quotes each token via shell_join_quoted
+        // so paths with spaces / globs / leading-`#` (the `-F #{format}`
+        // case that bit `ssh_argv`) round-trip verbatim. Pin both the
+        // command shape and the per-token quoting.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh(&log);
+        let host =
+            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+
+        host.run(None, "git", &["status", "--short"]).expect("run");
+
+        let lines = read_log_lines(&log);
+        // Line 0 is connect (-fN -M …); line 1 is our run().
+        let invoked = lines.last().expect("at least one log line");
+        assert!(
+            invoked.contains("'git' 'status' '--short'"),
+            "got: {invoked}"
+        );
+        assert!(invoked.contains("devbox"), "target missing: {invoked}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_run_with_cwd_prefixes_cd_to_remote_command() {
+        // The cwd parameter routes through the *remote* shell via a
+        // `cd <quoted cwd> && ` prefix — Command::current_dir doesn't
+        // help here because it scopes the local `ssh` process, not the
+        // remote shell. Tilde paths stay unquoted so the remote home
+        // expands; non-tilde paths get single-quoted whole.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh(&log);
+        let host =
+            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+
+        host.run(Some(Path::new("/srv/work/repo")), "git", &["status"])
+            .expect("run");
+
+        let invoked = read_log_lines(&log).last().cloned().expect("log");
+        assert!(
+            invoked.contains("cd '/srv/work/repo' && 'git' 'status'"),
+            "got: {invoked}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_run_preserves_remote_tilde_for_home_expansion() {
+        // `~/work` must reach the remote shell *unquoted* at the
+        // leading `~/` so the remote user's home expands. Anything
+        // beyond the prefix is single-quoted as usual. Same shape
+        // `transcript_root = "~/.claude/projects"` relies on.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh(&log);
+        let host =
+            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+
+        host.run(Some(Path::new("~/work/repo")), "pwd", &[])
+            .expect("run");
+
+        let invoked = read_log_lines(&log).last().cloned().expect("log");
+        assert!(
+            invoked.contains("cd ~/'work/repo' && 'pwd'"),
+            "got: {invoked}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_write_file_pipes_content_to_remote_cat() {
+        // Verifies two things end-to-end: (1) the remote command is
+        // `cat > <quoted path>` and (2) stdin content reaches the
+        // remote `cat` verbatim. Uses a tailored mock that reads
+        // stdin and writes it to a content-log alongside the
+        // argv-log, then asserts on both.
+        let tmp = TempDir::new().unwrap();
+        let argv_log = tmp.path().join("ssh-calls.log");
+        let stdin_log = tmp.path().join("ssh-stdin.bin");
+        let mock = write_executable_mock_ssh_capturing_stdin(&argv_log, &stdin_log);
+        let host =
+            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+
+        let payload = "task = \"refactor parser\"\nbase_branch = \"main\"\n";
+        host.write_file(Path::new("/srv/work/repo/.agent-mux/task.toml"), payload)
+            .expect("write_file");
+
+        let invoked = read_log_lines(&argv_log).last().cloned().expect("argv log");
+        assert!(
+            invoked.contains("cat > '/srv/work/repo/.agent-mux/task.toml'"),
+            "got: {invoked}"
+        );
+        let stdin_captured = fs::read_to_string(&stdin_log).expect("stdin readback");
+        assert_eq!(stdin_captured, payload);
+    }
+
+    /// Mock `ssh` that, in addition to logging argv (matching
+    /// [`write_executable_mock_ssh`]), drains its stdin into
+    /// `stdin_log`. Used by `ssh_write_file_pipes_content_to_remote_cat`
+    /// to verify the body of a `Host::write_file` call actually
+    /// reaches the remote shell — the argv alone says nothing about
+    /// content.
+    #[cfg(unix)]
+    fn write_executable_mock_ssh_capturing_stdin(argv_log: &Path, stdin_log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = argv_log.parent().expect("log path has parent");
+        let mock = dir.join("mock-ssh-with-stdin");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             cat > {}\n\
+             exit 0\n",
+            argv_log.display(),
+            stdin_log.display(),
+        );
+        write_file(&mock, &script);
+        let mut perms = fs::metadata(&mock).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock, perms).unwrap();
+        mock
     }
 }

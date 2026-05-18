@@ -613,6 +613,14 @@ mod tests {
             Ok(paths.iter().map(|p| self.is_dir(p)).collect())
         }
 
+        fn run(&self, _: Option<&Path>, _: &str, _: &[&str]) -> io::Result<std::process::Output> {
+            unreachable!()
+        }
+
+        fn write_file(&self, _: &Path, _: &str) -> io::Result<()> {
+            unreachable!()
+        }
+
         fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
             None
         }
@@ -756,6 +764,17 @@ mod tests {
                 unreachable!()
             }
             fn is_dir_many(&self, _: &[&Path]) -> io::Result<Vec<bool>> {
+                unreachable!()
+            }
+            fn run(
+                &self,
+                _: Option<&Path>,
+                _: &str,
+                _: &[&str],
+            ) -> io::Result<std::process::Output> {
+                unreachable!()
+            }
+            fn write_file(&self, _: &Path, _: &str) -> io::Result<()> {
                 unreachable!()
             }
             fn ssh_argv(&self, _: bool, _: &[&str]) -> Option<Vec<String>> {

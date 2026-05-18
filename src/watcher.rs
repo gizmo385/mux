@@ -405,9 +405,20 @@ pub fn derive_attention(host: &dyn Host, transcript_path: &Path) -> Attention {
     let Ok(tail) = host.read_tail(transcript_path, TAIL_BYTES) else {
         return Attention::Unknown;
     };
+    derive_attention_from_content(&tail)
+}
 
+/// Same attention-derivation logic as [`derive_attention`], but operates
+/// on transcript content already in memory. Discovery calls this after
+/// its bulk `read_many` so attention falls out of the same buffer it
+/// reads to extract `cwd` / `aiTitle`, with no extra SSH round-trip.
+/// The polling path keeps using the tail-only [`derive_attention`]
+/// because there the whole-file read would be wasteful — only the last
+/// few KB carry signal once the session is well underway.
+#[must_use]
+pub fn derive_attention_from_content(transcript: &str) -> Attention {
     let mut last: Option<EntryKind> = None;
-    for line in tail.lines() {
+    for line in transcript.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -415,7 +426,6 @@ pub fn derive_attention(host: &dyn Host, transcript_path: &Path) -> Attention {
             last = Some(kind);
         }
     }
-
     match last {
         Some(EntryKind::Assistant) => Attention::NeedsInput,
         Some(EntryKind::UserMessage | EntryKind::ToolResult) => Attention::Working,
@@ -595,6 +605,14 @@ mod tests {
             true
         }
 
+        fn read_many(&self, paths: &[&Path]) -> io::Result<Vec<io::Result<String>>> {
+            Ok(paths.iter().map(|p| self.read_to_string(p)).collect())
+        }
+
+        fn is_dir_many(&self, paths: &[&Path]) -> io::Result<Vec<bool>> {
+            Ok(paths.iter().map(|p| self.is_dir(p)).collect())
+        }
+
         fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
             None
         }
@@ -733,6 +751,12 @@ mod tests {
             }
             fn is_dir(&self, _: &Path) -> bool {
                 false
+            }
+            fn read_many(&self, _: &[&Path]) -> io::Result<Vec<io::Result<String>>> {
+                unreachable!()
+            }
+            fn is_dir_many(&self, _: &[&Path]) -> io::Result<Vec<bool>> {
+                unreachable!()
             }
             fn ssh_argv(&self, _: bool, _: &[&str]) -> Option<Vec<String>> {
                 None

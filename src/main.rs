@@ -36,7 +36,7 @@ use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
 use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
-use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent, derive_attention};
+use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent};
 use agent_mux::worktree::WorktreeManager;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -250,20 +250,34 @@ struct PreviewResult {
     entry: PreviewEntry,
 }
 
-/// Payload from a background SSH-discovery thread. `Ready` carries the
-/// connected `SshHost` (wrapped in `Arc` for trait-object insertion into
-/// `App.hosts`), the sessions found on it (each with its initial
-/// attention already computed against the remote transcript tail), and
-/// the `transcript_root` used for discovery — the polling thread that
-/// keeps attention live needs to rescan the same directory.
+/// Payload from a background SSH-discovery thread. The two-phase shape
+/// is load-bearing for UX: `Connected` fires as soon as the SSH
+/// `ControlMaster` is up (a few seconds) so cached remote sessions
+/// become *attachable* immediately — without it, the user stares at
+/// rows they can't enter for the entire duration of the slower
+/// discovery phase. `Ready` lands later with fresh discovered sessions
+/// and reconciles the catalog against them.
+///
+/// `Connected` carries the freshly-connected `Arc<dyn Host>` so it gets
+/// inserted into `App.hosts` (making attach/spawn-terminal work) and
+/// the polling threads can start ticking against current catalog state
+/// rather than waiting for a fresh discovery pass that might still
+/// have minutes to go on a high-latency proxy.
+///
 /// `Failed` carries the host's dashboard label and a one-line error so
-/// the footer can show why a host is missing from the catalog.
+/// the footer can show why a host is missing from the catalog —
+/// covers both connect-time failure (no `Connected` emitted before it)
+/// and discovery-time failure (host stays registered, but no fresh
+/// sessions overlay the cached entries this run).
 enum RemoteDiscoveryResult {
-    Ready {
+    Connected {
         host_id: HostId,
         host: Arc<dyn Host>,
-        sessions: Vec<Session>,
         transcript_root: PathBuf,
+    },
+    Ready {
+        host_id: HostId,
+        sessions: Vec<Session>,
     },
     Failed {
         host_id: HostId,
@@ -342,13 +356,13 @@ impl App {
             let tx = remote_tx.clone();
             let cache_dir_for_thread = cache_dir.clone();
             std::thread::spawn(move || {
-                let result = connect_and_discover(
-                    host_id.clone(),
+                connect_and_discover(
+                    host_id,
                     ssh_target,
-                    transcript_root,
+                    &transcript_root,
                     cache_dir_for_thread,
+                    &tx,
                 );
-                let _ = tx.send(result);
             });
         }
         // Drop the original Sender so the channel closes once every
@@ -525,30 +539,33 @@ impl App {
 
     fn drain_remote_discoveries(&mut self) {
         while let Ok(result) = self.remote_rx.try_recv() {
-            self.pending_hosts = self.pending_hosts.saturating_sub(1);
             match result {
-                RemoteDiscoveryResult::Ready {
+                RemoteDiscoveryResult::Connected {
                     host_id,
                     host,
-                    sessions,
                     transcript_root,
                 } => {
-                    let poll_seed: Vec<_> = sessions
+                    // Register the host as soon as its `ControlMaster`
+                    // is up so cached remote sessions become attachable
+                    // *before* discovery finishes. Polling threads
+                    // start here too, seeded with whatever sessions
+                    // for this host are already in the catalog
+                    // (typically the cache snapshot from the previous
+                    // run); the first poll tick is self-healing if
+                    // the seed disagrees with the live remote state.
+                    // `pending_hosts` does NOT decrement here — the
+                    // footer's "connecting to N host(s)…" hint stays
+                    // up until `Ready` lands so the user can tell
+                    // fresh-discovery progress from
+                    // attach-readiness.
+                    let poll_seed: Vec<_> = self
+                        .catalog
+                        .sessions()
                         .iter()
+                        .filter(|s| s.host == host_id)
                         .map(|s| (s.id.clone(), s.transcript_path.clone(), s.last_activity))
                         .collect();
                     self.hosts.insert(host_id.clone(), Arc::clone(&host));
-                    // Capture selection *before* reconcile so we can
-                    // re-seat it: a cached row the user already
-                    // highlighted should stay highlighted when the
-                    // live read overlays the same id; if the entry
-                    // disappeared, selection falls back to the first
-                    // visible session row.
-                    let prior = self.selected_id_for_reseat();
-                    self.catalog.reconcile_host(&host_id, sessions);
-                    self.reseat_selection_to(prior.as_ref());
-                    // Live polling: without this, remote attention stays
-                    // frozen at the discovery reading.
                     self.watcher.start_polling_host(
                         Arc::clone(&host),
                         transcript_root,
@@ -562,7 +579,20 @@ impl App {
                     self.watcher
                         .start_pane_polling_host(host, REMOTE_POLL_INTERVAL);
                 }
+                RemoteDiscoveryResult::Ready { host_id, sessions } => {
+                    self.pending_hosts = self.pending_hosts.saturating_sub(1);
+                    // Capture selection *before* reconcile so we can
+                    // re-seat it: a cached row the user already
+                    // highlighted should stay highlighted when the
+                    // live read overlays the same id; if the entry
+                    // disappeared, selection falls back to the first
+                    // visible session row.
+                    let prior = self.selected_id_for_reseat();
+                    self.catalog.reconcile_host(&host_id, sessions);
+                    self.reseat_selection_to(prior.as_ref());
+                }
                 RemoteDiscoveryResult::Failed { host_id, error } => {
+                    self.pending_hosts = self.pending_hosts.saturating_sub(1);
                     self.connect_errors.push((host_id, error));
                 }
             }
@@ -993,34 +1023,50 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
 fn connect_and_discover(
     host_id: HostId,
     ssh_target: String,
-    transcript_root: PathBuf,
+    transcript_root: &Path,
     cache_dir: Option<PathBuf>,
-) -> RemoteDiscoveryResult {
+    tx: &Sender<RemoteDiscoveryResult>,
+) {
     let ssh = match SshHost::connect(host_id.clone(), ssh_target) {
         Ok(h) => h,
         Err(e) => {
-            return RemoteDiscoveryResult::Failed {
+            let _ = tx.send(RemoteDiscoveryResult::Failed {
                 host_id,
                 error: e.to_string(),
-            };
+            });
+            return;
         }
     };
     let host: Arc<dyn Host> = Arc::new(ssh);
-    let mut sessions = match discover(host.as_ref(), &transcript_root) {
+    // Emit Connected before running discovery so the main thread can
+    // register the host (cached remote sessions become attachable) and
+    // start the polling threads — both gates that previously had to
+    // wait for the full discovery pass. If the receiver dropped (the
+    // dashboard exited) we bail; otherwise proceed with discovery.
+    if tx
+        .send(RemoteDiscoveryResult::Connected {
+            host_id: host_id.clone(),
+            host: Arc::clone(&host),
+            transcript_root: transcript_root.to_path_buf(),
+        })
+        .is_err()
+    {
+        return;
+    }
+    let sessions = match discover(host.as_ref(), transcript_root) {
         Ok(s) => s,
         Err(e) => {
-            return RemoteDiscoveryResult::Failed {
+            let _ = tx.send(RemoteDiscoveryResult::Failed {
                 host_id,
                 error: format!("discovery: {e}"),
-            };
+            });
+            return;
         }
     };
-    // Pre-compute attention on the discovery thread so the row shows
-    // real state on first render — the polling thread won't tick until
-    // its first interval elapses.
-    for session in &mut sessions {
-        session.attention = derive_attention(host.as_ref(), &session.transcript_path);
-    }
+    // No second pass for attention: `discover` now derives initial
+    // attention from the same bulk-fetched transcript content it used
+    // for cwd/title extraction, so the row paints with a real state
+    // (not Unknown) without a per-session `tail -c` round-trip.
     // Snapshot to disk so the next startup paints this host's
     // sessions before its `ControlMaster` handshake completes.
     // Best-effort: an unwritable cache directory must not fail the
@@ -1028,12 +1074,7 @@ fn connect_and_discover(
     if let Some(dir) = cache_dir {
         let _ = cache::write_for_host(&dir, &host_id, &sessions);
     }
-    RemoteDiscoveryResult::Ready {
-        host_id,
-        host,
-        sessions,
-        transcript_root,
-    }
+    let _ = tx.send(RemoteDiscoveryResult::Ready { host_id, sessions });
 }
 
 enum Action {

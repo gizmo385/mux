@@ -548,6 +548,12 @@ mod tests {
         fn is_dir(&self, _: &Path) -> bool {
             true
         }
+        fn read_many(&self, _: &[&Path]) -> std::io::Result<Vec<std::io::Result<String>>> {
+            unreachable!()
+        }
+        fn is_dir_many(&self, _: &[&Path]) -> std::io::Result<Vec<bool>> {
+            unreachable!()
+        }
         fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>> {
             self.calls
                 .lock()

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,37 @@ pub trait Host: Send + Sync {
     /// useful question is "can I attach a session rooted here?" and a
     /// failed stat is indistinguishable from "no" for that purpose.
     fn is_dir(&self, path: &Path) -> bool;
+
+    /// Bulk-read `paths` in a single host round-trip. Returns one
+    /// per-path [`io::Result`] in input order; a missing file lands in
+    /// its slot as `Err(ErrorKind::NotFound)` rather than failing the
+    /// whole batch, because discovery's task-metadata reads expect a
+    /// `NotFound` for sessions without a `.agent-mux/task.toml` and
+    /// need to distinguish that from a transport failure.
+    ///
+    /// Used by discovery to collapse N sequential `read_to_string`
+    /// round-trips into one — over a high-latency SSH proxy that's
+    /// the difference between ~30s and ~0.5s on a 20-session host.
+    /// Local impl iterates; the trait surface is the same so callers
+    /// stay host-agnostic.
+    ///
+    /// # Errors
+    /// Propagates only transport-level failures (the SSH process exits
+    /// non-zero, the local I/O subsystem errors on the batch as a
+    /// whole). Per-path errors land inside the returned vec.
+    fn read_many(&self, paths: &[&Path]) -> io::Result<Vec<io::Result<String>>>;
+
+    /// Bulk-`is_dir` check; one `bool` per input path in order. Same
+    /// rationale as [`Host::read_many`]: discovery's stale-cwd filter
+    /// hits every unique `project_dir` and the round-trip cost has to
+    /// amortize. Local impl iterates over `Path::is_dir`; SSH impl
+    /// runs one remote `test -d` loop and parses the Y/N stream.
+    ///
+    /// # Errors
+    /// Propagates transport-level failures only. A path that doesn't
+    /// exist (or isn't a directory) lands as `false` in its slot,
+    /// matching the single-path [`Host::is_dir`] contract.
+    fn is_dir_many(&self, paths: &[&Path]) -> io::Result<Vec<bool>>;
 
     /// Build the argv that runs `remote_cmd` against this host.
     /// Returns `None` for local hosts (the caller runs `remote_cmd`
@@ -154,6 +186,18 @@ impl Host for LocalHost {
         path.is_dir()
     }
 
+    fn read_many(&self, paths: &[&Path]) -> io::Result<Vec<io::Result<String>>> {
+        // Local FS has no per-call round-trip overhead — the batched
+        // shape exists for SSH amortization, not because std::fs::read
+        // benefits from batching. Iterating preserves per-path error
+        // resolution and keeps the local code path obvious.
+        Ok(paths.iter().map(fs::read_to_string).collect())
+    }
+
+    fn is_dir_many(&self, paths: &[&Path]) -> io::Result<Vec<bool>> {
+        Ok(paths.iter().map(|p| p.is_dir()).collect())
+    }
+
     fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
         None
     }
@@ -219,6 +263,16 @@ impl SshHost {
             .arg("ControlPersist=600")
             .arg("-o")
             .arg("ConnectTimeout=5")
+            // Compression is set on the ControlMaster so every channel
+            // multiplexed through it inherits it. Discovery's bulk
+            // transcript read shovels JSON over the wire — for a
+            // long-lived remote with megabytes of Claude Code
+            // transcripts to fetch, gzip at the SSH layer typically
+            // cuts wall-clock 3–5× because the proxy bandwidth is the
+            // bottleneck, not the per-round-trip latency. CPU cost
+            // is rounding error compared to the savings.
+            .arg("-o")
+            .arg("Compression=yes")
             .arg(&ssh_target)
             .status()?;
         if !status.success() {
@@ -320,6 +374,75 @@ impl Host for SshHost {
         matches!(status, Ok(s) if s.success())
     }
 
+    fn read_many(&self, paths: &[&Path]) -> io::Result<Vec<io::Result<String>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Remote loop: emit one length-prefixed record per input path.
+        // `OK <bytes>\n<bytes>` for an existing regular file, `MISS\n`
+        // for anything that fails the `-f` test. `wc -c < "$p"` (no
+        // path arg) avoids printing the filename; `tr -d ' '` strips
+        // the leading whitespace BSD `wc` adds. Paths are emitted in
+        // input order so the parser doesn't need to associate by name.
+        let mut script = String::from("set -e; ");
+        for p in paths {
+            let quoted = shell_quote_path(&p.to_string_lossy());
+            let _ = write!(
+                script,
+                "if [ -f {quoted} ]; then \
+                    sz=$(wc -c < {quoted} | tr -d ' '); \
+                    printf 'OK %s\\n' \"$sz\"; \
+                    cat {quoted}; \
+                else \
+                    printf 'MISS\\n'; \
+                fi; "
+            );
+        }
+        let stdout = self.run(&script)?;
+        parse_read_many_output(&stdout, paths.len())
+    }
+
+    fn is_dir_many(&self, paths: &[&Path]) -> io::Result<Vec<bool>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One `Y\n` or `N\n` per input path, in order. Cheaper wire
+        // format than `read_many` because there's no payload.
+        let mut script = String::new();
+        for p in paths {
+            let quoted = shell_quote_path(&p.to_string_lossy());
+            let _ = write!(script, "if [ -d {quoted} ]; then echo Y; else echo N; fi; ");
+        }
+        let stdout = self.run(&script)?;
+        let mut out = Vec::with_capacity(paths.len());
+        for line in stdout.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            match line {
+                b"Y" => out.push(true),
+                b"N" => out.push(false),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "is_dir_many: unexpected line {:?}",
+                            String::from_utf8_lossy(other)
+                        ),
+                    ));
+                }
+            }
+        }
+        if out.len() != paths.len() {
+            return Err(io::Error::other(format!(
+                "is_dir_many: expected {} results, got {}",
+                paths.len(),
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+
     fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>> {
         let mut argv = vec![
             self.ssh_binary.to_string_lossy().into_owned(),
@@ -399,6 +522,61 @@ where
         .map(|s| shell_single_quote(s.as_ref()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Parse the wire format emitted by `read_many`'s remote loop:
+/// alternating `OK <bytes>\n<bytes>` (existing file) or `MISS\n`
+/// (`NotFound`), one record per requested path, in input order.
+/// Returns one `io::Result<String>` per record so per-path `NotFound`
+/// is surfaced without failing the whole batch.
+fn parse_read_many_output(bytes: &[u8], expected: usize) -> io::Result<Vec<io::Result<String>>> {
+    let mut out: Vec<io::Result<String>> = Vec::with_capacity(expected);
+    let mut cursor = 0usize;
+    while out.len() < expected {
+        let nl_offset = bytes[cursor..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "read_many: truncated header after {} of {} records",
+                    out.len(),
+                    expected
+                ))
+            })?;
+        let header = std::str::from_utf8(&bytes[cursor..cursor + nl_offset])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        cursor += nl_offset + 1;
+
+        if header == "MISS" {
+            out.push(Err(io::Error::from(io::ErrorKind::NotFound)));
+        } else if let Some(size_str) = header.strip_prefix("OK ") {
+            let size: usize = size_str.parse().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read_many: bad size {size_str:?}: {e}"),
+                )
+            })?;
+            let end = cursor
+                .checked_add(size)
+                .ok_or_else(|| io::Error::other("read_many: size overflow"))?;
+            if end > bytes.len() {
+                return Err(io::Error::other(format!(
+                    "read_many: short read — declared {size} bytes, got {}",
+                    bytes.len().saturating_sub(cursor)
+                )));
+            }
+            let content = String::from_utf8(bytes[cursor..end].to_vec())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            cursor = end;
+            out.push(Ok(content));
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("read_many: bad header {header:?}"),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Parse the NUL-delimited output of `find -printf '%T@ %p\0'` into
@@ -971,5 +1149,89 @@ mod tests {
         assert!(name.contains("devbox"), "{name}");
         assert!(name.contains(&pid), "{name}");
         assert!(name.ends_with(".sock"), "{name}");
+    }
+
+    #[test]
+    fn local_read_many_returns_per_path_results_in_order() {
+        // Mix of present + missing files: ordering must match input,
+        // and the missing file's slot must surface as an Err so
+        // discovery's task.toml lookups can dispatch on NotFound vs
+        // transport failure.
+        let tmp = TempDir::new().expect("tempdir");
+        let a = tmp.path().join("a.txt");
+        let c = tmp.path().join("c.txt");
+        write_file(&a, "alpha");
+        write_file(&c, "gamma");
+        let missing = tmp.path().join("b.txt");
+
+        let host = LocalHost::new();
+        let results = host
+            .read_many(&[a.as_path(), missing.as_path(), c.as_path()])
+            .expect("batch ok");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_deref().ok(), Some("alpha"));
+        assert!(results[1].is_err(), "missing slot should be Err");
+        assert_eq!(results[2].as_deref().ok(), Some("gamma"));
+    }
+
+    #[test]
+    fn local_is_dir_many_returns_per_path_bools_in_order() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("d");
+        fs::create_dir(&dir).expect("mkdir");
+        let file = tmp.path().join("f.txt");
+        write_file(&file, "x");
+        let missing = tmp.path().join("nope");
+
+        let host = LocalHost::new();
+        let results = host
+            .is_dir_many(&[dir.as_path(), file.as_path(), missing.as_path()])
+            .expect("batch ok");
+        assert_eq!(results, vec![true, false, false]);
+    }
+
+    #[test]
+    fn parse_read_many_output_decodes_ok_and_miss_records_in_order() {
+        // Two existing files (with binary-ish + UTF-8 content) plus
+        // one missing file, in mixed order. Parser tracks position by
+        // byte count so a file whose content lacks a trailing newline
+        // round-trips correctly — the next header starts immediately
+        // after the declared size.
+        let mut wire: Vec<u8> = Vec::new();
+        wire.extend_from_slice(b"OK 5\n");
+        wire.extend_from_slice(b"alpha");
+        wire.extend_from_slice(b"MISS\n");
+        wire.extend_from_slice(b"OK 11\n");
+        wire.extend_from_slice("hello world".as_bytes());
+
+        let parsed = super::parse_read_many_output(&wire, 3).expect("parse");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].as_deref().ok(), Some("alpha"));
+        assert_eq!(
+            parsed[1].as_ref().err().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound),
+        );
+        assert_eq!(parsed[2].as_deref().ok(), Some("hello world"));
+    }
+
+    #[test]
+    fn parse_read_many_output_rejects_truncated_content() {
+        // Declared 100 bytes but only 5 actual bytes follow: the
+        // parser should error rather than silently return a short
+        // string. Pin the failure mode so a remote shell that dies
+        // mid-cat doesn't masquerade as a valid (partial) result.
+        let mut wire: Vec<u8> = Vec::new();
+        wire.extend_from_slice(b"OK 100\n");
+        wire.extend_from_slice(b"short");
+
+        let err = super::parse_read_many_output(&wire, 1).expect_err("should error");
+        assert!(err.to_string().contains("short read"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_read_many_output_rejects_bad_header() {
+        let wire = b"GARBAGE\n";
+        let err = super::parse_read_many_output(wire, 1).expect_err("should error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::host::Host;
-use crate::session::{Attention, Session, SessionId};
+use crate::session::{Attention, HostId, Session, SessionId};
+use crate::watcher::derive_attention_from_content;
 use crate::worktree;
 
 #[must_use]
@@ -11,22 +13,193 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
+/// Transcripts older than this are dropped at the `list_transcripts`
+/// boundary, before any per-transcript SSH `cat` / `test -d` round-trip.
+/// Measured 2026-05-18 on a long-lived remote host: 233 transcripts × 4
+/// sequential ssh round-trips per session ≈ 7+ minutes wall-clock through
+/// a Coder proxy, almost all of it spent on weeks-cold conversations the
+/// user is never going to attach to. 30 days is the initial cut; the
+/// exact value will become a config knob in M5 (see TODO under
+/// `#m5 #config`). Local discovery applies the same filter for parity —
+/// the user's mental model of "old session" shouldn't shift based on
+/// whether the box happens to be local or remote.
+pub const DISCOVERY_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Discover sessions by listing `root` (typically `~/.claude/projects`)
 /// through the given `Host`. The same code path serves the local case and
 /// the future SSH case — the only thing that varies is the `Host` impl.
+///
+/// Transcripts whose mtime is older than [`DISCOVERY_MAX_AGE`] are
+/// dropped before any per-session work. See [`discover_with_cutoff`] for
+/// the test-friendly variant that takes an explicit cutoff.
 ///
 /// # Errors
 /// Returns `io::Error` if `host.list_transcripts` or the per-transcript
 /// reads fail. A missing `root` directory is treated as "no sessions"
 /// (see [`crate::host::Host::list_transcripts`]) and yields an empty `Vec`.
 pub fn discover(host: &dyn Host, root: &Path) -> io::Result<Vec<Session>> {
-    let mut sessions = Vec::new();
-    for stat in host.list_transcripts(root)? {
-        if let Some(s) = build_session(host, &stat.path, stat.mtime)? {
+    let cutoff = SystemTime::now()
+        .checked_sub(DISCOVERY_MAX_AGE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    discover_with_cutoff(host, root, cutoff)
+}
+
+/// Per-transcript intermediate built during phase 1 of bulk discovery.
+/// Stays local to this module — the public surface still trades only in
+/// fully-formed [`Session`]s.
+struct Partial<'a> {
+    stat: &'a crate::host::TranscriptStat,
+    content: String,
+    project_dir: PathBuf,
+    attention: Attention,
+}
+
+/// Variant of [`discover`] that takes an explicit `cutoff`: transcripts
+/// with mtime strictly older than `cutoff` are filtered. Lets tests pin
+/// the boundary without mocking the clock.
+///
+/// # Errors
+/// See [`discover`].
+pub fn discover_with_cutoff(
+    host: &dyn Host,
+    root: &Path,
+    cutoff: SystemTime,
+) -> io::Result<Vec<Session>> {
+    let stats: Vec<_> = host
+        .list_transcripts(root)?
+        .into_iter()
+        .filter(|s| s.mtime >= cutoff)
+        .collect();
+    if stats.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Phase 1 — bulk-fetch every transcript in one round-trip. The
+    // content is reused three times: to extract cwd/title metadata,
+    // to derive initial attention, and (indirectly via the parsed
+    // cwd) to drive the bulk is_dir / task.toml batches below. Over
+    // a high-latency proxy this is the difference between O(N) ssh
+    // round-trips and O(1).
+    let transcript_paths: Vec<&Path> = stats.iter().map(|s| s.path.as_path()).collect();
+    let transcript_contents = host.read_many(&transcript_paths)?;
+
+    // Parse meta + derive attention for each transcript we could read.
+    // Transcripts that failed the per-path read drop here — they won't
+    // appear in the dashboard this tick, and the next poll will retry.
+    let mut partials: Vec<Partial<'_>> = Vec::with_capacity(stats.len());
+    for (stat, content_result) in stats.iter().zip(transcript_contents) {
+        let Ok(content) = content_result else {
+            continue;
+        };
+        let meta = parse_transcript_meta(&content);
+        let project_dir = meta.cwd.clone().unwrap_or_else(|| fallback_dir(&stat.path));
+        let attention = derive_attention_from_content(&content);
+        partials.push(Partial {
+            stat,
+            content,
+            project_dir,
+            attention,
+        });
+    }
+
+    // Phase 2 — bulk is_dir on the unique project_dirs. Multiple
+    // sessions sharing a worktree (common — same repo, several
+    // conversations) collapse to one stat call. Dedup is cheap
+    // because partials.len() is small.
+    let mut unique_dirs: Vec<PathBuf> = partials.iter().map(|p| p.project_dir.clone()).collect();
+    unique_dirs.sort();
+    unique_dirs.dedup();
+    let unique_dir_refs: Vec<&Path> = unique_dirs.iter().map(PathBuf::as_path).collect();
+    let exists = host.is_dir_many(&unique_dir_refs)?;
+    let exists_by_dir: HashMap<&Path, bool> = unique_dir_refs
+        .iter()
+        .copied()
+        .zip(exists.iter().copied())
+        .collect();
+
+    // Phase 3 — bulk-read task.toml only for project_dirs that
+    // actually exist. NotFound results land per-path; we map them to
+    // "no override title" without failing the batch.
+    let task_dirs: Vec<&PathBuf> = unique_dirs
+        .iter()
+        .filter(|d| *exists_by_dir.get(d.as_path()).unwrap_or(&false))
+        .collect();
+    let task_toml_paths: Vec<PathBuf> = task_dirs
+        .iter()
+        .map(|d| worktree::task_metadata_path(d))
+        .collect();
+    let task_toml_path_refs: Vec<&Path> = task_toml_paths.iter().map(PathBuf::as_path).collect();
+    let task_toml_results = host.read_many(&task_toml_path_refs)?;
+    let task_toml_by_dir: HashMap<&Path, String> = task_dirs
+        .iter()
+        .map(|d| d.as_path())
+        .zip(task_toml_results)
+        .filter_map(|(d, r)| r.ok().map(|content| (d, content)))
+        .collect();
+
+    // Phase 4 — assemble sessions from the now-resolved data. No I/O
+    // beyond this point; this loop is pure CPU over in-memory inputs.
+    let mut sessions = Vec::with_capacity(partials.len());
+    for partial in &partials {
+        let project_dir_exists = *exists_by_dir
+            .get(partial.project_dir.as_path())
+            .unwrap_or(&false);
+        let task_toml = task_toml_by_dir
+            .get(partial.project_dir.as_path())
+            .map(String::as_str);
+        if let Some(s) = assemble_session(
+            host.id(),
+            &partial.stat.path,
+            partial.stat.mtime,
+            &partial.content,
+            project_dir_exists,
+            task_toml,
+            partial.attention,
+        ) {
             sessions.push(s);
         }
     }
     Ok(sessions)
+}
+
+/// Pure session-assembly: given a fully-fetched payload for one
+/// transcript, produce a `Session` or `None` if it's not usable
+/// (missing file stem, no surviving `project_dir`). No I/O — both
+/// [`build_session`] (single-shot reads for the live-discovery path)
+/// and [`discover_with_cutoff`] (bulk reads at startup) compose
+/// around this function.
+fn assemble_session(
+    host_id: &HostId,
+    transcript_path: &Path,
+    mtime: SystemTime,
+    transcript_content: &str,
+    project_dir_exists: bool,
+    task_toml_content: Option<&str>,
+    attention: Attention,
+) -> Option<Session> {
+    let id = SessionId(transcript_path.file_stem()?.to_str()?.to_string());
+    let meta = parse_transcript_meta(transcript_content);
+    let project_dir = meta
+        .cwd
+        .clone()
+        .unwrap_or_else(|| fallback_dir(transcript_path));
+    if !project_dir_exists {
+        return None;
+    }
+    let task_title = task_toml_content
+        .and_then(|raw| worktree::parse_task_metadata(raw).ok())
+        .map(|m| m.task);
+    let title = task_title.or(meta.ai_title).or(meta.first_user_message);
+    Some(Session {
+        id,
+        host: host_id.clone(),
+        project_dir,
+        transcript_path: transcript_path.to_path_buf(),
+        last_activity: mtime,
+        attention,
+        title,
+        has_live_pane: None,
+    })
 }
 
 /// Build a `Session` from a single transcript path and its mtime. Reused
@@ -49,30 +222,35 @@ pub fn build_session(
     transcript_path: &Path,
     mtime: SystemTime,
 ) -> io::Result<Option<Session>> {
-    let id = match transcript_path.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => SessionId(s.to_string()),
-        None => return Ok(None),
-    };
-    let transcript_meta = read_transcript_meta(host, transcript_path)?;
-    let project_dir = transcript_meta
-        .cwd
-        .unwrap_or_else(|| fallback_dir(transcript_path));
-    if !host.is_dir(&project_dir) {
+    if transcript_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_none()
+    {
         return Ok(None);
     }
-    let title = task_toml_title(host, &project_dir)
-        .or(transcript_meta.ai_title)
-        .or(transcript_meta.first_user_message);
-    Ok(Some(Session {
-        id,
-        host: host.id().clone(),
-        project_dir,
-        transcript_path: transcript_path.to_path_buf(),
-        last_activity: mtime,
-        attention: Attention::Unknown,
-        title,
-        has_live_pane: None,
-    }))
+    let content = host.read_to_string(transcript_path)?;
+    let meta = parse_transcript_meta(&content);
+    let project_dir = meta
+        .cwd
+        .clone()
+        .unwrap_or_else(|| fallback_dir(transcript_path));
+    let exists = host.is_dir(&project_dir);
+    let task_toml = if exists {
+        host.read_to_string(&worktree::task_metadata_path(&project_dir))
+            .ok()
+    } else {
+        None
+    };
+    Ok(assemble_session(
+        host.id(),
+        transcript_path,
+        mtime,
+        &content,
+        exists,
+        task_toml.as_deref(),
+        Attention::Unknown,
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -93,12 +271,13 @@ struct TranscriptMeta {
 /// rambling first message doesn't dominate the row.
 const FIRST_USER_MSG_MAX_CHARS: usize = 60;
 
-/// Single-pass scan: take cwd from the first line that has one,
-/// ai-title from the *last* `{"type":"ai-title",...}` entry (titles
-/// refine as the session grows), and the first non-empty user message
-/// for the title-fallback path. Malformed JSON lines are skipped.
-fn read_transcript_meta(host: &dyn Host, transcript_path: &Path) -> io::Result<TranscriptMeta> {
-    let raw = host.read_to_string(transcript_path)?;
+/// Single-pass scan over an already-fetched transcript: take cwd from
+/// the first line that has one, ai-title from the *last* `ai-title`
+/// entry (titles refine as the session grows), and the first non-empty
+/// user message for the title-fallback path. Malformed JSON lines are
+/// skipped. Pure — no I/O — so both the single-shot `build_session`
+/// path and the batched `discover_with_cutoff` path can share it.
+fn parse_transcript_meta(raw: &str) -> TranscriptMeta {
     let mut meta = TranscriptMeta::default();
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -124,7 +303,7 @@ fn read_transcript_meta(host: &dyn Host, transcript_path: &Path) -> io::Result<T
             meta.first_user_message = Some(normalize_for_title(&text));
         }
     }
-    Ok(meta)
+    meta
 }
 
 /// Pull the human-authored text out of a `{"type":"user", ...}` entry.
@@ -188,13 +367,6 @@ fn normalize_for_title(raw: &str) -> String {
     taken
 }
 
-fn task_toml_title(host: &dyn Host, project_dir: &Path) -> Option<String> {
-    let raw = host
-        .read_to_string(&worktree::task_metadata_path(project_dir))
-        .ok()?;
-    worktree::parse_task_metadata(&raw).ok().map(|m| m.task)
-}
-
 fn fallback_dir(transcript_path: &Path) -> PathBuf {
     transcript_path
         .parent()
@@ -228,6 +400,18 @@ mod tests {
     /// the local filesystem, so wrap the explicit-host call.
     fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
         discover(&LocalHost::new(), root)
+    }
+
+    /// Force a file's mtime to a specific instant. Used by the recency-
+    /// filter tests to age a transcript past the cutoff without waiting
+    /// 30 days. Wraps `File::set_times` so the call site stays one-line.
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        let times = std::fs::FileTimes::new().set_modified(mtime);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for set_times");
+        f.set_times(times).expect("set_times");
     }
 
     #[test]
@@ -641,5 +825,92 @@ mod tests {
 
         let sessions = discover_local(&projects).unwrap();
         assert_eq!(sessions[0].title.as_deref(), Some("second message"));
+    }
+
+    #[test]
+    fn cold_transcript_is_filtered_before_per_session_work() {
+        // The performance win this filter exists for: a transcript older
+        // than the cutoff is dropped at the `list_transcripts` boundary,
+        // so the expensive `cat`/`is_dir`/title-read round-trips never
+        // happen. We can't directly observe "no SSH calls were made"
+        // through the LocalHost path, but we can prove the filtered
+        // transcript doesn't appear in the result even though it would
+        // have been a valid session by content.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        let path = entry.join("cold.jsonl");
+        fs::write(
+            &path,
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        // Age the transcript 60 days; cutoff at 30 days means it's
+        // out — strictly older than the cutoff.
+        set_mtime(&path, now - Duration::from_secs(60 * 24 * 60 * 60));
+
+        let cutoff = now - Duration::from_secs(30 * 24 * 60 * 60);
+        let sessions =
+            discover_with_cutoff(&LocalHost::new(), &projects, cutoff).expect("discover");
+        assert!(
+            sessions.is_empty(),
+            "cold transcript should be filtered: {sessions:?}"
+        );
+    }
+
+    #[test]
+    fn warm_transcript_survives_the_cutoff() {
+        // Sibling test to the cold-filter one: a transcript still inside
+        // the window must reach `build_session` and appear in the result.
+        // Pins both halves of the boundary so a future change that flips
+        // the comparison direction blows up here.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        let path = entry.join("warm.jsonl");
+        fs::write(
+            &path,
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        // Age the transcript 5 days; cutoff at 30 days lets it through.
+        set_mtime(&path, now - Duration::from_secs(5 * 24 * 60 * 60));
+
+        let cutoff = now - Duration::from_secs(30 * 24 * 60 * 60);
+        let sessions =
+            discover_with_cutoff(&LocalHost::new(), &projects, cutoff).expect("discover");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id.0, "warm");
+    }
+
+    #[test]
+    fn discover_default_uses_max_age_constant() {
+        // Without injecting a cutoff, `discover` should apply the public
+        // `DISCOVERY_MAX_AGE` constant. Pin it by constructing a
+        // transcript aged just past the constant and confirming the
+        // bare `discover` call filters it.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        let path = entry.join("aged.jsonl");
+        fs::write(
+            &path,
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+        // 1 hour past the constant — well inside floating-point /
+        // scheduler slack on the SystemTime::now() comparison.
+        set_mtime(
+            &path,
+            SystemTime::now() - DISCOVERY_MAX_AGE - Duration::from_secs(60 * 60),
+        );
+
+        let sessions = discover_local(&projects).expect("discover");
+        assert!(
+            sessions.is_empty(),
+            "discover() should honour DISCOVERY_MAX_AGE: {sessions:?}"
+        );
     }
 }

@@ -27,7 +27,7 @@ use agent_mux::attachment::{
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
-use agent_mux::config::{self, Config, Theme};
+use agent_mux::config::{self, Config, Theme, ToolBinding};
 use agent_mux::dashboard::{
     DisplayRow, Focus, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg,
     build_display_rows, build_display_rows_filtered, compose_preview_pane_lines,
@@ -1431,6 +1431,58 @@ impl App {
         }
     }
 
+    /// Fire a user-configured `[[tools]]` keybind against the selected
+    /// session. Resolves `{cwd}` / `{host}` placeholders against the
+    /// session, then routes through the attachment driver's
+    /// `spawn_tool` (same dispatch family as `t: terminal`).
+    /// Returns a `SuspendCommand` for the outside-tmux path; `None`
+    /// when nothing to suspend (`Done`, `EmbedPty`, errors).
+    fn launch_tool(&mut self, idx: usize) -> Option<SuspendCommand> {
+        let tool = self.config.tools.get(idx)?.clone();
+        let (outcome, label, cwd) = {
+            let session = self.selected_session()?;
+            let host = self.hosts.get(&session.host)?.clone();
+            let cwd = session.project_dir.clone();
+            let host_str = session.host.as_str().to_string();
+            let cmd = tool.substitute(&cwd, &host_str);
+            (
+                self.driver.spawn_tool(session, host.as_ref(), &cmd),
+                tool.name.clone().unwrap_or_else(|| {
+                    // Fall back to the program name (first token) when
+                    // the user didn't set a `name`. Distinguishes
+                    // launches in the status line without forcing
+                    // every entry to carry an explicit label.
+                    tool.command
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| format!("tool {idx}"))
+                }),
+                cwd,
+            )
+        };
+        match outcome {
+            Ok(AttachOutcome::Done) => {
+                self.status = Some(format!("launched {label} in {}", cwd.display()));
+                None
+            }
+            Ok(AttachOutcome::SuspendAndRun(cmd)) => {
+                self.status = None;
+                Some(cmd)
+            }
+            Ok(AttachOutcome::EmbedPty(_)) => {
+                // Defensive — neither driver currently emits EmbedPty
+                // for spawn_tool. If a future driver does, surface
+                // the gap instead of panicking the binary.
+                self.status = Some(format!("tool {label}: embedded launch not yet wired"));
+                None
+            }
+            Err(e) => {
+                self.status = Some(format!("tool {label}: {e}"));
+                None
+            }
+        }
+    }
+
     fn next(&mut self) {
         let rows = self.current_rows();
         if let Some(i) = next_session_index(self.list_state.selected(), &rows) {
@@ -1562,7 +1614,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             if app.route_search_active_key(key) {
                 continue;
             }
-            match dispatch_action(app, action_for(key)) {
+            match dispatch_action(app, action_for(key, &app.config.tools)) {
                 ActionOutcome::Quit => return Ok(()),
                 ActionOutcome::Continue => {}
                 ActionOutcome::Suspend(cmd) => {
@@ -1712,6 +1764,10 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.open_delete_worktree();
             ActionOutcome::Continue
         }
+        Action::LaunchTool(idx) => match app.launch_tool(idx) {
+            Some(cmd) => ActionOutcome::Suspend(cmd),
+            None => ActionOutcome::Continue,
+        },
     }
 }
 
@@ -1729,9 +1785,14 @@ enum Action {
     OpenSearch,
     TogglePreview,
     DeleteWorktree,
+    /// User-configured `[[tools]]` keybind. The index is into
+    /// `App.config.tools` — `dispatch_action` reads the binding back
+    /// out of the same vec at fire time so a stale index can't
+    /// outlive a config reload (when reload-on-edit ships).
+    LaunchTool(usize),
 }
 
-fn action_for(key: KeyEvent) -> Option<Action> {
+fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
     // Ctrl-j / Ctrl-k jump host. Handled first so they don't fall through
     // to the lowercase j/k single-session navigation below. Ctrl-C is
     // already intercepted upstream so it never reaches this function.
@@ -1756,6 +1817,15 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::OpenSearch),
         KeyCode::Char('p') => Some(Action::TogglePreview),
         KeyCode::Char('d') => Some(Action::DeleteWorktree),
+        // Tool keybinds dispatch after built-ins. Config-load
+        // validation rejected any tool whose `key` shadows a built-in
+        // (RESERVED_KEY_CHARS in config.rs), so the order here is
+        // belt-and-braces: even a buggy validator can't make a tool
+        // override `q` or `j`.
+        KeyCode::Char(c) => tools
+            .iter()
+            .position(|t| t.key == c)
+            .map(Action::LaunchTool),
         _ => None,
     }
 }
@@ -2205,6 +2275,52 @@ mod tests {
 
     fn no_connect_errors() -> Vec<(HostId, String)> {
         Vec::new()
+    }
+
+    fn tool(key: char, command: &[&str]) -> ToolBinding {
+        ToolBinding {
+            key,
+            name: None,
+            command: command.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn plain_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn action_for_dispatches_tool_keybinds_after_builtins() {
+        // `g` is not a built-in key; with a tool bound to `g`, action_for
+        // returns LaunchTool with the correct index.
+        let tools = vec![tool('g', &["lazygit"]), tool('v', &["nvim"])];
+        assert!(matches!(
+            action_for(plain_key('g'), &tools),
+            Some(Action::LaunchTool(0))
+        ));
+        assert!(matches!(
+            action_for(plain_key('v'), &tools),
+            Some(Action::LaunchTool(1))
+        ));
+    }
+
+    #[test]
+    fn action_for_built_in_keys_take_priority_over_tool_keys() {
+        // Defensive: even if a (buggy) validator let a tool slip
+        // through with `key = 'q'`, the built-in match arms come first
+        // and quit still wins. This is the second line of defence
+        // behind config-load validation.
+        let tools = vec![tool('q', &["never-fires"])];
+        assert!(matches!(
+            action_for(plain_key('q'), &tools),
+            Some(Action::Quit)
+        ));
+    }
+
+    #[test]
+    fn action_for_returns_none_for_unbound_key() {
+        let tools = vec![tool('g', &["lazygit"])];
+        assert!(action_for(plain_key('x'), &tools).is_none());
     }
 
     #[test]

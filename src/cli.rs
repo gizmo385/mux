@@ -259,6 +259,20 @@ fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
         out,
         "  theme: preset={preset:?}, per-field overrides={overrides}",
     )?;
+    writeln!(out, "  tools ({}):", cfg.tools.len())?;
+    if cfg.tools.is_empty() {
+        writeln!(out, "    (none)")?;
+    } else {
+        for t in &cfg.tools {
+            let name = t.name.as_deref().unwrap_or("");
+            let label = if name.is_empty() {
+                String::new()
+            } else {
+                format!(" ({name})")
+            };
+            writeln!(out, "    - {} → {:?}{label}", t.key, t.command)?;
+        }
+    }
     Ok(())
 }
 
@@ -384,6 +398,48 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
         out,
         "tool_result_err = \"\"    # ↳ error lines in preview pane"
     )?;
+    print_tools_reference(out)?;
+    Ok(())
+}
+
+/// Pulled out of [`print_config_reference`] so that function stays
+/// under the clippy line cap. Prints the commented-out `[[tools]]`
+/// skeleton the user can copy into their config.
+fn print_tools_reference<W: Write>(out: &mut W) -> io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "# ─── Tool keybinds (post-M5) ───────────────────────")?;
+    writeln!(
+        out,
+        "# One [[tools]] array entry per custom keybind. `key` is a single"
+    )?;
+    writeln!(
+        out,
+        "# character that must not collide with built-ins (q j k J K t n p d /)."
+    )?;
+    writeln!(
+        out,
+        "# `command` is the argv to spawn; `{{cwd}}` and `{{host}}` are"
+    )?;
+    writeln!(
+        out,
+        "# substituted at fire time. Inside tmux the tool opens in a new"
+    )?;
+    writeln!(
+        out,
+        "# window in the session's cwd; outside tmux it takes over the"
+    )?;
+    writeln!(
+        out,
+        "# terminal as a foreground subprocess. `name` is an optional label"
+    )?;
+    writeln!(out, "# shown in the dashboard status line at launch.")?;
+    writeln!(out, "# [[tools]]")?;
+    writeln!(out, "# key = \"g\"")?;
+    writeln!(out, "# command = [\"lazygit\"]")?;
+    writeln!(out, "# [[tools]]")?;
+    writeln!(out, "# key = \"v\"")?;
+    writeln!(out, "# name = \"edit\"")?;
+    writeln!(out, "# command = [\"nvim\", \".\"]")?;
     Ok(())
 }
 

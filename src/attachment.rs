@@ -123,6 +123,26 @@ pub trait AttachmentDriver {
     /// or `AttachError::RemoteUnsupported` if `host` is unexpectedly
     /// local-shaped (e.g. an `ssh_argv` impl that returns `None`).
     fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError>;
+
+    /// Launch a user-configured tool (lazygit, nvim, …) in the
+    /// session's cwd. Same dispatch family as [`spawn_terminal`] —
+    /// inside tmux this is `tmux new-window -c <cwd> <command>` so
+    /// the new window joins the user's existing tmux session;
+    /// outside tmux it `SuspendAndRun`s the command with the cwd
+    /// set, taking over the terminal until the tool exits.
+    ///
+    /// `command` is shell-quoted as a unit before being handed to
+    /// `tmux new-window` so spaces / glob chars / shell
+    /// metacharacters in arguments round-trip verbatim.
+    ///
+    /// # Errors
+    /// Returns `AttachError::TmuxCommandFailed` if tmux returns non-zero.
+    fn spawn_tool(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+        command: &[String],
+    ) -> Result<AttachOutcome, AttachError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -153,6 +173,19 @@ impl AttachmentDriver for TmuxDriver {
             Self::spawn_terminal_local(session)
         } else {
             Self::spawn_terminal_remote(session, host)
+        }
+    }
+
+    fn spawn_tool(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+        command: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        if session.host.is_local() {
+            Self::spawn_tool_local(session, command)
+        } else {
+            Self::spawn_tool_remote(session, host, command)
         }
     }
 
@@ -239,6 +272,36 @@ impl TmuxDriver {
             }))
         }
     }
+
+    /// Local tool launch. Inside tmux this opens a new window in cwd
+    /// running the shell-joined command (so `tmux` execs it via
+    /// `sh -c`, which handles spaces / quotes / globs uniformly).
+    /// Outside tmux, suspend the TUI and run the program directly —
+    /// `cwd` set on the [`SuspendCommand`] so the child inherits it.
+    fn spawn_tool_local(
+        session: &Session,
+        command: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        if in_tmux() {
+            let cwd_str = session.project_dir.to_string_lossy().into_owned();
+            let joined = shell_join_quoted(command.iter().map(String::as_str));
+            run_tmux(&["new-window", "-c", &cwd_str, &joined])?;
+            Ok(AttachOutcome::Done)
+        } else {
+            // command was validated non-empty by `ToolBinding`'s
+            // Deserialize; defensively split here so a future caller
+            // that hands us an empty slice gets a clear error rather
+            // than an index panic.
+            let (program, args) = command
+                .split_first()
+                .ok_or_else(|| AttachError::TmuxCommandFailed("tool command is empty".into()))?;
+            Ok(AttachOutcome::SuspendAndRun(SuspendCommand {
+                program: program.clone(),
+                args: args.to_vec(),
+                cwd: Some(session.project_dir.clone()),
+            }))
+        }
+    }
 }
 
 // ---------- Remote ----------
@@ -285,6 +348,20 @@ impl TmuxDriver {
     ) -> Result<AttachOutcome, AttachError> {
         let cwd = session.project_dir.to_string_lossy().into_owned();
         Self::run_remote_interactive(host, &["tmux", "new-window", "-c", &cwd])
+    }
+
+    /// Remote tool launch. Same dispatch shape as `spawn_terminal_remote`,
+    /// just with the user's shell-joined command appended to the
+    /// `tmux new-window` invocation. The remote tmux runs the command
+    /// via `sh -c`, so spaces / globs / shell metacharacters survive.
+    fn spawn_tool_remote(
+        session: &Session,
+        host: &dyn Host,
+        command: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        let cwd = session.project_dir.to_string_lossy().into_owned();
+        let joined = shell_join_quoted(command.iter().map(String::as_str));
+        Self::run_remote_interactive(host, &["tmux", "new-window", "-c", &cwd, &joined])
     }
 
     /// Hand the user a fully-interactive subprocess that runs
@@ -444,6 +521,20 @@ impl AttachmentDriver for PtyDriver {
 
     fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
         TmuxDriver.spawn_session(cwd, host)
+    }
+
+    fn spawn_tool(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+        command: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        // Out-of-band action — same reasoning as `spawn_terminal`'s
+        // delegate-to-TmuxDriver shape: opening lazygit in a tmux
+        // window isn't part of "embed the active attach," it's a
+        // sibling tmux affordance. Pivot here only if dogfooding
+        // surfaces demand for an embedded-launch variant.
+        TmuxDriver.spawn_tool(session, host, command)
     }
 }
 
@@ -827,6 +918,53 @@ mod tests {
             .position(|s| s == "-s")
             .expect("must have -s");
         assert_eq!(remote_cmd[name_idx + 1], "agent-mux-abc");
+    }
+
+    #[test]
+    fn spawn_tool_remote_appends_shell_joined_command_to_new_window() {
+        // Remote tool launch must shell-quote the user's command into
+        // one token that the remote `tmux new-window` execs via sh -c.
+        // Otherwise multi-arg commands like `nvim .` would be split
+        // by SSH/the remote shell in surprising ways.
+        let host = FakeRemoteHost::new();
+        let session = make_session(HostId("remote".into()), "/work/proj");
+        let cmd = vec!["nvim".to_string(), ".".to_string()];
+        let _ = TmuxDriver::spawn_tool_remote(&session, &host, &cmd);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(tty, "spawn_tool needs -t for interactive tools");
+        assert_eq!(
+            remote_cmd,
+            vec!["tmux", "new-window", "-c", "/work/proj", "'nvim' '.'"]
+        );
+    }
+
+    #[test]
+    fn spawn_tool_local_outside_tmux_returns_suspend_command_with_cwd() {
+        // Outside tmux, the tool runs as a foreground subprocess
+        // inheriting the session's cwd. The first command token is
+        // the program; the rest are args. The shell-join used by the
+        // in-tmux branch is *not* applied here — SuspendCommand spawns
+        // via exec(), not sh -c.
+        let session = make_session(HostId::local(), "/work/proj");
+        let cmd = vec![
+            "lazygit".to_string(),
+            "--git-dir".to_string(),
+            ".".to_string(),
+        ];
+        // Skip if $TMUX is set in the test environment — we can't
+        // exercise the outside-tmux branch from inside one.
+        if std::env::var_os("TMUX").is_some() {
+            return;
+        }
+        let outcome = TmuxDriver::spawn_tool_local(&session, &cmd).expect("spawn_tool_local");
+        match outcome {
+            AttachOutcome::SuspendAndRun(sc) => {
+                assert_eq!(sc.program, "lazygit");
+                assert_eq!(sc.args, vec!["--git-dir", "."]);
+                assert_eq!(sc.cwd.as_deref(), Some(Path::new("/work/proj")));
+            }
+            other => panic!("expected SuspendAndRun, got {other:?}"),
+        }
     }
 
     #[test]

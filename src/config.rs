@@ -9,12 +9,26 @@ use serde::Deserialize;
 /// `[hosts.<name>]` key — the local host is implicit, not configured.
 pub const LOCAL_HOST_NAME: &str = "local";
 
+/// Single-char keybinds the dashboard hard-codes in `action_for`.
+/// Tool configs whose `key` matches one of these are rejected at load
+/// so the user gets a clear error rather than silently-shadowed
+/// behaviour. **Keep in sync with `action_for` in `main.rs`** — if you
+/// add a new built-in key there, add it here too.
+pub const RESERVED_KEY_CHARS: &[char] = &['q', 'j', 'k', 'J', 'K', 't', 'n', '/', 'p', 'd'];
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
     ReservedHostName(String),
     EmptySshTarget(String),
+    /// Two `[[tools]]` entries declared the same `key`. The dashboard
+    /// can only dispatch one action per key; the user must rename.
+    DuplicateToolKey(char),
+    /// A `[[tools]]` entry's `key` matches a hard-coded dashboard
+    /// binding. Surfaced loudly so the user can pick a different key
+    /// instead of silently never seeing their tool fire.
+    ToolKeyCollidesWithBuiltin(char),
     /// A theme field carried a string that isn't a recognised colour
     /// (named ANSI colour, `bright_*` variant, hex `#RRGGBB`, or empty
     /// for default). Loud failure beats silent fallback because the
@@ -39,6 +53,23 @@ impl std::fmt::Display for ConfigError {
             }
             Self::EmptySshTarget(name) => {
                 write!(f, "host {name:?} has an empty `ssh` field")
+            }
+            Self::DuplicateToolKey(c) => {
+                write!(
+                    f,
+                    "tool key {c:?} is configured by more than one [[tools]] entry"
+                )
+            }
+            Self::ToolKeyCollidesWithBuiltin(c) => {
+                write!(
+                    f,
+                    "tool key {c:?} collides with a built-in dashboard binding (reserved: {})",
+                    RESERVED_KEY_CHARS
+                        .iter()
+                        .map(|c| format!("{c:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
             Self::InvalidColor { field, value } => {
                 write!(f, "theme.{field}: {value:?} is not a recognised colour")
@@ -104,6 +135,94 @@ pub struct Config {
     /// Public so the loader can validate and reject bad names early.
     #[serde(default)]
     pub theme: ThemeConfig,
+    /// User-defined keybinds that launch a terminal tool in the
+    /// selected session's cwd. Each `[[tools]]` entry adds a single
+    /// dashboard binding; the existing `t: terminal` action is the
+    /// degenerate case (shell with no args), so tools live in the
+    /// same dispatch family.
+    #[serde(default)]
+    pub tools: Vec<ToolBinding>,
+}
+
+/// One user-configured tool keybind. Construction via [`Deserialize`]
+/// enforces single-char key + non-empty command; cross-entry checks
+/// (no duplicates, no collision with built-in dashboard keys) live in
+/// [`Config::load_from`] because they need the full vec in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolBinding {
+    /// Sidebar-focus key that fires this tool. Always one character —
+    /// validated during deserialize.
+    pub key: char,
+    /// Optional human-readable label. Surfaced in the launch status
+    /// line so the user sees what fired; not required because the
+    /// command itself is usually enough.
+    pub name: Option<String>,
+    /// argv to launch. `command[0]` is the program; the rest are
+    /// passed through verbatim, with `{cwd}` and `{host}` substituted
+    /// at launch time. Joined with shell-safe quoting before being
+    /// handed to `tmux new-window` or the outside-tmux suspend path,
+    /// so spaces / globs / shell metacharacters round-trip correctly.
+    pub command: Vec<String>,
+}
+
+/// On-disk shape for `[[tools]]`. Kept as a private intermediate so
+/// the public [`ToolBinding`] can carry the validated `key: char` and
+/// callers don't have to re-parse the string.
+#[derive(Deserialize)]
+struct ToolBindingRaw {
+    key: String,
+    #[serde(default)]
+    name: Option<String>,
+    command: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ToolBinding {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let raw = ToolBindingRaw::deserialize(d)?;
+        let mut chars = raw.key.chars();
+        let key = chars
+            .next()
+            .ok_or_else(|| Error::custom("tool `key` cannot be empty"))?;
+        if chars.next().is_some() {
+            return Err(Error::custom(format!(
+                "tool `key` must be a single character, got {:?}",
+                raw.key
+            )));
+        }
+        if raw.command.is_empty() {
+            return Err(Error::custom("tool `command` cannot be an empty list"));
+        }
+        if raw.command[0].is_empty() {
+            return Err(Error::custom(
+                "tool `command[0]` (the program) cannot be an empty string",
+            ));
+        }
+        Ok(Self {
+            key,
+            name: raw.name,
+            command: raw.command,
+        })
+    }
+}
+
+impl ToolBinding {
+    /// Apply `{cwd}` / `{host}` substitutions against a session's
+    /// `project_dir` and host id, returning the launchable token list.
+    /// Tokens without placeholders pass through unchanged; substitution
+    /// is plain string-replace (no shell parsing) because the result
+    /// is shell-quoted as a unit downstream.
+    #[must_use]
+    pub fn substitute(&self, cwd: &Path, host: &str) -> Vec<String> {
+        let cwd_str = cwd.to_string_lossy();
+        self.command
+            .iter()
+            .map(|tok| tok.replace("{cwd}", &cwd_str).replace("{host}", host))
+            .collect()
+    }
 }
 
 /// Raw theme strings from `[theme]` in `config.toml`. Each colour field
@@ -516,8 +635,26 @@ impl Config {
             // means the *remote* user's home, not ours. `SshHost` passes
             // the tilde through to the remote shell via `shell_quote_path`.
         }
+        validate_tool_keys(&cfg.tools)?;
         Ok(cfg)
     }
+}
+
+/// Cross-entry validation: every tool must have a unique key and must
+/// not shadow a built-in dashboard binding. Per-entry validation
+/// (single-char key, non-empty command) already happened during
+/// deserialize; this is the layer that needs the full vec in hand.
+fn validate_tool_keys(tools: &[ToolBinding]) -> Result<(), ConfigError> {
+    let mut seen: std::collections::HashSet<char> = std::collections::HashSet::new();
+    for t in tools {
+        if RESERVED_KEY_CHARS.contains(&t.key) {
+            return Err(ConfigError::ToolKeyCollidesWithBuiltin(t.key));
+        }
+        if !seen.insert(t.key) {
+            return Err(ConfigError::DuplicateToolKey(t.key));
+        }
+    }
+    Ok(())
 }
 
 /// Paths agent-mux searches for `config.toml`, in priority order. The
@@ -1260,6 +1397,146 @@ ssh = "   "
         assert!(
             matches!(err, ConfigError::EmptySshTarget(ref n) if n == "devbox"),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_parses_tool_bindings() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "g"
+command = ["lazygit"]
+
+[[tools]]
+key = "v"
+name = "edit"
+command = ["nvim", "."]
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert_eq!(cfg.tools.len(), 2);
+        assert_eq!(cfg.tools[0].key, 'g');
+        assert_eq!(cfg.tools[0].name, None);
+        assert_eq!(cfg.tools[0].command, vec!["lazygit"]);
+        assert_eq!(cfg.tools[1].key, 'v');
+        assert_eq!(cfg.tools[1].name.as_deref(), Some("edit"));
+        assert_eq!(cfg.tools[1].command, vec!["nvim", "."]);
+    }
+
+    #[test]
+    fn load_from_rejects_multi_char_tool_key() {
+        // Single-char enforced at the deserialize boundary so the error
+        // points at the offending entry rather than failing later in
+        // dispatch-key-mapping land.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "gg"
+command = ["lazygit"]
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(matches!(err, ConfigError::Parse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn load_from_rejects_empty_tool_command() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "g"
+command = []
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(matches!(err, ConfigError::Parse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn load_from_rejects_tool_key_colliding_with_builtin() {
+        // `n` is the new-session binding; the user trying to bind a
+        // tool to `n` should see a loud error, not have their tool
+        // silently shadowed.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "n"
+command = ["whatever"]
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::ToolKeyCollidesWithBuiltin('n')),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_duplicate_tool_keys() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "g"
+command = ["lazygit"]
+
+[[tools]]
+key = "g"
+command = ["gitk"]
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::DuplicateToolKey('g')),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tool_binding_substitutes_cwd_and_host_tokens() {
+        // Plain `{cwd}` / `{host}` swap in; tokens without placeholders
+        // pass through; tokens with both placeholders get both swapped.
+        let t = ToolBinding {
+            key: 'x',
+            name: None,
+            command: vec![
+                "echo".into(),
+                "{cwd}".into(),
+                "on".into(),
+                "{host}".into(),
+                "literal {host}-and-{cwd}".into(),
+            ],
+        };
+        let subbed = t.substitute(Path::new("/work/proj"), "alpenglow");
+        assert_eq!(
+            subbed,
+            vec![
+                "echo".to_string(),
+                "/work/proj".into(),
+                "on".into(),
+                "alpenglow".into(),
+                "literal alpenglow-and-/work/proj".into(),
+            ]
         );
     }
 }

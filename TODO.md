@@ -47,9 +47,9 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 
 ### Worktrees & session workflow
 
-- add `WorktreeManager::list` + `WorktreeManager::remove` once a caller materializes (discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). Deferred to avoid speculative surface area. `#worktree`
+- add `WorktreeManager::list` once a caller materializes (discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). `remove` shipped 2026-05-19; `list` still deferred to avoid speculative surface area. `#worktree`
 - diff view (what an agent has changed against the base branch). `#worktree #review`
-- merge / discard workflow for completed sessions. `#worktree`
+- merge / discard workflow for completed sessions — the broader umbrella that the delete-worktree entry above is the first slice of. `#worktree`
 - design constraint (from user, 2026-05-16, originally captured against M1 but applies whenever worktree code paths grow): (a) switching between worktree-backed sessions must not approach claude-squad's 10+ second cost — every worktree-touching code path should hold the "switching never blocks on I/O" discipline; (b) worktree creation must not bake in local-only assumptions that would later need to be unwound for remote session creation. `#worktree #design`
 - decide behaviour when an attached tmux window is killed externally (drop session, mark dead, relaunch). `#attachment #dogfood`
 
@@ -57,6 +57,7 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 
 - extend `[theme]` schema beyond foreground colours: background colours, per-element modifier overrides (currently bold/dim/reversed are hardcoded), and richer keys (e.g. `[theme.header]` bold = true, fg = "..."). Today's flat per-element fg-only schema covers the common dogfood case; the more expressive shape waits until a real user-pain signal asks for it. `#config #theme`
 - design TOML schema for keybinds (action name → key combo). `#config`
+- custom action keybinds that launch terminal tools scoped to the selected session (raised by user 2026-05-19): motivating example is `lazygit` in the selected worktree, but the shape generalizes — user-defined keybinds in config that spawn a command with the selected session's cwd as the working directory. The existing `t: terminal` is a degenerate case (key=t, command=$SHELL). Open design questions: (a) launch surface — embedded PTY is the natural fit since it already handles return-to-dashboard on exit; full attach is heavier; (b) local-vs-remote routing — for remote sessions the command should run on the remote through the existing attach plumbing, not locally; (c) config schema — likely a `[[tools]]` array with `key`, `name`, `command` fields; (d) variable substitution — at minimum `{cwd}`, possibly `{branch}`, `{host}`. Couples with the keybinds TOML schema entry above; probably ships behind the same `[keybinds]` design. `#config #worktree #embedded-pty`
 - reload-on-edit (watch config file, re-apply). `#config`
 - env-var expansion in `workspace_folders` (e.g. `$HOME/work`, `$WORK_DIR/repos`). Tilde expansion ships today; env vars deferred. `#config`
 - expose previously-hardcoded thresholds: idle threshold (`IDLE_THRESHOLD` in `main.rs`, default 1h), remote poll interval (`REMOTE_POLL_INTERVAL` in `watcher.rs`, default 3s), and discovery max-age (`DISCOVERY_MAX_AGE` in `discovery.rs`, default 30d — added 2026-05-18 with the recency filter). All flagged in code comments. `#config`
@@ -66,6 +67,7 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 - footer keybind line is dense after the group-jump hints landed (2026-05-17): `j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · q: quit  ·  return: …` will truncate on narrow terminals. Not a regression (the line was already long) but worth a follow-up. Plausible shapes: (a) drop secondary hints (`t: terminal`, `n: new`) when terminal width < threshold; (b) hide the group-jump hints once the user has used them once (a "learned" signal); (c) split into two footer rows. Defer until dogfooding shows whether it actually bites. `#ui #footer`
 - larger move on return-to-dashboard discoverability: in inside-tmux mode, name the agent-mux window predictably (e.g. `agent-mux`) so the hint can become "switch-client -t agent-mux" instead of the generic "prefix+s" picker. Deferred — the footer hint shipped first to see whether it's enough in dogfooding before introducing a window-naming convention. `#ui #attachment`
 - decide UX when agent-mux is launched from inside an existing tmux session vs from a bare shell. `#ui #dogfood`
+- favorite projects/worktrees with a pinned section at the top of the sidebar (raised by user 2026-05-19): a way to mark frequently-attended sessions/projects and surface them above the host/project grouping. Open design questions: (a) favorite unit — project (stable across session resets), individual session/worktree (ephemeral but precise), or both with separate affordances; mixing units in one section risks awkwardness; (b) persistence — `~/.cache/agent-mux/favorites.json` is the cheap path, but living in config survives machine moves; (c) keybind — `f` to toggle favorite on the selected row (currently free in the dashboard map); (d) sort order within favorites — recency is the cheapest default, manual ordering is a meaningful UI lift. `#ui #sidebar`
 
 ### Discovery & catalog perf
 

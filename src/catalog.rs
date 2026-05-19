@@ -66,6 +66,17 @@ impl SessionCatalog {
         }
     }
 
+    /// Remove the session with the given id, returning it if found.
+    /// The dashboard calls this after a successful worktree-delete so
+    /// the row vanishes immediately rather than waiting for the next
+    /// discovery refresh to filter on the now-missing cwd. Returning
+    /// the removed [`Session`] lets the caller act on its
+    /// `transcript_path` / `host` without a second lookup.
+    pub fn remove_by_id(&mut self, id: &SessionId) -> Option<Session> {
+        let pos = self.sessions.iter().position(|s| s.id == *id)?;
+        Some(self.sessions.remove(pos))
+    }
+
     /// Replace every session currently in the catalog whose `host` is
     /// `host_id` with the given `fresh` set. Sessions belonging to
     /// other hosts are untouched.
@@ -238,6 +249,28 @@ mod tests {
         c.apply_live_panes(&host, &HashSet::new());
         assert_eq!(c.sessions()[0].has_live_pane, Some(false));
         assert_eq!(c.sessions()[1].has_live_pane, Some(false));
+    }
+
+    #[test]
+    fn remove_by_id_drops_the_matching_session_and_returns_it() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.add(session("b"));
+        c.add(session("c"));
+
+        let removed = c.remove_by_id(&SessionId("b".into())).expect("found");
+        assert_eq!(removed.id.0, "b");
+        let ids: Vec<&str> = c.sessions().iter().map(|s| s.id.0.as_str()).collect();
+        // 'a' and 'c' survive in original order; 'b' is gone.
+        assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn remove_by_id_returns_none_for_unknown_id() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        assert!(c.remove_by_id(&SessionId("nope".into())).is_none());
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

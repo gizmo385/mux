@@ -114,6 +114,55 @@ impl WorktreeManager {
         )?;
         Ok(path)
     }
+
+    /// Remove a worktree on `host` by shelling `git worktree remove
+    /// [--force] <path>` against `parent_repo`. Without `force`, git
+    /// refuses if the worktree has uncommitted changes — the dashboard's
+    /// delete-confirm modal re-runs with force set when the user
+    /// explicitly opts in.
+    ///
+    /// The branch the worktree was on is **not** deleted: matches
+    /// `git worktree remove`'s own default and keeps the merge/discard
+    /// decision in the user's hands. Cleaning up the transcript file
+    /// and the remote `agent-mux-<id>` tmux session are also explicitly
+    /// out of scope here — Claude Code and the user own those respectively.
+    ///
+    /// # Errors
+    /// Returns [`WorktreeError::GitFailed`] for any non-zero git exit
+    /// (most commonly: uncommitted changes without `--force`, or the
+    /// path not being registered as a worktree of `parent_repo`).
+    pub fn remove(
+        &self,
+        host: &dyn Host,
+        parent_repo: &Path,
+        worktree_path: &Path,
+        force: bool,
+    ) -> Result<(), WorktreeError> {
+        // Pre-clean agent-mux's own metadata directory. Every
+        // agent-mux-created worktree carries an untracked
+        // `.agent-mux/task.toml` written at create-time; without
+        // this step, `git worktree remove` would treat that file
+        // as a dirty worktree and refuse without `--force`. By
+        // removing the file we own first, git's safety net only
+        // trips on *actual* user work — preserving the modal's
+        // distinction between "clean delete" (default Enter) and
+        // "force delete" (`f` then Enter).
+        //
+        // Best-effort: a missing `.agent-mux/` or a transient rm
+        // failure just means git decides for itself, surfacing the
+        // same error the user would have hit before this fix.
+        let metadata_dir = worktree_path.join(".agent-mux");
+        let metadata_str = metadata_dir.to_string_lossy();
+        let _ = host.run(None, "rm", &["-rf", &metadata_str]);
+
+        let path_str = worktree_path.to_string_lossy();
+        let mut args: Vec<&str> = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&path_str);
+        run_git_via_host(host, parent_repo, &args)
+    }
 }
 
 /// Resolve the repo's default branch name on `host`.
@@ -548,6 +597,122 @@ mod tests {
         let host = LocalHost::new();
         let resolved = resolve_default_base_branch(&host, &clone);
         assert_eq!(resolved.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn remove_takes_a_clean_worktree_off_disk() {
+        // Create a worktree, then remove it. The directory should
+        // be gone and `git worktree list` should no longer list it
+        // — both observable from outside `WorktreeManager`, which
+        // pins the contract we care about (a removed worktree is
+        // *really* gone) without depending on git's internal admin
+        // file layout.
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("proj");
+        fs::create_dir(&repo).expect("mkdir proj");
+        init_repo(&repo);
+
+        let host = LocalHost::new();
+        let manager = WorktreeManager::new();
+        let path = manager
+            .create(&host, &repo, "main", "feature")
+            .expect("create worktree");
+        assert!(path.is_dir());
+
+        manager
+            .remove(&host, &repo, &path, false)
+            .expect("remove clean worktree");
+        assert!(!path.exists(), "worktree dir should be gone: {path:?}");
+
+        let listed = run_git_directly_capture(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !listed.contains(&path.to_string_lossy().into_owned()),
+            "removed worktree should not appear in `git worktree list`: {listed}"
+        );
+    }
+
+    #[test]
+    fn remove_refuses_dirty_worktree_without_force() {
+        // Mirror `git worktree remove`'s safety default: an uncommitted
+        // edit in the worktree blocks plain removal. The dashboard
+        // surfaces this back to the user, who re-confirms with force.
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("proj");
+        fs::create_dir(&repo).expect("mkdir proj");
+        init_repo(&repo);
+
+        let host = LocalHost::new();
+        let manager = WorktreeManager::new();
+        let path = manager
+            .create(&host, &repo, "main", "feature")
+            .expect("create worktree");
+        fs::write(path.join("README.md"), "dirty edit").expect("dirty up the worktree");
+
+        let err = manager
+            .remove(&host, &repo, &path, false)
+            .expect_err("dirty worktree should refuse non-force remove");
+        assert!(matches!(err, WorktreeError::GitFailed(_)), "got: {err:?}");
+        assert!(path.is_dir(), "dir should still exist after refusal");
+    }
+
+    #[test]
+    fn remove_with_force_accepts_dirty_worktree() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("proj");
+        fs::create_dir(&repo).expect("mkdir proj");
+        init_repo(&repo);
+
+        let host = LocalHost::new();
+        let manager = WorktreeManager::new();
+        let path = manager
+            .create(&host, &repo, "main", "feature")
+            .expect("create worktree");
+        fs::write(path.join("README.md"), "dirty edit").expect("dirty up the worktree");
+
+        manager
+            .remove(&host, &repo, &path, true)
+            .expect("force remove should succeed");
+        assert!(!path.exists(), "worktree dir should be gone: {path:?}");
+    }
+
+    #[test]
+    fn remove_errors_for_unknown_path() {
+        // A path that was never registered as a worktree of this repo
+        // surfaces as `GitFailed` rather than silently succeeding — the
+        // dashboard turns it into a status line so the user can tell
+        // something is wrong.
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("proj");
+        fs::create_dir(&repo).expect("mkdir proj");
+        init_repo(&repo);
+
+        let host = LocalHost::new();
+        let bogus = tmp.path().join("never-was-a-worktree");
+        let err = WorktreeManager::new()
+            .remove(&host, &repo, &bogus, false)
+            .expect_err("unknown worktree path should error");
+        assert!(matches!(err, WorktreeError::GitFailed(_)), "got: {err:?}");
+    }
+
+    /// Test helper: same as `run_git_directly` but captures and returns
+    /// stdout. Used by the remove tests to read `git worktree list`
+    /// without re-implementing the parse.
+    fn run_git_directly_capture(dir: &Path, args: &[&str]) -> String {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir).args(args);
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+        ] {
+            cmd.env_remove(var);
+        }
+        let out = cmd.output().expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     #[test]

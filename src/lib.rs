@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod dashboard;
+pub mod delete_worktree_modal;
 pub mod discovery;
 pub mod embedded_pty;
 pub mod host;

@@ -34,6 +34,9 @@ use agent_mux::dashboard::{
     first_session_index, is_pty_leader, matches_query, next_host_index, next_project_index,
     next_session_index, prev_host_index, prev_project_index, prev_session_index,
 };
+use agent_mux::delete_worktree_modal::{
+    DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
+};
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
@@ -241,9 +244,20 @@ struct App {
     config: Config,
     registry: RepoRegistry,
     modal: Option<NewSessionModal>,
+    /// Open delete-worktree confirmation modal. Kept as a sibling of
+    /// `modal` rather than collapsing both into one `enum` variant —
+    /// the open paths guard against opening one while the other is up,
+    /// so the at-most-one invariant is upheld at the call sites with
+    /// no shared `take()` plumbing to refactor.
+    delete_modal: Option<DeleteWorktreeModal>,
     create_tx: Sender<NewSessionResult>,
     create_rx: Receiver<NewSessionResult>,
     creating: Option<CreatingSession>,
+    /// Channel for completed worktree deletions. Same pattern as
+    /// `create_tx/rx`: spawn a background thread for the slow git call,
+    /// post the result here, drain on tick.
+    delete_tx: Sender<DeleteWorktreeResult>,
+    delete_rx: Receiver<DeleteWorktreeResult>,
     /// Channel for background remote-workspace scan results. Each
     /// `Connected` event spawns a scan thread for the host's
     /// `effective_workspace_folders`; the result lands here and
@@ -360,6 +374,18 @@ enum NewSessionResult {
     Failed(String),
 }
 
+/// Result of a background worktree-deletion thread. `Deleted` carries
+/// the session id so `drain_deletes` can call `remove_by_id` without
+/// re-resolving the selection (which may have moved by the time the
+/// background thread reports). `Failed` carries the message verbatim
+/// from `WorktreeError::Display` so the user sees git's stderr —
+/// most useful when the failure is "uncommitted changes, use --force"
+/// and the user needs to re-run with the force toggle.
+enum DeleteWorktreeResult {
+    Deleted(SessionId),
+    Failed(String),
+}
+
 /// One remote host's freshly-scanned repo list, returned from the
 /// background thread spawned on `Connected`. Drained each tick; the
 /// dashboard `reconcile_host`s the registry with the result so the
@@ -473,6 +499,7 @@ impl App {
 
         let registry = RepoRegistry::from_config(&config);
         let (create_tx, create_rx) = channel();
+        let (delete_tx, delete_rx) = channel();
         let (repo_scan_tx, repo_scan_rx) = channel();
 
         let mut hosts: HashMap<HostId, Arc<dyn Host>> = HashMap::new();
@@ -528,8 +555,11 @@ impl App {
             config,
             registry,
             modal: None,
+            delete_modal: None,
             create_tx,
             create_rx,
+            delete_tx,
+            delete_rx,
             repo_scan_tx,
             repo_scan_rx,
             creating: None,
@@ -897,6 +927,140 @@ impl App {
             }
         }
         None
+    }
+
+    /// Open the delete-worktree confirmation modal for the currently
+    /// selected session. No-op (with a status message) if the selection
+    /// isn't a worktree-backed session, the modal can't open. Also
+    /// declines if either the new-session modal or another delete
+    /// modal is already open — keeps the at-most-one-modal invariant.
+    fn open_delete_worktree(&mut self) {
+        if self.modal.is_some() || self.delete_modal.is_some() {
+            return;
+        }
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        if session.parent_repo.is_none() {
+            // Sessions started outside a worktree (a plain checkout,
+            // or `claude` against an arbitrary cwd) aren't deletable
+            // through this path — there's no parent repo to run
+            // `git worktree remove` against. Surface that rather than
+            // opening a modal whose Enter would always fail.
+            self.status = Some(format!(
+                "{} is not a worktree — nothing to delete",
+                session.project_dir.display()
+            ));
+            return;
+        }
+        let label = session.title.clone().unwrap_or_else(|| {
+            let id_str = session.id.0.as_str();
+            id_str
+                .get(id_str.len().saturating_sub(6)..)
+                .unwrap_or(id_str)
+                .to_string()
+        });
+        // `for_session` only returns `None` if `parent_repo` is missing,
+        // which we just ruled out — but defensively fall through to
+        // status rather than unwrapping.
+        match DeleteWorktreeModal::for_session(&session, label) {
+            Some(modal) => {
+                self.delete_modal = Some(modal);
+                self.status = None;
+            }
+            None => {
+                self.status =
+                    Some("could not open delete modal — session is not a worktree".to_string());
+            }
+        }
+    }
+
+    fn handle_delete_modal_key(&mut self, key: KeyEvent) {
+        let Some(mut modal) = self.delete_modal.take() else {
+            return;
+        };
+        match modal.handle_key(key) {
+            DeleteWorktreeKeyOutcome::Handled => self.delete_modal = Some(modal),
+            DeleteWorktreeKeyOutcome::Cancel => {}
+            DeleteWorktreeKeyOutcome::Submit {
+                session_id,
+                host_id,
+                parent_repo,
+                worktree_path,
+                force,
+            } => self.start_deleting(session_id, &host_id, parent_repo, worktree_path, force),
+        }
+    }
+
+    /// Dispatch the actual `git worktree remove` on a background
+    /// thread. Mirrors `start_creating`: the UI thread must never
+    /// block on a multi-second SSH round-trip, and a delete on a
+    /// large worktree can be measurably slow even locally.
+    fn start_deleting(
+        &mut self,
+        session_id: SessionId,
+        host_id: &HostId,
+        parent_repo: PathBuf,
+        worktree_path: PathBuf,
+        force: bool,
+    ) {
+        let Some(host) = self.hosts.get(host_id).cloned() else {
+            self.status = Some(format!(
+                "host {} not connected — cannot delete worktree",
+                host_id.as_str()
+            ));
+            return;
+        };
+        self.status = Some(format!("deleting worktree at {}…", worktree_path.display()));
+        let tx = self.delete_tx.clone();
+        std::thread::spawn(move || {
+            let outcome =
+                match WorktreeManager.remove(host.as_ref(), &parent_repo, &worktree_path, force) {
+                    Ok(()) => DeleteWorktreeResult::Deleted(session_id),
+                    Err(e) => DeleteWorktreeResult::Failed(format!("delete worktree: {e}")),
+                };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Drain any finished deletes. On success, remove the session
+    /// from the catalog so the row vanishes immediately, and — if
+    /// the embedded PTY was attached to the deleted session — drop
+    /// it and return focus to the sidebar (otherwise the user is
+    /// staring at a tmux pane whose cwd no longer exists).
+    fn drain_deletes(&mut self) {
+        while let Ok(result) = self.delete_rx.try_recv() {
+            match result {
+                DeleteWorktreeResult::Deleted(id) => {
+                    let removed = self.catalog.remove_by_id(&id);
+                    if let Some(emb) = self.embedded.as_ref()
+                        && emb.session_id == id
+                    {
+                        self.embedded = None;
+                        self.focus = Focus::Sidebar;
+                    }
+                    self.preview_cache.remove(&id);
+                    match removed {
+                        Some(s) => {
+                            self.status =
+                                Some(format!("deleted worktree at {}", s.project_dir.display()));
+                        }
+                        None => {
+                            // Session was already removed from the
+                            // catalog by something else (e.g. a
+                            // discovery refresh between modal open
+                            // and submit). The git side succeeded,
+                            // so report that — losing the row
+                            // earlier isn't a failure.
+                            self.status = Some("deleted worktree".to_string());
+                        }
+                    }
+                }
+                DeleteWorktreeResult::Failed(msg) => {
+                    self.status = Some(msg);
+                }
+            }
+        }
     }
 
     fn drain_updates(&mut self) {
@@ -1344,6 +1508,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         {
             app.status = Some(err);
         }
+        app.drain_deletes();
         if has_event {
             let raw = event::read()?;
             match raw {
@@ -1380,6 +1545,10 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             }
             if app.modal.is_some() {
                 app.handle_modal_key(key);
+                continue;
+            }
+            if app.delete_modal.is_some() {
+                app.handle_delete_modal_key(key);
                 continue;
             }
             // Editing-mode search owns the keyboard — composing the
@@ -1539,6 +1708,10 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.toggle_preview();
             ActionOutcome::Continue
         }
+        Action::DeleteWorktree => {
+            app.open_delete_worktree();
+            ActionOutcome::Continue
+        }
     }
 }
 
@@ -1555,6 +1728,7 @@ enum Action {
     NewSession,
     OpenSearch,
     TogglePreview,
+    DeleteWorktree,
 }
 
 fn action_for(key: KeyEvent) -> Option<Action> {
@@ -1581,6 +1755,7 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Some(Action::NewSession),
         KeyCode::Char('/') => Some(Action::OpenSearch),
         KeyCode::Char('p') => Some(Action::TogglePreview),
+        KeyCode::Char('d') => Some(Action::DeleteWorktree),
         _ => None,
     }
 }
@@ -1704,7 +1879,20 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     )));
     frame.render_widget(footer, layout[footer_idx]);
 
+    draw_modal_overlay(frame, app);
+}
+
+/// Overlay any open modal on top of the dashboard. At most one modal
+/// is up at a time (open-time guards in `open_new_session` /
+/// `open_delete_worktree` enforce that), so the order here is purely
+/// defensive — render new-session first so a stuck-both state stays
+/// visible rather than silently masking one. Extracted to keep `draw`
+/// under the 100-line clippy budget.
+fn draw_modal_overlay(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     if let Some(modal) = app.modal.as_mut() {
+        modal.draw(frame);
+    }
+    if let Some(modal) = app.delete_modal.as_ref() {
         modal.draw(frame);
     }
 }
@@ -1786,7 +1974,7 @@ fn compose_footer(
         String::new()
     };
     format!(
-        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · q: quit  ·  return: {return_hint}{suffix} "
+        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · d: delete · q: quit  ·  return: {return_hint}{suffix} "
     )
 }
 
@@ -2032,6 +2220,24 @@ mod tests {
         );
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(!s.contains("prefix+d"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_keybind_line_advertises_delete_action() {
+        // Pin that `d: delete` lands in the keybind line — a regression
+        // here would leave the action discoverable only by reading the
+        // source (it doesn't have a separate visible affordance the way
+        // `n: new` does via the modal it opens).
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
+        assert!(s.contains("d: delete"), "got: {s}");
     }
 
     #[test]

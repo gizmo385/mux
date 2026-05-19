@@ -1039,6 +1039,42 @@ mod tests {
     // master processes for ControlPersist's full 10-minute window
     // before they self-terminated.
 
+    /// Test-only wrapper around [`SshHost::connect_with_binary`] that retries
+    /// on `ErrorKind::ExecutableFileBusy` (Linux `ETXTBSY`).
+    ///
+    /// When `cargo test` runs the host tests in parallel, the test binary's
+    /// process is shared across threads. While test A is inside its
+    /// `fs::write(mock_ssh_A, ...)` call, a sibling test B's
+    /// `Command::spawn` may fork the test binary; that fork inherits test
+    /// A's still-open write fd. The inherited fd has `FD_CLOEXEC` set, but
+    /// `CLOEXEC` only fires on the child's *exec*: between fork and exec
+    /// there is a window where test A's exec on `mock_ssh_A` sees the
+    /// still-open inherited write fd and returns `ETXTBSY`. This is a
+    /// well-known Linux race with no clean fix short of serialising every
+    /// fork in the process, so we absorb it here with a short bounded
+    /// retry. Production callers go through [`SshHost::connect`], whose
+    /// target is the system `ssh` binary — that file is not being rewritten
+    /// under us, so the race cannot fire there and the retry would be dead
+    /// code. Keeping the retry test-only preserves that invariant.
+    #[cfg(unix)]
+    fn connect_with_binary_retrying_etxtbsy(
+        id: HostId,
+        ssh_target: String,
+        ssh_binary: PathBuf,
+    ) -> io::Result<SshHost> {
+        let mut delay = std::time::Duration::from_millis(2);
+        for _ in 0..10 {
+            match SshHost::connect_with_binary(id.clone(), ssh_target.clone(), ssh_binary.clone()) {
+                Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+                other => return other,
+            }
+        }
+        SshHost::connect_with_binary(id, ssh_target, ssh_binary)
+    }
+
     #[cfg(unix)]
     fn write_executable_mock_ssh(log_path: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1073,10 +1109,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ssh_host_lifecycle_invokes_connect_then_drop_with_matching_socket() {
-        // Pins three lifecycle contracts in one sequential test
-        // (split-into-three failed CI with `ExecutableFileBusy`: a
-        // parallel test's `fork()` briefly held a write fd to a
-        // mock-ssh script and the child's exec raced it):
+        // Pins three lifecycle contracts in one test. The ETXTBSY
+        // race that originally forced the consolidation is now
+        // absorbed by `connect_with_binary_retrying_etxtbsy`; the
+        // test stays unified because each step builds on the previous
+        // (connect → drop → check the log), not because splitting it
+        // would re-trip the race:
         //
         // 1. Connect uses `-fN -M`, `ControlPersist=600`, and
         //    `ConnectTimeout=5`. Losing any of these breaks the
@@ -1096,9 +1134,12 @@ mod tests {
         let mock = write_executable_mock_ssh(&log);
 
         {
-            let _host =
-                SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock)
-                    .unwrap();
+            let _host = connect_with_binary_retrying_etxtbsy(
+                HostId("devbox".into()),
+                "devbox".into(),
+                mock,
+            )
+            .unwrap();
             // Drop fires at end of scope.
         }
 
@@ -1448,7 +1489,8 @@ mod tests {
         let log = tmp.path().join("ssh-calls.log");
         let mock = write_executable_mock_ssh(&log);
         let host =
-            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+            connect_with_binary_retrying_etxtbsy(HostId("devbox".into()), "devbox".into(), mock)
+                .unwrap();
 
         host.run(None, "git", &["status", "--short"]).expect("run");
 
@@ -1474,7 +1516,8 @@ mod tests {
         let log = tmp.path().join("ssh-calls.log");
         let mock = write_executable_mock_ssh(&log);
         let host =
-            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+            connect_with_binary_retrying_etxtbsy(HostId("devbox".into()), "devbox".into(), mock)
+                .unwrap();
 
         host.run(Some(Path::new("/srv/work/repo")), "git", &["status"])
             .expect("run");
@@ -1501,7 +1544,8 @@ mod tests {
         let log = tmp.path().join("ssh-calls.log");
         let mock = write_executable_mock_ssh(&log);
         let host =
-            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+            connect_with_binary_retrying_etxtbsy(HostId("devbox".into()), "devbox".into(), mock)
+                .unwrap();
 
         host.run(
             None,
@@ -1537,7 +1581,8 @@ mod tests {
         let log = tmp.path().join("ssh-calls.log");
         let mock = write_executable_mock_ssh(&log);
         let host =
-            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+            connect_with_binary_retrying_etxtbsy(HostId("devbox".into()), "devbox".into(), mock)
+                .unwrap();
 
         host.run(Some(Path::new("~/work/repo")), "pwd", &[])
             .expect("run");
@@ -1562,7 +1607,8 @@ mod tests {
         let stdin_log = tmp.path().join("ssh-stdin.bin");
         let mock = write_executable_mock_ssh_capturing_stdin(&argv_log, &stdin_log);
         let host =
-            SshHost::connect_with_binary(HostId("devbox".into()), "devbox".into(), mock).unwrap();
+            connect_with_binary_retrying_etxtbsy(HostId("devbox".into()), "devbox".into(), mock)
+                .unwrap();
 
         let payload = "task = \"refactor parser\"\nbase_branch = \"main\"\n";
         host.write_file(Path::new("/srv/work/repo/.agent-mux/task.toml"), payload)

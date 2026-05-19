@@ -4,7 +4,15 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-M1 complete. M2 (remote hosts) substantially shipped: with `[hosts.<name>]` entries in the config, the dashboard surfaces sessions from SSH-reachable machines at startup, attention updates stream live (every 3s, over each host's existing `ControlMaster` connection), and `Enter` / `t` attach into the remote tmux. Remote portability and post-M5 remote session *creation* remain in `TODO.md`. M3 (inline preview) substantially shipped: `p` toggles a right-side pane that reads the selected session's recent transcript activity (user prompts, assistant prose, tool calls, tool results) without requiring an attach. M4 (attention notifications) shipped: when a session moves into `needs-input`, agent-mux fires an OS notification (libnotify on Linux, NSUserNotification on macOS) carrying the session's title and host. Per-episode and time-window suppression keep notification spam in check; user-facing on/off and quiet-hours knobs land in M5. **Post-M5 — embedded-PTY dashboard shipped 2026-05-18:** the default attach now hosts the active session inside a ratatui-rendered PTY widget next to the dashboard sidebar, instead of `tmux switch-client`-ing the whole terminal. The sidebar stays live while you work — attention transitions on other sessions surface without detaching. `--no-embed` opts back into the legacy flow.
+M0–M5 shipped; post-M5 work continues on the Shape B (embedded-PTY) dashboard and remote session creation. Highlights:
+
+- **M1 (session creation).** `n` picks a repo, names a task, picks a base branch; agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/` and launches `claude` inside it.
+- **M2 (remote hosts).** Configured `[hosts.<name>]` entries surface in the dashboard at startup. Attention updates stream live (3s polling over each host's `ControlMaster`); `Enter` / `t` route through the host abstraction so attach + spawn-terminal work locally and remotely with the same dispatch. Remote `find` portability for macOS remotes is the lone open item — see `TODO.md`.
+- **M3 (inline preview).** `p` toggles a right-side pane showing the selected session's recent transcript activity (prompts, assistant prose, tool calls, results) without attaching.
+- **M4 (attention notifications).** OS notifications (libnotify on Linux, NSUserNotification on macOS) fire when a session transitions into `needs-input`. Per-episode and time-window suppression keep the spam in check.
+- **M5 (customization).** `[notifications]` (`enabled`, `sound`, `disabled_hosts`) and `[theme]` (eight presets + per-element overrides) live in `~/.config/agent-mux/config.toml`. Run `agent-mux config` to see what's loaded; `agent-mux themes` for a coloured preview of every preset. Quiet-hours, keybind config, and reload-on-edit are deferred — see `TODO.md`.
+- **Post-M5 remote session creation.** `n` against a remote-host repo creates the worktree on the remote and launches `claude` over SSH; the new session surfaces in the dashboard via the normal discovery pipeline.
+- **Post-M5 embedded-PTY dashboard (Shape B), shipped 2026-05-18.** Pressing Enter hosts the active session inside a ratatui-rendered PTY widget alongside the dashboard sidebar instead of taking over the whole terminal. The sidebar stays live while you work — attention transitions on other sessions surface without detaching. `--no-embed` opts back into the legacy `tmux switch-client` flow.
 
 The dashboard runs (`cargo run`), discovers local Claude Code sessions, groups them under host headers (`── local ──`, then any configured SSH hosts alphabetical) with dim project sub-headers beneath each host, labels each row with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to a short session-id suffix), shows live attention state (● needs-input, ◐ working, ○ idle), dims the title when no live tmux pane matches the session (Enter will spin up a fresh `claude --resume` rather than fast-switch into an existing pane), and:
 
@@ -33,12 +41,14 @@ Optional `~/.config/agent-mux/config.toml`:
 ```toml
 workspace_folders = ["~/workspace", "~/code"]
 
-# Remote hosts (M2 partial — see Status above).
-# Each table is one SSH-reachable machine whose Claude Code
-# sessions show up alongside your local ones at startup.
+# Remote hosts (M2). Each table is one SSH-reachable machine whose
+# Claude Code sessions show up alongside your local ones at startup.
+# Per-host `workspace_folders` (post-M5) lets `n` create sessions on
+# the remote; omit it to inherit the top-level workspaces.
 [hosts.alpenglow]
 ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 # transcript_root = "~/.claude/projects"  # default; tilde-expanded
+# workspace_folders = ["~/work"]          # post-M5; inherits top-level if omitted
 
 # Notification behaviour (M5). Every field has a default; the whole
 # section is optional. Master toggle, audible cue, and per-host
@@ -76,13 +86,19 @@ The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; til
 
 ### Remote sessions
 
-Pressing `Enter` on a remote session runs `ssh -t <target> tmux attach -t <pane>` over the host's existing `ControlMaster` connection. The remote tmux's UI is what you interact with.
+Pressing `Enter` on a remote session runs `ssh -t <target> tmux attach -t <pane>` over the host's existing `ControlMaster` connection — by default the resulting tmux client lives inside the embedded pane next to the sidebar; with `--no-embed` it takes over your whole terminal as a foreground subprocess. Either way, what you interact with is the remote tmux's UI.
 
-**Nested-tmux gotcha:** if you run agent-mux from *inside* a local tmux session and then attach to a remote, you end up with local-tmux > remote-tmux nesting, and both servers will see the same prefix key. To send a prefix to the inner (remote) tmux, send the local prefix twice (e.g. `C-b C-b` if your prefix is `C-b`) — that's the standard tmux passthrough convention. If you live inside tmux all day, the common fix is to configure the remote tmux to use a different prefix (e.g. `C-a`) so the keys don't collide at all.
+**Prefix collisions when nesting tmux.** Running agent-mux from inside an outer tmux puts you in a multi-layer prefix situation:
 
-If you run agent-mux from a bare shell, attaching to a remote is single-layer — agent-mux suspends, ssh runs in the same terminal, only the remote tmux is involved, no collision.
+- Outer tmux owns its prefix (default `C-b`) — the user's normal way to manage their tmux session.
+- agent-mux's embedded-PTY leader is `C-a esc` — pressing `C-a` then `esc` returns focus to the sidebar without killing the inner tmux. `C-a` was picked to *avoid* colliding with tmux's `C-b` default.
+- The tmux server running inside the embedded pane (or the remote tmux you SSH-attached to) owns its own prefix.
 
-**When there's no remote pane to attach to:** if no remote tmux pane has `pane_current_path` matching the session's directory (e.g. the remote tmux server was restarted, or the original window was killed), agent-mux falls back to `tmux new-session -A -s agent-mux-<conv-id> -c <cwd> claude --resume <conv-id>` on the remote — creating a fresh remote tmux session named after the conversation, running `claude --resume`, and attaching the client. `-A` makes this idempotent: a second attach against the same conversation reuses the same remote tmux session rather than spawning a parallel `claude --resume` that would race on the transcript.
+If you've already remapped your outer or remote tmux to use `C-a`, that *will* collide with agent-mux's leader. Workarounds: remap one side (the most common move is configuring remote tmux to use a separate prefix like `C-x`), or use the standard tmux passthrough — send the conflicting prefix twice to pass it through to the inner tmux.
+
+A leader-chord config knob is on the roadmap (`#post-m5 #embedded-pty` in `TODO.md`) for users who can't avoid the `C-a` collision.
+
+**When there's no remote pane to attach to.** If no remote tmux pane has `pane_current_path` matching the session's directory (e.g. the remote tmux server was restarted, or the original window was killed), agent-mux falls back to `tmux new-session -A -s agent-mux-<conv-id> -c <cwd> claude --resume <conv-id>` on the remote — creating a fresh remote tmux session named after the conversation, running `claude --resume`, and attaching the client. `-A` makes this idempotent: a second attach against the same conversation reuses the same remote tmux session rather than spawning a parallel `claude --resume` that would race on the transcript.
 
 These `agent-mux-<id>` tmux sessions accumulate on the remote over time. Clean them up with `tmux kill-session -t agent-mux-<id>` when a conversation is truly done.
 
@@ -98,13 +114,17 @@ After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hoo
 
 `cargo run` to start the binary. `cargo build --release` for an optimised build. `cargo test` for the test suite. See `PROCESS.md` for the canonical-commands list.
 
-## CLI subcommands
+## CLI subcommands and flags
 
-`agent-mux` with no arguments launches the dashboard. Two read-only subcommands surface what's tunable without making the user dig through this README:
+`agent-mux` with no arguments launches the dashboard in embedded-PTY mode (post-M5 default). Two read-only subcommands surface what's tunable without making the user dig through this README:
 
 - `agent-mux themes` — coloured browser of every built-in theme preset, each element rendered in its actual colour so you can pick a palette by eye before editing the config.
 - `agent-mux config` — prints the current resolved config (which path was loaded, parsed `workspace_folders` / `hosts` / `notifications` / theme) followed by a reference TOML skeleton documenting every key with its default. The status block answers "is my config actually being read?" without log-spelunking; the reference is copy-pasteable into `~/.config/agent-mux/config.toml`.
 - `agent-mux help` / `--help` — subcommand overview.
+
+Flags for the dashboard:
+
+- `--no-embed` — disable the embedded PTY pane and revert to the legacy attach behaviour (`tmux switch-client` from inside tmux, `tmux attach` as a foreground subprocess outside). For users who prefer agent-mux to hand off the whole terminal rather than host a pane.
 
 Stdout-detection: `themes` emits ANSI escapes only when stdout is a real terminal; piping to `less -R` works, piping to a non-`-R` pager or a file produces plain text.
 

@@ -400,7 +400,7 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(out)?;
     writeln!(out, "USAGE:")?;
-    writeln!(out, "  agent-mux                Launch the dashboard TUI.")?;
+    writeln!(out, "  agent-mux [--no-embed]   Launch the dashboard TUI.")?;
     writeln!(
         out,
         "  agent-mux themes         Show every built-in theme preset with colour samples."
@@ -410,6 +410,24 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
         "  agent-mux config         Print every config key, its default, and a description."
     )?;
     writeln!(out, "  agent-mux help           Show this help.")?;
+    writeln!(out)?;
+    writeln!(out, "FLAGS:")?;
+    writeln!(
+        out,
+        "  --no-embed               Disable the embedded PTY pane (post-M5 default) and"
+    )?;
+    writeln!(
+        out,
+        "                           revert to legacy `tmux switch-client` / foreground"
+    )?;
+    writeln!(
+        out,
+        "                           `tmux attach` behaviour. Useful when you prefer"
+    )?;
+    writeln!(
+        out,
+        "                           agent-mux to hand off the whole terminal."
+    )?;
     writeln!(out)?;
     writeln!(
         out,

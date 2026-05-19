@@ -22,7 +22,7 @@ The target user is a single developer who already lives in the terminal, already
 - **Dashboard** — the agent-mux TUI: the list of all known sessions and their states.
 - **Transcript** — the JSONL file Claude Code writes for each conversation (under `~/.claude/projects/<hash>/<conversation-id>.jsonl`). Source of truth for what a session is doing.
 - **Attention state** — a session's current status, derived from its transcript: `needs-input`, `working`, or `idle`.
-- **Attachment** — the mechanism by which the user interacts with a session. For M0–M5 this is a `tmux` window; the abstraction allows for other backends later.
+- **Attachment** — the mechanism by which the user interacts with a session. For M0–M5 this was a foreground `tmux` window (the user's whole terminal took the session's place); post-M5 the default is an embedded PTY pane inside the dashboard, hosting the same `tmux attach` invocation but as a child process rather than a screen handoff. The `AttachmentDriver` trait abstracts both modes so callers don't know the difference; users select via `--no-embed`.
 
 ## Functionality
 
@@ -34,7 +34,7 @@ What agent-mux does, in user-observable terms.
 - **Spawn a new session (M1).** From the dashboard, the user picks a repo from the registry, names a task, and picks a base branch; agent-mux creates a git worktree, starts `claude` inside it in a new tmux window, and registers the resulting session. The user is in the new session immediately. Worktree-backed sessions group under their parent repo's header in the dashboard (resolved from each cwd's `.git` pointer file at discovery time), so a session in `discord` and one in a `discord-<task>` worktree share one project group instead of fragmenting into per-worktree entries.
 - **Attach.** Pressing Enter on a session opens the active session inside an embedded terminal pane occupying the right side of the dashboard; the dashboard list collapses to a compact ~40-column sidebar on the left. Inside the pane the user sees their real tmux + Claude Code session and can type, paste, use slash commands, anything Claude Code supports — agent-mux is just hosting the terminal tmux runs in. The sidebar updates live while the embedded pane has focus, so the user can see attention transitions on other sessions without detaching. `Ctrl-a Esc` returns focus to the sidebar without killing the PTY; pressing Enter on a different row drops the old PTY and attaches to the new session. `--no-embed` opts back into the legacy `tmux switch-client` / `SuspendAndRun` flow for users who prefer it.
 - **Spawn terminal in session cwd.** A keybind opens a new tmux window in the session's working directory, so the user can run shell commands alongside Claude Code without leaving agent-mux's mental model.
-- **Remote sessions (M2).** Sessions on configured SSH hosts appear in the same dashboard. Attaching SSH-tunnels into the remote tmux. Attention state for remote sessions is detected the same way as local — by watching the remote transcript file — over the existing SSH connection.
+- **Remote sessions (M2).** Sessions on configured SSH hosts appear in the same dashboard. Attaching opens an `ssh -t target tmux attach …` inside the embedded pane (or as a foreground subprocess with `--no-embed`) — same dispatch as local. Attention state for remote sessions is detected the same way as local: by watching the remote transcript file over the existing SSH connection. Post-M5: `n` against a remote-host repo creates the worktree on the remote and spawns `claude` there, surfacing the new session in the dashboard via the normal discovery pipeline.
 - **Attention notifications.** When a session moves from `working` or `idle` into `needs-input`, the dashboard updates and (eventually) the user receives an OS-level notification.
 - **Inline preview (M3).** Each session row shows the last few transcript entries — recent tool calls, the most recent assistant message — without requiring the user to attach.
 
@@ -75,12 +75,17 @@ Out of scope for M4: detection of agent-mux's terminal having focus (defer to do
 Goal: themes and custom keybinds.
 Scope: TOML config schema for themes and keybindings; reload-on-edit; documented defaults. Also exposes the previously-hardcoded thresholds (idle threshold, remote poll interval) and the M4 notification suppression knobs (on/off, sound, quiet hours, per-host suppression).
 
-**Post-M5.** Direction depends on M3 findings and dogfooding signal. Likely candidates: diff view (what an agent has changed against the base branch), merge / discard workflow for completed sessions, remote session creation, Claude Code hooks integration for richer attention signals. If the M3 preview experiment suggests a full chat surface is worth building, also plan a Shape B/D transition. The order will follow what M0–M5 dogfooding surfaces.
+**Post-M5.** Two arcs landed off the back of M5 dogfooding:
+
+- **Remote session creation.** `n` against a remote-host repo creates the worktree on the remote (via the `Host` trait's `run` + `write_file` primitives) and spawns `claude` over SSH. Surfaces in the dashboard through normal discovery.
+- **Shape B — embedded-PTY dashboard.** The M3 inline-preview experiment surfaced enough signal — "see other sessions while interacting with one" — to justify the Shape B transition the `AttachmentDriver` trait was designed to allow. The default attach now hosts a pseudoterminal inside the dashboard's TUI rather than handing off the whole terminal; tmux still runs as before, just inside our pane. `--no-embed` opts back into the legacy flow.
+
+Still on the table: diff view (what an agent has changed against the base branch), merge / discard workflow for completed sessions, Claude Code hooks integration for richer attention signals, embedded-PTY polish (F5+ key codes, leader-chord config knob, mouse-on-sidebar). Order will follow what dogfooding surfaces.
 
 ## Out of scope
 
-- **Replacing tmux.** agent-mux runs on top of tmux through M5. A future post-M5 milestone might add an alternative backend, but tmux is the only attachment in scope for the foreseeable plan.
-- **Replacing Claude Code.** agent-mux does not implement a chat UI in M0–M5. The user always interacts with the real Claude Code. agent-mux *spawns* Claude Code sessions in M1 but does not configure or update Claude Code itself.
+- **Replacing tmux.** agent-mux runs on top of tmux. Post-M5's embedded-PTY mode hosts the terminal that tmux runs in, but tmux still owns panes-within-tmux, scrollback, copy mode, and session persistence across agent-mux restarts. A no-tmux Shape B (PTY hosting `claude` directly) is *possible* given the embedded infrastructure but would lose persistence and remote ergonomics; not in scope for the foreseeable plan.
+- **Replacing Claude Code.** agent-mux does not implement a chat UI. The user always interacts with the real Claude Code through tmux — the embedded pane just hosts the terminal tmux + Claude Code run in. agent-mux *spawns* Claude Code sessions (M1 locally, post-M5 remotely) but does not configure or update Claude Code itself.
 - **Other agents.** Cursor, Aider, generic-LLM CLIs — none of these are in scope. Claude Code only.
 - **Windows-native.** Targets Linux and macOS terminals. WSL is the only supported Windows path.
 - **Collaboration features.** Single user, single dashboard instance. No shared state across users or machines (other than the user logging in to their own remote hosts).

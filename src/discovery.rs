@@ -117,9 +117,16 @@ pub fn discover_with_cutoff(
         .zip(exists.iter().copied())
         .collect();
 
-    // Phase 3 — bulk-read task.toml only for project_dirs that
-    // actually exist. NotFound results land per-path; we map them to
-    // "no override title" without failing the batch.
+    // Phase 3 — bulk-read task.toml and the worktree `.git` pointer
+    // file in one round-trip each, only for project_dirs that actually
+    // exist. NotFound results land per-path and turn into "no override
+    // title" / "no parent repo" rather than failing the batch. Reading
+    // `.git` lets the dashboard group worktree-backed sessions under
+    // their parent repo instead of treating each worktree as its own
+    // project (see `worktree::parse_parent_repo`); for a regular
+    // checkout `.git` is a directory and `read_many` returns
+    // `NotFound` (its remote `[ -f $p ]` test rejects directories),
+    // which surfaces as `parent_repo = None` — exactly what we want.
     let task_dirs: Vec<&PathBuf> = unique_dirs
         .iter()
         .filter(|d| *exists_by_dir.get(d.as_path()).unwrap_or(&false))
@@ -137,6 +144,20 @@ pub fn discover_with_cutoff(
         .filter_map(|(d, r)| r.ok().map(|content| (d, content)))
         .collect();
 
+    let git_pointer_paths: Vec<PathBuf> = task_dirs
+        .iter()
+        .map(|d| worktree::git_pointer_path(d))
+        .collect();
+    let git_pointer_path_refs: Vec<&Path> =
+        git_pointer_paths.iter().map(PathBuf::as_path).collect();
+    let git_pointer_results = host.read_many(&git_pointer_path_refs)?;
+    let git_pointer_by_dir: HashMap<&Path, String> = task_dirs
+        .iter()
+        .map(|d| d.as_path())
+        .zip(git_pointer_results)
+        .filter_map(|(d, r)| r.ok().map(|content| (d, content)))
+        .collect();
+
     // Phase 4 — assemble sessions from the now-resolved data. No I/O
     // beyond this point; this loop is pure CPU over in-memory inputs.
     let mut sessions = Vec::with_capacity(partials.len());
@@ -147,6 +168,9 @@ pub fn discover_with_cutoff(
         let task_toml = task_toml_by_dir
             .get(partial.project_dir.as_path())
             .map(String::as_str);
+        let git_pointer = git_pointer_by_dir
+            .get(partial.project_dir.as_path())
+            .map(String::as_str);
         if let Some(s) = assemble_session(
             host.id(),
             &partial.stat.path,
@@ -154,6 +178,7 @@ pub fn discover_with_cutoff(
             &partial.content,
             project_dir_exists,
             task_toml,
+            git_pointer,
             partial.attention,
         ) {
             sessions.push(s);
@@ -168,6 +193,10 @@ pub fn discover_with_cutoff(
 /// [`build_session`] (single-shot reads for the live-discovery path)
 /// and [`discover_with_cutoff`] (bulk reads at startup) compose
 /// around this function.
+#[allow(clippy::too_many_arguments)] // pure-data assembly; bundling into a
+// struct would just push the field-by-field threading one level up to the
+// two call sites (bulk discovery + single-shot build_session) without
+// reducing the actual coupling.
 fn assemble_session(
     host_id: &HostId,
     transcript_path: &Path,
@@ -175,6 +204,7 @@ fn assemble_session(
     transcript_content: &str,
     project_dir_exists: bool,
     task_toml_content: Option<&str>,
+    git_pointer_content: Option<&str>,
     attention: Attention,
 ) -> Option<Session> {
     let id = SessionId(transcript_path.file_stem()?.to_str()?.to_string());
@@ -190,6 +220,7 @@ fn assemble_session(
         .and_then(|raw| worktree::parse_task_metadata(raw).ok())
         .map(|m| m.task);
     let title = task_title.or(meta.ai_title).or(meta.first_user_message);
+    let parent_repo = git_pointer_content.and_then(worktree::parse_parent_repo);
     Some(Session {
         id,
         host: host_id.clone(),
@@ -198,6 +229,7 @@ fn assemble_session(
         last_activity: mtime,
         attention,
         title,
+        parent_repo,
         has_live_pane: None,
     })
 }
@@ -236,11 +268,15 @@ pub fn build_session(
         .clone()
         .unwrap_or_else(|| fallback_dir(transcript_path));
     let exists = host.is_dir(&project_dir);
-    let task_toml = if exists {
-        host.read_to_string(&worktree::task_metadata_path(&project_dir))
-            .ok()
+    let (task_toml, git_pointer) = if exists {
+        (
+            host.read_to_string(&worktree::task_metadata_path(&project_dir))
+                .ok(),
+            host.read_to_string(&worktree::git_pointer_path(&project_dir))
+                .ok(),
+        )
     } else {
-        None
+        (None, None)
     };
     Ok(assemble_session(
         host.id(),
@@ -249,6 +285,7 @@ pub fn build_session(
         &content,
         exists,
         task_toml.as_deref(),
+        git_pointer.as_deref(),
         Attention::Unknown,
     ))
 }
@@ -429,6 +466,71 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id.0, "abc-123");
         assert_eq!(sessions[0].project_dir, cwd);
+    }
+
+    #[test]
+    fn discovers_session_with_parent_repo_when_cwd_is_a_worktree() {
+        // End-to-end: a transcript whose `cwd` is a git worktree must
+        // surface `Session.parent_repo = Some(<parent>)`, derived from
+        // the worktree's `.git` pointer file. This is what lets the
+        // dashboard group worktree-backed sessions under the parent
+        // repo header instead of fragmenting per-worktree.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        // Lay down a `.git` pointer file in the cwd so the discovery
+        // bulk-read picks it up. The exact `worktrees/<id>` suffix
+        // doesn't matter for parsing — only the segment up to
+        // `/.git/worktrees/` matters.
+        let parent_repo = cwd.parent().unwrap().join("the-parent");
+        create_dir_all(&parent_repo).unwrap();
+        fs::write(
+            cwd.join(".git"),
+            format!(
+                "gitdir: {}/.git/worktrees/cwd-task\n",
+                parent_repo.display()
+            ),
+        )
+        .unwrap();
+
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("wt.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_dir, cwd);
+        assert_eq!(
+            sessions[0].parent_repo.as_deref(),
+            Some(parent_repo.as_path())
+        );
+    }
+
+    #[test]
+    fn discovers_session_with_no_parent_repo_for_plain_checkout() {
+        // Regular-checkout session: `.git` is a directory, not a
+        // pointer file. The bulk-read should return `NotFound`
+        // (LocalHost::read_many → fs::read_to_string of a directory
+        // errors with IsADirectory on Unix; either way it's an Err)
+        // and parent_repo should land as `None` — grouping falls
+        // through to project_dir.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        // Plain .git directory, no pointer file.
+        create_dir_all(cwd.join(".git")).unwrap();
+
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("plain.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].parent_repo, None);
     }
 
     #[test]

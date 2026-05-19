@@ -98,6 +98,13 @@ struct CachedSession {
     last_activity_secs: i64,
     title: Option<String>,
     attention: CachedAttention,
+    /// Parent repo path when `project_dir` is a git worktree. Optional
+    /// and marked `#[serde(default)]` so caches written by earlier
+    /// builds (no such field) still deserialise; those rows degrade to
+    /// grouping by `project_dir` until the next live discovery
+    /// refreshes them with the actual parent.
+    #[serde(default)]
+    parent_repo: Option<PathBuf>,
 }
 
 /// Parallel of [`Attention`] for the wire format. Lives here (not
@@ -121,6 +128,7 @@ impl CachedSession {
             last_activity_secs: systemtime_to_epoch_secs(s.last_activity),
             title: s.title.clone(),
             attention: s.attention.into(),
+            parent_repo: s.parent_repo.clone(),
         }
     }
 
@@ -133,6 +141,7 @@ impl CachedSession {
             last_activity: epoch_secs_to_systemtime(self.last_activity_secs),
             attention: self.attention.into(),
             title: self.title,
+            parent_repo: self.parent_repo,
             // Tmux pane state is ephemeral; the runtime pane poller
             // will set this on its first tick. Anything cached here
             // would be stale before the user could read it.
@@ -194,6 +203,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             attention: Attention::NeedsInput,
             title: Some(format!("task {id}")),
+            parent_repo: Some(PathBuf::from(format!("/repos/{id}"))),
             has_live_pane: None,
         }
     }
@@ -240,6 +250,33 @@ mod tests {
         assert_eq!(r.last_activity, s.last_activity);
         assert_eq!(r.attention, s.attention);
         assert_eq!(r.title, s.title);
+        assert_eq!(r.parent_repo, s.parent_repo);
+    }
+
+    #[test]
+    fn read_legacy_cache_without_parent_repo_field_still_parses() {
+        // Caches written by builds before parent_repo landed lack the
+        // field. `#[serde(default)]` on `CachedSession.parent_repo`
+        // lets them deserialise — those rows degrade to grouping by
+        // `project_dir` until the next live discovery refreshes them.
+        // Pin that contract so a future serde tweak can't silently
+        // break first-paint for users with stale caches on disk.
+        let dir = TempDir::new().unwrap();
+        let host = HostId("legacy".into());
+        let legacy_json = r#"[
+            {
+                "id": "old",
+                "project_dir": "/proj/old",
+                "transcript_path": "/t/old.jsonl",
+                "last_activity_secs": 1700000000,
+                "title": null,
+                "attention": "idle"
+            }
+        ]"#;
+        fs::write(cache_file(dir.path(), &host), legacy_json).unwrap();
+        let read = read_for_host(dir.path(), &host);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].parent_repo, None);
     }
 
     #[test]

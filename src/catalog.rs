@@ -118,6 +118,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH,
             attention: Attention::Unknown,
             title: None,
+            parent_repo: None,
             has_live_pane: None,
         }
     }

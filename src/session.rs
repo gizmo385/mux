@@ -61,6 +61,14 @@ pub struct Session {
     /// `None` means "no signal beyond the cwd" and the UI falls back to cwd
     /// alone.
     pub title: Option<String>,
+    /// If `project_dir` is a git worktree, the path of the worktree's
+    /// parent repo (resolved from the `gitdir: …/.git/worktrees/…`
+    /// pointer file). `None` for sessions in a regular checkout or in
+    /// a non-git directory. The dashboard groups sessions by
+    /// `parent_repo.unwrap_or(project_dir)` so worktree-backed sessions
+    /// land under one header alongside the parent repo's own sessions
+    /// instead of each worktree getting its own project group.
+    pub parent_repo: Option<PathBuf>,
     /// Whether the session's host has a live tmux pane whose
     /// `pane_current_path` matches `project_dir`. `Some(true)` means
     /// Enter is a fast switch into an existing pane; `Some(false)`

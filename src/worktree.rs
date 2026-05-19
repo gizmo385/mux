@@ -159,6 +159,39 @@ pub fn task_metadata_path(worktree: &Path) -> PathBuf {
     worktree.join(METADATA_PATH)
 }
 
+/// Relative path of the `.git` file/dir inside a working directory.
+/// In a regular checkout this is a directory; in a worktree it's a
+/// pointer file containing `gitdir: <parent-repo>/.git/worktrees/<id>`.
+/// Exposed so `discovery` can request bulk reads through `Host::read_many`
+/// without duplicating the path convention.
+#[must_use]
+pub fn git_pointer_path(working_dir: &Path) -> PathBuf {
+    working_dir.join(".git")
+}
+
+/// Parse the content of a worktree's `.git` pointer file and return
+/// the parent repo's working-tree path.
+///
+/// Git's worktree pointer format is one line: `gitdir: <abs-path>` where
+/// `<abs-path>` ends in `/.git/worktrees/<name>`. Stripping that suffix
+/// yields the parent repo's `.git` directory; one more pop yields the
+/// parent repo's working tree, which is what the dashboard groups on.
+///
+/// Returns `None` for any content that doesn't match the worktree
+/// pointer shape (including `.git` being a directory and therefore not
+/// readable as a file — that case turns into a `NotFound`/`IsADirectory`
+/// at the caller, never reaches this function).
+#[must_use]
+pub fn parse_parent_repo(git_pointer_contents: &str) -> Option<PathBuf> {
+    let first = git_pointer_contents.lines().next()?.trim();
+    let rest = first.strip_prefix("gitdir:")?.trim();
+    let (parent, _) = rest.split_once("/.git/worktrees/")?;
+    if parent.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(parent))
+}
+
 fn write_task_metadata(
     host: &dyn Host,
     worktree: &Path,
@@ -337,6 +370,51 @@ mod tests {
         assert!(slugify("").is_none());
         assert!(slugify("!!!").is_none());
         assert!(slugify("   ").is_none());
+    }
+
+    #[test]
+    fn parse_parent_repo_extracts_path_from_pointer_file() {
+        // Canonical Git worktree pointer shape — `.git` is a regular
+        // file whose first line is `gitdir: <abs>/.git/worktrees/<name>`.
+        // The parent repo's *working tree* is everything to the left of
+        // `/.git/worktrees/…`. Pin the exact shape because the dashboard
+        // groups on this — a regression that returns the parent's `.git`
+        // dir instead of the worktree would mis-group every session.
+        let parent =
+            parse_parent_repo("gitdir: /Users/dev/work/myproj/.git/worktrees/myproj-fix-bug\n");
+        assert_eq!(parent.as_deref(), Some(Path::new("/Users/dev/work/myproj")));
+    }
+
+    #[test]
+    fn parse_parent_repo_tolerates_no_trailing_newline_and_extra_whitespace() {
+        // Real-world pointer files we've observed (e.g. `cat
+        // ~/workspace/<wt>/.git`) have a trailing newline; defensive
+        // input may not. Both must parse the same.
+        let no_nl = parse_parent_repo("gitdir: /a/b/.git/worktrees/x");
+        assert_eq!(no_nl.as_deref(), Some(Path::new("/a/b")));
+        let extra_space = parse_parent_repo("gitdir:   /a/b/.git/worktrees/x  \n");
+        assert_eq!(extra_space.as_deref(), Some(Path::new("/a/b")));
+    }
+
+    #[test]
+    fn parse_parent_repo_returns_none_for_non_worktree_content() {
+        // Anything that isn't a worktree pointer must not synthesize a
+        // parent. Covers: arbitrary text (a stray file someone named
+        // `.git`), a config file with a `gitdir` line that points at
+        // something other than a worktree subdir, and an empty body.
+        assert!(parse_parent_repo("hello world").is_none());
+        assert!(parse_parent_repo("").is_none());
+        assert!(parse_parent_repo("gitdir: /some/path").is_none());
+        assert!(parse_parent_repo("gitdir: /some/.git/objects").is_none());
+    }
+
+    #[test]
+    fn parse_parent_repo_ignores_lines_after_first() {
+        // Git pointer files are single-line, but be lenient: only the
+        // first line is the pointer. Don't fail on a trailing comment
+        // or an editor-added line.
+        let with_trailer = parse_parent_repo("gitdir: /a/b/.git/worktrees/x\nsome editor footer\n");
+        assert_eq!(with_trailer.as_deref(), Some(Path::new("/a/b")));
     }
 
     #[test]

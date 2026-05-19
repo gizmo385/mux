@@ -75,12 +75,22 @@ where
         rows.push(DisplayRow::HostHeader(host.clone()));
         let session_idxs = by_host.remove(&host).unwrap_or_default();
 
+        // Worktree-backed sessions group under their parent repo so a
+        // session created from `discord` and one from a `discord-<task>`
+        // worktree share one project header instead of fragmenting into
+        // per-worktree groups. `parent_repo` is `Some` only when the
+        // session's cwd is a git worktree (see `Session.parent_repo` and
+        // `worktree::parse_parent_repo`); regular checkouts and external
+        // (non-git) cwds fall through to grouping by `project_dir` as
+        // before. Sessions keep their actual `project_dir` — only the
+        // grouping key changes.
         let mut by_project: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for &i in &session_idxs {
-            by_project
-                .entry(sessions[i].project_dir.clone())
-                .or_default()
-                .push(i);
+            let key = sessions[i]
+                .parent_repo
+                .clone()
+                .unwrap_or_else(|| sessions[i].project_dir.clone());
+            by_project.entry(key).or_default().push(i);
         }
 
         // Order projects: most-recent-session desc, then by path (stable
@@ -545,6 +555,17 @@ mod tests {
         seconds_ago: u64,
         title: Option<&str>,
     ) -> Session {
+        session_with_parent(id, host, project, None, seconds_ago, title)
+    }
+
+    fn session_with_parent(
+        id: &str,
+        host: &str,
+        project: &str,
+        parent_repo: Option<&str>,
+        seconds_ago: u64,
+        title: Option<&str>,
+    ) -> Session {
         Session {
             id: SessionId(id.to_string()),
             host: HostId(host.to_string()),
@@ -553,6 +574,7 @@ mod tests {
             last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(10_000 - seconds_ago),
             attention: Attention::Unknown,
             title: title.map(str::to_string),
+            parent_repo: parent_repo.map(PathBuf::from),
             has_live_pane: None,
         }
     }
@@ -627,6 +649,78 @@ mod tests {
         assert_eq!(
             l,
             vec!["H:local", "P:/p1", "S:p1-b", "S:p1-a", "P:/p2", "S:p2-x"]
+        );
+    }
+
+    #[test]
+    fn worktree_session_groups_under_parent_repo_header() {
+        // Regression for the dogfooded issue: a session in `/discord`
+        // and a worktree-backed session in `/discord-fix-bug` (parent
+        // = `/discord`) used to land under two separate project
+        // headers. They must share one header keyed by the parent
+        // repo path, with the worktree session still pointing at its
+        // own `project_dir`.
+        let s = vec![
+            session_with_parent("plain", "local", "/discord", None, 100, None),
+            session_with_parent(
+                "worktree",
+                "local",
+                "/discord-fix-bug",
+                Some("/discord"),
+                10,
+                None,
+            ),
+        ];
+        let l = layout(&s);
+        assert_eq!(
+            l,
+            vec!["H:local", "P:/discord", "S:worktree", "S:plain"],
+            "worktree should fold into /discord's group, not get its own header"
+        );
+    }
+
+    #[test]
+    fn two_worktrees_of_the_same_repo_share_one_header() {
+        // Two worktrees of `/discord`, no plain-checkout session, must
+        // still collapse to a single `/discord` project header.
+        let s = vec![
+            session_with_parent(
+                "wt1",
+                "local",
+                "/discord-fix-bug",
+                Some("/discord"),
+                100,
+                None,
+            ),
+            session_with_parent(
+                "wt2",
+                "local",
+                "/discord-refactor",
+                Some("/discord"),
+                10,
+                None,
+            ),
+        ];
+        let l = layout(&s);
+        assert_eq!(l, vec!["H:local", "P:/discord", "S:wt2", "S:wt1"]);
+    }
+
+    #[test]
+    fn sessions_without_parent_repo_still_group_by_project_dir() {
+        // External (non-git) sessions and plain-checkout sessions
+        // — `parent_repo` is `None` for both — must fall through to
+        // the legacy behaviour: group by `project_dir`. Pins that
+        // unifying worktrees doesn't accidentally regress how
+        // external sessions display.
+        let s = vec![
+            session_with_parent("a", "local", "/scratch", None, 100, None),
+            session_with_parent("b", "local", "/scratch", None, 10, None),
+            session_with_parent("c", "local", "/notes", None, 50, None),
+        ];
+        let l = layout(&s);
+        assert_eq!(
+            l,
+            vec!["H:local", "P:/scratch", "S:b", "S:a", "P:/notes", "S:c"]
         );
     }
 

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod dashboard;
 pub mod discovery;
+pub mod embedded_pty;
 pub mod host;
 pub mod new_session_modal;
 pub mod notifications;

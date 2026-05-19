@@ -294,9 +294,15 @@ struct App {
 /// for. The `session_id` field is what lets the attach path skip a
 /// respawn when the user presses Enter on the same row twice — a
 /// common gesture after a prefix-escape and re-attach.
+///
+/// `last_size` is the (rows, cols) the PTY was last resized to. The
+/// draw path compares the current rendered area against this and
+/// fires `EmbeddedPty::resize` only on change — sending SIGWINCH on
+/// every frame would be 60 wakeups/sec for nothing.
 struct Embedded {
     pty: EmbeddedPty,
     session_id: SessionId,
+    last_size: (u16, u16),
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -1054,7 +1060,11 @@ impl App {
             DEFAULT_PTY_COLS,
         ) {
             Ok(pty) => {
-                self.embedded = Some(Embedded { pty, session_id });
+                self.embedded = Some(Embedded {
+                    pty,
+                    session_id,
+                    last_size: (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
+                });
                 self.focus = Focus::Terminal {
                     leader_armed: false,
                 };
@@ -1653,48 +1663,73 @@ fn draw_embedded(
     list: List<'_>,
     area: ratatui::layout::Rect,
 ) {
-    let Some(embedded) = app.embedded.as_ref() else {
-        return;
-    };
     let split =
         Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).split(area);
     frame.render_stateful_widget(list, split[0], &mut app.list_state);
 
-    // Border style reflects focus so the user can see which pane their
-    // keys go to without reading the footer hint. Phase 5 could promote
-    // this to a theme knob; Phase 3 hardcodes it.
     let term_focus = matches!(app.focus, Focus::Terminal { .. });
+    // Resolve the title via the immutable catalog borrow *before*
+    // taking the mutable borrow of `embedded` below. Cloning the
+    // SessionId here is cheap (a String) and side-steps borrow-checker
+    // friction between the catalog lookup and the resize mutation.
+    let Some(session_id) = app.embedded.as_ref().map(|e| e.session_id.clone()) else {
+        return;
+    };
+    let label = terminal_block_label(app, &session_id);
+
+    let Some(embedded) = app.embedded.as_mut() else {
+        return;
+    };
     let term_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", terminal_block_label(app, embedded)))
+        .title(format!(" {label} "))
         .border_style(if term_focus {
             Style::new().add_modifier(Modifier::BOLD)
         } else {
             Style::new().add_modifier(Modifier::DIM)
         });
     let inner = term_block.inner(split[1]);
+
+    // Resize cascade: best-effort on each frame, only firing when the
+    // area genuinely changed (see `should_resize_pty` for the
+    // predicate). A `master.resize` ioctl failure isn't worth
+    // surfacing — the child keeps running at the old size and the
+    // next frame will retry.
+    let new_size = (inner.height, inner.width);
+    if should_resize_pty(embedded.last_size, new_size)
+        && embedded.pty.resize(new_size.0, new_size.1).is_ok()
+    {
+        embedded.last_size = new_size;
+    }
+
     frame.render_widget(term_block, split[1]);
     embedded.pty.render(frame, inner);
+}
+
+/// Whether the embedded PTY should be resized to `proposed`. False for
+/// zero-sized areas (vt100 rejects them, and there's nothing meaningful
+/// to render anyway) and for no-change ticks (the common case — 60-Hz
+/// re-renders without an actual terminal resize must not fire 60
+/// SIGWINCHes/sec at the child).
+#[must_use]
+fn should_resize_pty(current: (u16, u16), proposed: (u16, u16)) -> bool {
+    proposed.0 > 0 && proposed.1 > 0 && current != proposed
 }
 
 /// Title rendered in the embedded terminal's block. Mirrors
 /// `preview_pane_title`'s fallback (last 6 of session id, "…" prefix)
 /// for title-less sessions so the same anchor reads consistently
 /// whether you're looking at the inline preview or the embedded pane.
-fn terminal_block_label(app: &App, embedded: &Embedded) -> String {
+fn terminal_block_label(app: &App, session_id: &SessionId) -> String {
     // Look up the session by id rather than relying on selection,
     // because the user may have navigated to a different row while
     // the embedded PTY is still attached to the previously-selected
     // session.
-    let session = app
-        .catalog
-        .sessions()
-        .iter()
-        .find(|s| s.id == embedded.session_id);
+    let session = app.catalog.sessions().iter().find(|s| &s.id == session_id);
     if let Some(title) = session.and_then(|s| s.title.as_deref()) {
         return title.to_string();
     }
-    let id = &embedded.session_id.0;
+    let id = &session_id.0;
     let suffix: String = id.chars().rev().take(6).collect();
     let suffix: String = suffix.chars().rev().collect();
     format!("…{suffix}")
@@ -2094,5 +2129,74 @@ mod tests {
         let s = SearchState::new();
         let bar = compose_search_bar(&s, 5);
         assert!(bar.contains("/█"), "got: {bar}");
+    }
+
+    // ---- focus-aware footer ----
+
+    #[test]
+    fn footer_terminal_focus_shows_only_back_to_sidebar_hint() {
+        // When the embedded terminal owns the keyboard, the j/k/⏎/etc
+        // bindings the sidebar advertises don't work — listing them
+        // would mislead the user. Footer collapses to the one hint
+        // that does.
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Terminal {
+                leader_armed: false,
+            },
+        );
+        assert!(s.contains("back to sidebar"), "got: {s}");
+        assert!(!s.contains("j/k"), "got: {s}");
+        assert!(!s.contains("return:"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_terminal_focus_still_surfaces_transient_status() {
+        // A creating-worktree status or a fresh error still takes
+        // precedence in Terminal focus — the user needs to see
+        // those signals even mid-session.
+        let s = compose_footer(
+            None,
+            Some("attach: boom"),
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Terminal {
+                leader_armed: false,
+            },
+        );
+        assert!(s.contains("attach: boom"), "got: {s}");
+        assert!(!s.contains("back to sidebar"), "got: {s}");
+    }
+
+    // ---- should_resize_pty ----
+
+    #[test]
+    fn should_resize_pty_returns_false_for_unchanged_size() {
+        // The hot-path case: 60 fps of unchanged geometry should not
+        // trigger 60 SIGWINCHes/sec at the child.
+        assert!(!should_resize_pty((24, 80), (24, 80)));
+    }
+
+    #[test]
+    fn should_resize_pty_returns_true_when_dimensions_change() {
+        assert!(should_resize_pty((24, 80), (40, 120)));
+        assert!(should_resize_pty((24, 80), (24, 100)));
+        assert!(should_resize_pty((24, 80), (30, 80)));
+    }
+
+    #[test]
+    fn should_resize_pty_returns_false_for_zero_sized_proposed() {
+        // Terminal shrunk past the borders: there's no meaningful
+        // grid to render and vt100 rejects zero dimensions anyway.
+        assert!(!should_resize_pty((24, 80), (0, 80)));
+        assert!(!should_resize_pty((24, 80), (24, 0)));
+        assert!(!should_resize_pty((24, 80), (0, 0)));
     }
 }

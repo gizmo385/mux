@@ -222,6 +222,15 @@ impl EmbeddedPty {
             .read()
             .map_or_else(|_| String::new(), |p| p.screen().contents())
     }
+
+    /// Current `(rows, cols)` of the parser's screen. Returns `(0, 0)`
+    /// if the parser lock is poisoned (unreachable in normal flow —
+    /// vt100's `Parser::process` doesn't panic). Used by the resize
+    /// cascade test to verify dimensions actually changed.
+    #[must_use]
+    pub fn current_size(&self) -> (u16, u16) {
+        self.parser.read().map_or((0, 0), |p| p.screen().size())
+    }
 }
 
 fn map_pty_err<E: std::fmt::Display>(e: E) -> io::Error {
@@ -410,6 +419,25 @@ mod tests {
         let mut pty = EmbeddedPty::spawn(&argv, None, 24, 80).unwrap();
         pty.resize(40, 120).unwrap();
         pty.resize(10, 30).unwrap();
+    }
+
+    #[test]
+    fn resize_updates_parser_screen_size() {
+        // Pins the contract that `resize` propagates the new
+        // dimensions to the vt100 parser, not just the pty master.
+        // Without this, the rendered grid would stay stuck at the
+        // spawn size even after the user resized their terminal.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ];
+        let mut pty = EmbeddedPty::spawn(&argv, None, 24, 80).unwrap();
+        assert_eq!(pty.current_size(), (24, 80));
+        pty.resize(40, 120).unwrap();
+        assert_eq!(pty.current_size(), (40, 120));
+        pty.resize(10, 30).unwrap();
+        assert_eq!(pty.current_size(), (10, 30));
     }
 
     #[test]

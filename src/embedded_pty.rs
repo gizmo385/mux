@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -227,6 +228,77 @@ fn map_pty_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Encode a crossterm `KeyEvent` into the byte sequence a tty-attached
+/// program would receive. Conservative coverage — printable chars
+/// (with Ctrl/Alt modifiers), the common control codes (Enter, Tab,
+/// Backspace, Esc), arrow / navigation keys, and F1–F4. Exotic keys
+/// (F5+, kitty-keyboard extensions) yield an empty `Vec`; dogfooding
+/// will tell us which ones need adding.
+///
+/// Ctrl + ASCII letter follows the standard "byte XOR 0x40" rule
+/// (Ctrl-a → 0x01, Ctrl-c → 0x03, …). Ctrl + non-letter is best-effort:
+/// terminals disagree on these and the chord layer above us will
+/// usually intercept the interesting ones (Ctrl-space, Ctrl-^).
+///
+/// Alt + key prepends `0x1B` (the de-facto Esc-prefix convention used
+/// by xterm, gnome-terminal, and friends). Alt + an unsupported key
+/// returns an empty `Vec` rather than a stray Esc.
+#[must_use]
+pub fn encode_key_for_pty(key: &KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let mut payload = Vec::with_capacity(4);
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                let upper = c.to_ascii_uppercase();
+                if upper.is_ascii_alphabetic() {
+                    // Ctrl-A=0x01 … Ctrl-Z=0x1A
+                    payload.push((upper as u8) - 0x40);
+                } else {
+                    // Non-letter Ctrl: best-effort literal byte. The
+                    // interesting cases (Ctrl-[, Ctrl-]) happen to map
+                    // correctly under this branch on ASCII input.
+                    let mut buf = [0u8; 4];
+                    payload.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                payload.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        KeyCode::Enter => payload.push(0x0D),
+        KeyCode::Backspace => payload.push(0x7F),
+        KeyCode::Tab => payload.push(0x09),
+        KeyCode::BackTab => payload.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Esc => payload.push(0x1B),
+        KeyCode::Up => payload.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => payload.extend_from_slice(b"\x1b[B"),
+        KeyCode::Right => payload.extend_from_slice(b"\x1b[C"),
+        KeyCode::Left => payload.extend_from_slice(b"\x1b[D"),
+        KeyCode::Home => payload.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => payload.extend_from_slice(b"\x1b[F"),
+        KeyCode::PageUp => payload.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => payload.extend_from_slice(b"\x1b[6~"),
+        KeyCode::Delete => payload.extend_from_slice(b"\x1b[3~"),
+        KeyCode::Insert => payload.extend_from_slice(b"\x1b[2~"),
+        KeyCode::F(1) => payload.extend_from_slice(b"\x1bOP"),
+        KeyCode::F(2) => payload.extend_from_slice(b"\x1bOQ"),
+        KeyCode::F(3) => payload.extend_from_slice(b"\x1bOR"),
+        KeyCode::F(4) => payload.extend_from_slice(b"\x1bOS"),
+        _ => return Vec::new(),
+    }
+
+    if alt && !payload.is_empty() {
+        let mut out = Vec::with_capacity(payload.len() + 1);
+        out.push(0x1B);
+        out.extend_from_slice(&payload);
+        return out;
+    }
+    payload
+}
+
 /// Manual `Debug` because `MasterPty` and the boxed writer don't
 /// implement it. We don't need the field contents in a diagnostic — the
 /// existence of the struct is enough for `assert_*!`-style failure
@@ -356,6 +428,114 @@ mod tests {
             pty.resize(24, 0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput,
         );
+    }
+
+    // ---- encode_key_for_pty ----
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn encode_printable_char_passes_through_as_utf8() {
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Char('a'))), b"a");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Char('Z'))), b"Z");
+        // Multi-byte UTF-8 char survives intact.
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Char('é'))), "é".as_bytes());
+    }
+
+    #[test]
+    fn encode_ctrl_letter_yields_xor_0x40_control_byte() {
+        assert_eq!(
+            encode_key_for_pty(&key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            vec![0x01],
+        );
+        assert_eq!(
+            encode_key_for_pty(&key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![0x03],
+        );
+        assert_eq!(
+            encode_key_for_pty(&key_mod(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            vec![0x1A],
+        );
+    }
+
+    #[test]
+    fn encode_alt_letter_prepends_escape_byte() {
+        // xterm-style Alt prefix: ESC + key. Same convention every
+        // common terminal uses for Meta on a no-meta-key keyboard.
+        assert_eq!(
+            encode_key_for_pty(&key_mod(KeyCode::Char('x'), KeyModifiers::ALT)),
+            vec![0x1B, b'x'],
+        );
+    }
+
+    #[test]
+    fn encode_ctrl_alt_letter_prepends_escape_to_control_byte() {
+        // Meta-Ctrl-C used by some apps. Result: ESC followed by the
+        // control byte (0x03).
+        assert_eq!(
+            encode_key_for_pty(&key_mod(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            vec![0x1B, 0x03],
+        );
+    }
+
+    #[test]
+    fn encode_named_control_keys() {
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Enter)), vec![0x0D]);
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Backspace)), vec![0x7F]);
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Tab)), vec![0x09]);
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Esc)), vec![0x1B]);
+    }
+
+    #[test]
+    fn encode_arrow_keys_to_csi_sequences() {
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Up)), b"\x1b[A");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Down)), b"\x1b[B");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Right)), b"\x1b[C");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Left)), b"\x1b[D");
+    }
+
+    #[test]
+    fn encode_navigation_keys_to_csi_sequences() {
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Home)), b"\x1b[H");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::End)), b"\x1b[F");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::PageUp)), b"\x1b[5~");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::PageDown)), b"\x1b[6~");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Delete)), b"\x1b[3~");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::Insert)), b"\x1b[2~");
+    }
+
+    #[test]
+    fn encode_function_keys_f1_through_f4_use_ss3_sequences() {
+        // SS3 (\x1bO) prefix is what xterm uses for F1–F4 in normal
+        // keypad mode. F5+ uses CSI \x1b[N~ — added when dogfooding
+        // asks for them.
+        assert_eq!(encode_key_for_pty(&key(KeyCode::F(1))), b"\x1bOP");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::F(2))), b"\x1bOQ");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::F(3))), b"\x1bOR");
+        assert_eq!(encode_key_for_pty(&key(KeyCode::F(4))), b"\x1bOS");
+    }
+
+    #[test]
+    fn encode_unsupported_key_yields_empty_vec() {
+        // F5 is not in our table; the user sees nothing happen rather
+        // than a corrupt byte sequence reaching the PTY.
+        assert!(encode_key_for_pty(&key(KeyCode::F(5))).is_empty());
+    }
+
+    #[test]
+    fn encode_backtab_emits_csi_z() {
+        // Shift-Tab. Distinct from regular Tab so terminals can move
+        // backwards through focusable elements.
+        assert_eq!(encode_key_for_pty(&key(KeyCode::BackTab)), b"\x1b[Z");
     }
 
     #[test]

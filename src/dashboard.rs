@@ -152,6 +152,50 @@ pub fn matches_query(session: &Session, query_lower: &str) -> bool {
     session.host.as_str().to_lowercase().contains(query_lower)
 }
 
+/// Where the user's keyboard goes. `Sidebar` is the default — the
+/// dashboard list owns the keys, as it has since M0. `Terminal` is
+/// entered when the user attaches via the embedded PTY driver
+/// (`PtyDriver`); every key flows to the embedded process *except* the
+/// leader sequence (`Ctrl-a Esc`), which transitions back to `Sidebar`.
+///
+/// The PTY itself lives in `App.embedded`; this enum describes input
+/// routing only. The invariant — `Focus::Terminal` only valid when
+/// `embedded.is_some()` — is maintained by the transitions in
+/// [`attach_selected`](crate::main) and the PTY-exit drain.
+///
+/// `leader_armed` is the state between "user pressed the leader" and
+/// "user pressed the second key of the chord." A leader followed by
+/// `Esc` returns to `Sidebar`; a leader followed by anything else
+/// forwards both bytes to the PTY (tmux-style passthrough) and disarms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Sidebar,
+    Terminal {
+        leader_armed: bool,
+    },
+}
+
+/// Whether the leader chord is currently armed (waiting for the second
+/// key). Pure helper so the main loop's `match (focus, key)` stays
+/// readable without nested pattern matches.
+#[must_use]
+pub fn leader_armed(focus: Focus) -> bool {
+    matches!(focus, Focus::Terminal { leader_armed: true })
+}
+
+/// Whether `key` is the embedded-terminal leader. Hard-coded as
+/// `Ctrl-a` for the Phase-3 ship; M5 will surface this in config so
+/// users can dodge collisions with their tmux prefix.
+///
+/// The check is strict-equal on `KeyModifiers::CONTROL` — `Ctrl-Shift-a`
+/// is *not* the leader, because tmux-style users expect a clean two-
+/// key chord without an accidental Shift triggering it.
+#[must_use]
+pub fn is_pty_leader(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL
+}
+
 /// Dashboard search/filter state. `None` on App means "no search active".
 ///
 /// Two modes, distinct because the keyboard ownership differs:
@@ -1010,6 +1054,55 @@ mod tests {
             })
             .collect();
         assert_eq!(session_rows, vec![1]);
+    }
+
+    // ------- Focus -------
+
+    #[test]
+    fn focus_default_is_sidebar() {
+        // The keyboard goes to the dashboard list out of the box —
+        // launching agent-mux without an embedded driver must not
+        // silently steal input into a non-existent terminal pane.
+        assert_eq!(Focus::default(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn leader_armed_helper_unwraps_terminal_variant() {
+        assert!(!leader_armed(Focus::Sidebar));
+        assert!(!leader_armed(Focus::Terminal {
+            leader_armed: false
+        }));
+        assert!(leader_armed(Focus::Terminal { leader_armed: true }));
+    }
+
+    #[test]
+    fn is_pty_leader_matches_ctrl_a_exactly() {
+        assert!(is_pty_leader(&KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL
+        )));
+        // Bare 'a' is not the leader — must include Ctrl.
+        assert!(!is_pty_leader(&KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::empty()
+        )));
+        // Ctrl-b (tmux's default prefix) deliberately doesn't trigger
+        // our leader — picked to avoid colliding when nesting.
+        assert!(!is_pty_leader(&KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn is_pty_leader_rejects_ctrl_shift_a() {
+        // Strict-equal on modifiers — Ctrl-Shift-a is a different chord
+        // and shouldn't fire the leader, because users expect a clean
+        // two-key chord without accidental Shift triggering it.
+        assert!(!is_pty_leader(&KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
     }
 
     // ------- SearchState -------

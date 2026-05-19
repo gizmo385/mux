@@ -19,19 +19,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use agent_mux::attachment::{
-    AttachOutcome, AttachmentDriver, PtyDriver, SuspendCommand, TmuxDriver,
+    AttachOutcome, AttachmentDriver, EmbedSpec, PtyDriver, SuspendCommand, TmuxDriver,
 };
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
 use agent_mux::config::{self, Config, Theme};
 use agent_mux::dashboard::{
-    DisplayRow, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
-    build_display_rows_filtered, compose_preview_pane_lines, first_session_index, matches_query,
-    next_host_index, next_project_index, next_session_index, prev_host_index, prev_project_index,
-    prev_session_index,
+    DisplayRow, Focus, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg,
+    build_display_rows, build_display_rows_filtered, compose_preview_pane_lines,
+    first_session_index, is_pty_leader, matches_query, next_host_index, next_project_index,
+    next_session_index, prev_host_index, prev_project_index, prev_session_index,
 };
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
+use agent_mux::embedded_pty::{EmbeddedPty, PtyEvent, encode_key_for_pty};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
@@ -50,6 +51,27 @@ const IDLE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 /// Event-loop tick. Bounds the latency between an attention update arriving
 /// in the channel and the dashboard re-rendering it.
 const TICK: Duration = Duration::from_millis(100);
+
+/// Event-loop tick while [`Focus::Terminal`] is active. The embedded
+/// PTY's reader thread updates its parser asynchronously and posts a
+/// `PtyEvent::Output` to wake the loop, but `event::poll` on stdin
+/// doesn't observe that channel — so the worst-case latency from
+/// "child wrote bytes" to "redraw" is bounded by this tick. 16 ms
+/// (~60fps) feels native; 100 ms (the sidebar tick) lags visibly when
+/// the user is typing.
+const TICK_TERMINAL: Duration = Duration::from_millis(16);
+
+/// Default grid the embedded PTY spawns into. Phase 4 will replace
+/// this with the actual rendered area at attach time; Phase 3 spawns
+/// at this size and lets vt100 / the child's SIGWINCH handler reflow.
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+
+/// Width (in cells) of the dashboard sidebar when an embedded PTY is
+/// active. Wide enough to render the host + project headers without
+/// truncating common labels; narrow enough that the terminal pane
+/// dominates the screen. M5 candidate for `[ui]` config.
+const SIDEBAR_WIDTH: u16 = 40;
 
 /// How long the Repo Registry's cached scan is allowed to age before the
 /// next picker-open re-scans. Short enough that newly-cloned repos appear
@@ -253,6 +275,28 @@ struct App {
     /// paths look up `Option<Color>` from a typed struct rather than
     /// re-parsing strings every frame.
     theme: Theme,
+    /// The single embedded PTY slot. `Some` when the user has attached
+    /// via `PtyDriver`; `None` for `TmuxDriver` runs and for the
+    /// initial state of every run. We deliberately do not pre-warm or
+    /// hot-cache other sessions — the Plan-agent-decided shape is a
+    /// *swappable* PTY, killed and respawned when the user attaches to
+    /// a different session. Pivot to N hot PTYs only if dogfooding
+    /// shows the swap cost is visible.
+    embedded: Option<Embedded>,
+    /// Input routing for the embedded-PTY arc. Default `Sidebar` keeps
+    /// the legacy keybinds active. Transitions to `Terminal` on a
+    /// successful `EmbedPty` attach; back to `Sidebar` on prefix-escape
+    /// (`Ctrl-a Esc`) or PTY exit.
+    focus: Focus,
+}
+
+/// Owns the embedded pseudoterminal and remembers which session it's
+/// for. The `session_id` field is what lets the attach path skip a
+/// respawn when the user presses Enter on the same row twice — a
+/// common gesture after a prefix-escape and re-attach.
+struct Embedded {
+    pty: EmbeddedPty,
+    session_id: SessionId,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -456,6 +500,8 @@ impl App {
             preview_rx,
             notifier,
             theme,
+            embedded: None,
+            focus: Focus::default(),
         })
     }
 
@@ -949,10 +995,11 @@ impl App {
     }
 
     fn attach_selected(&mut self) -> Option<SuspendCommand> {
-        let result = {
+        let (result, session_id) = {
             let session = self.selected_session()?;
             let host = self.hosts.get(&session.host)?.clone();
-            self.driver.attach(session, host.as_ref())
+            let id = session.id.clone();
+            (self.driver.attach(session, host.as_ref()), id)
         };
         match result {
             Ok(AttachOutcome::Done) => {
@@ -964,22 +1011,129 @@ impl App {
                 Some(cmd)
             }
             Ok(AttachOutcome::EmbedPty(spec)) => {
-                // Phase 2 stub for `--embedded` dogfooding. Phase 3
-                // replaces this with a real `EmbeddedPty::spawn` against
-                // `spec.argv`. The label echoes what the future widget
-                // will title — useful for verifying the dispatch shape
-                // (right argv, right host wrap) without standing the
-                // widget up yet.
-                self.status = Some(format!(
-                    "embedded attach not yet wired (Phase 3) — would spawn: {}",
-                    spec.label
-                ));
+                self.install_embedded(&spec, session_id);
                 None
             }
             Err(e) => {
                 self.status = Some(format!("attach: {e}"));
                 None
             }
+        }
+    }
+
+    /// Spawn (or refocus) the embedded PTY for the given session.
+    /// Common gesture: prefix-escape, navigate, press Enter on the
+    /// same session — we shouldn't kill and respawn the PTY just to
+    /// return focus, because that loses the child's state. The
+    /// `session_id` comparison gates that fast path.
+    ///
+    /// On a different session, the existing PTY is dropped first (its
+    /// `Drop` closes the pty → child gets SIGHUP → reader thread reaps
+    /// it), then a fresh PTY is spawned. Spawn failures surface as a
+    /// dashboard status; the focus stays on the sidebar so the user
+    /// isn't stranded in a terminal that doesn't exist.
+    fn install_embedded(&mut self, spec: &EmbedSpec, session_id: SessionId) {
+        if let Some(existing) = &self.embedded
+            && existing.session_id == session_id
+        {
+            self.focus = Focus::Terminal {
+                leader_armed: false,
+            };
+            self.status = None;
+            return;
+        }
+        // Drop the previous PTY before spawning a new one. Done in two
+        // steps so the old `EmbeddedPty`'s `Drop` runs *before* we
+        // allocate a fresh pty (avoids briefly holding two ptys for
+        // overlapping sessions).
+        self.embedded = None;
+        match EmbeddedPty::spawn(
+            &spec.argv,
+            spec.cwd.as_deref(),
+            DEFAULT_PTY_ROWS,
+            DEFAULT_PTY_COLS,
+        ) {
+            Ok(pty) => {
+                self.embedded = Some(Embedded { pty, session_id });
+                self.focus = Focus::Terminal {
+                    leader_armed: false,
+                };
+                self.status = None;
+            }
+            Err(e) => {
+                self.status = Some(format!("embedded attach failed: {e}"));
+            }
+        }
+    }
+
+    /// Route a key event while [`Focus::Terminal`] holds the keyboard.
+    ///
+    /// State machine:
+    /// - Not armed, leader chord: arm and consume.
+    /// - Armed, Esc: return focus to sidebar; PTY stays alive.
+    /// - Armed, anything else: forward both the leader bytes and the
+    ///   followup bytes to the PTY (tmux-style passthrough), then disarm.
+    /// - Not armed, anything else: encode and forward to PTY.
+    fn handle_terminal_key(&mut self, key: &KeyEvent) {
+        if matches!(self.focus, Focus::Terminal { leader_armed: true }) {
+            if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+                self.focus = Focus::Sidebar;
+                return;
+            }
+            let leader_event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+            let mut bytes = encode_key_for_pty(&leader_event);
+            bytes.extend_from_slice(&encode_key_for_pty(key));
+            self.write_to_embedded(&bytes);
+            self.focus = Focus::Terminal {
+                leader_armed: false,
+            };
+            return;
+        }
+        if is_pty_leader(key) {
+            self.focus = Focus::Terminal { leader_armed: true };
+            return;
+        }
+        let bytes = encode_key_for_pty(key);
+        if !bytes.is_empty() {
+            self.write_to_embedded(&bytes);
+        }
+    }
+
+    /// Best-effort write to the active embedded PTY. A write failure
+    /// surfaces in the dashboard status but does not transition focus —
+    /// the PTY may still be readable, and an over-eager teardown would
+    /// strand the user with a stuck terminal.
+    fn write_to_embedded(&mut self, bytes: &[u8]) {
+        let Some(embedded) = self.embedded.as_mut() else {
+            return;
+        };
+        if let Err(e) = embedded.pty.write_input(bytes) {
+            self.status = Some(format!("pty write: {e}"));
+        }
+    }
+
+    /// Drain pending events from the embedded PTY's reader thread.
+    /// `Output` events are pure redraw hints (the parser is already
+    /// updated); `Exited` means the child terminated and the PTY
+    /// should be dropped, returning focus to the sidebar.
+    ///
+    /// We deliberately do not surface the exit status — the common
+    /// case is "user detached from tmux," which is a normal end of
+    /// session and shouldn't read as an error in the dashboard.
+    fn drain_pty_events(&mut self) {
+        let Some(embedded) = self.embedded.as_ref() else {
+            return;
+        };
+        let mut exited = false;
+        while let Some(ev) = embedded.pty.poll_event() {
+            if matches!(ev, PtyEvent::Exited(_)) {
+                exited = true;
+                break;
+            }
+        }
+        if exited {
+            self.embedded = None;
+            self.focus = Focus::Sidebar;
         }
     }
 
@@ -1072,19 +1226,34 @@ impl App {
 fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
-        let has_event = event::poll(TICK)?;
+        // Tick faster while the embedded terminal owns the keyboard —
+        // see `TICK_TERMINAL` for the latency reasoning.
+        let tick = if matches!(app.focus, Focus::Terminal { .. }) {
+            TICK_TERMINAL
+        } else {
+            TICK
+        };
+        let has_event = event::poll(tick)?;
         app.drain_updates();
         app.drain_remote_discoveries();
         app.drain_repo_scans();
+        app.drain_pty_events();
         if let Some(cmd) = app.drain_creates()
             && let Some(err) = suspend_and_run(terminal, &cmd)?
         {
             app.status = Some(err);
         }
         if has_event && let Event::Key(key) = event::read()? {
-            // Ctrl-C quits unconditionally, even when the modal is open
-            // or the search bar has focus. Everything else routes to
-            // those if they're up.
+            // Embedded-terminal focus owns the keyboard. Ctrl-C goes
+            // to the running child (the standard "interrupt" gesture);
+            // the only way out is the leader chord (`Ctrl-a Esc`).
+            if matches!(app.focus, Focus::Terminal { .. }) {
+                app.handle_terminal_key(&key);
+                continue;
+            }
+            // Ctrl-C quits unconditionally in sidebar focus, even when
+            // the modal is open or the search bar has focus. Everything
+            // else routes to those if they're up.
             let ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
             if ctrl_c {
@@ -1324,11 +1493,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌ ");
 
-    // When the preview pane is open, split the list area into
-    // list (55%) + preview (45%). 55/45 favours the list because
-    // that's still the primary navigation surface; the preview is
-    // peripheral context, not the main object of attention.
-    if app.preview_open {
+    // Three layout modes for the main area (in priority order):
+    // 1. Embedded PTY active → compact sidebar + embedded terminal
+    //    (preview pane hidden — the terminal *is* the preview).
+    // 2. Preview pane open → 55/45 list + inline preview.
+    // 3. Default → list takes the full main area.
+    if app.embedded.is_some() {
+        draw_embedded(frame, app, list, layout[1]);
+    } else if app.preview_open {
         let split = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(layout[1]);
         frame.render_stateful_widget(list, split[0], &mut app.list_state);
@@ -1377,6 +1549,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.in_tmux,
         app.pending_hosts,
         &app.connect_errors,
+        app.focus,
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -1432,12 +1605,22 @@ fn compose_footer(
     in_tmux: bool,
     pending_hosts: usize,
     connect_errors: &[(HostId, String)],
+    focus: Focus,
 ) -> String {
+    // Terminal focus narrows the footer to a single hint — the
+    // embedded child owns every other key, so listing the sidebar
+    // binds would mislead the user about what works right now.
+    // Status / creating still win because they're transient signals
+    // the user needs even mid-session (e.g. a worktree create finished
+    // while the user was inside the terminal).
     if let Some(c) = creating {
         return format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name);
     }
     if let Some(s) = status {
         return format!(" {s} ");
+    }
+    if matches!(focus, Focus::Terminal { .. }) {
+        return " ⌃a esc: back to sidebar ".to_string();
     }
     if !connect_errors.is_empty() {
         let names: Vec<String> = connect_errors.iter().map(|(h, _)| h.to_string()).collect();
@@ -1458,6 +1641,63 @@ fn compose_footer(
     format!(
         " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · q: quit  ·  return: {return_hint}{suffix} "
     )
+}
+
+/// Embedded-PTY layout: compact sidebar on the left, terminal on the
+/// right with a focus-aware border. Extracted from `draw` to keep that
+/// function under the line cap; takes the prepared sidebar `list`
+/// widget and the rect to fill.
+fn draw_embedded(
+    frame: &mut ratatui::Frame<'_>,
+    app: &mut App,
+    list: List<'_>,
+    area: ratatui::layout::Rect,
+) {
+    let Some(embedded) = app.embedded.as_ref() else {
+        return;
+    };
+    let split =
+        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).split(area);
+    frame.render_stateful_widget(list, split[0], &mut app.list_state);
+
+    // Border style reflects focus so the user can see which pane their
+    // keys go to without reading the footer hint. Phase 5 could promote
+    // this to a theme knob; Phase 3 hardcodes it.
+    let term_focus = matches!(app.focus, Focus::Terminal { .. });
+    let term_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", terminal_block_label(app, embedded)))
+        .border_style(if term_focus {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
+        });
+    let inner = term_block.inner(split[1]);
+    frame.render_widget(term_block, split[1]);
+    embedded.pty.render(frame, inner);
+}
+
+/// Title rendered in the embedded terminal's block. Mirrors
+/// `preview_pane_title`'s fallback (last 6 of session id, "…" prefix)
+/// for title-less sessions so the same anchor reads consistently
+/// whether you're looking at the inline preview or the embedded pane.
+fn terminal_block_label(app: &App, embedded: &Embedded) -> String {
+    // Look up the session by id rather than relying on selection,
+    // because the user may have navigated to a different row while
+    // the embedded PTY is still attached to the previously-selected
+    // session.
+    let session = app
+        .catalog
+        .sessions()
+        .iter()
+        .find(|s| s.id == embedded.session_id);
+    if let Some(title) = session.and_then(|s| s.title.as_deref()) {
+        return title.to_string();
+    }
+    let id = &embedded.session_id.0;
+    let suffix: String = id.chars().rev().take(6).collect();
+    let suffix: String = suffix.chars().rev().collect();
+    format!("…{suffix}")
 }
 
 /// Title for the preview pane's bordered block. Lifts the session's
@@ -1608,34 +1848,74 @@ mod tests {
 
     #[test]
     fn footer_keybind_line_shows_in_tmux_return_hint() {
-        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(!s.contains("prefix+d"), "got: {s}");
     }
 
     #[test]
     fn footer_keybind_line_advertises_preview_toggle() {
-        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(s.contains("p: preview"), "got: {s}");
     }
 
     #[test]
     fn footer_keybind_line_advertises_group_jumps() {
-        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(s.contains("J/K: project"), "got: {s}");
         assert!(s.contains("⌃j/⌃k: host"), "got: {s}");
     }
 
     #[test]
     fn footer_keybind_line_shows_outside_tmux_return_hint() {
-        let s = compose_footer(None, None, false, false, 0, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            false,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(s.contains("return: prefix+d"), "got: {s}");
         assert!(!s.contains("prefix+s"), "got: {s}");
     }
 
     #[test]
     fn footer_empty_catalog_omits_return_hint() {
-        let s = compose_footer(None, None, true, true, 0, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            true,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(!s.contains("return:"), "got: {s}");
         assert!(s.contains("no sessions"), "got: {s}");
     }
@@ -1649,6 +1929,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            Focus::Sidebar,
         );
         assert!(s.contains("attach: boom"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
@@ -1667,6 +1948,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            Focus::Sidebar,
         );
         assert!(s.contains("creating worktree"), "got: {s}");
         assert!(s.contains("agent-mux"), "got: {s}");
@@ -1675,7 +1957,15 @@ mod tests {
 
     #[test]
     fn footer_keybind_line_appends_connecting_suffix_when_hosts_pending() {
-        let s = compose_footer(None, None, false, true, 2, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            2,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(s.contains("connecting to 2 host(s)"), "got: {s}");
     }
@@ -1685,21 +1975,37 @@ mod tests {
         // First impression matters: when the catalog is empty *and*
         // remote discovery is still in flight, "no sessions discovered"
         // would mis-imply we're done.
-        let s = compose_footer(None, None, true, true, 1, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            true,
+            true,
+            1,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(s.contains("connecting to 1 host(s)"), "got: {s}");
         assert!(!s.contains("no sessions"), "got: {s}");
     }
 
     #[test]
     fn footer_connecting_suffix_disappears_once_all_hosts_have_reported() {
-        let s = compose_footer(None, None, false, true, 0, &no_connect_errors());
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+        );
         assert!(!s.contains("connecting to"), "got: {s}");
     }
 
     #[test]
     fn footer_renders_connect_errors_as_sticky_line_when_no_status() {
         let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
-        let s = compose_footer(None, None, false, true, 0, &errors);
+        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar);
         assert!(s.contains("connect failed: alpenglow"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
     }
@@ -1714,7 +2020,7 @@ mod tests {
             (HostId("alpenglow".into()), "first error".to_string()),
             (HostId("gpu-1".into()), "second error".to_string()),
         ];
-        let s = compose_footer(None, None, false, true, 0, &errors);
+        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar);
         assert!(s.contains("alpenglow"), "got: {s}");
         assert!(s.contains("gpu-1"), "got: {s}");
     }
@@ -1724,7 +2030,15 @@ mod tests {
         // A fresh action's feedback must not be drowned out by the
         // sticky connect-failure line.
         let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
-        let s = compose_footer(None, Some("opened terminal in /x"), false, true, 0, &errors);
+        let s = compose_footer(
+            None,
+            Some("opened terminal in /x"),
+            false,
+            true,
+            0,
+            &errors,
+            Focus::Sidebar,
+        );
         assert!(s.contains("opened terminal"), "got: {s}");
         assert!(!s.contains("connect failed"), "got: {s}");
     }

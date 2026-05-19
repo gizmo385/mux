@@ -2,37 +2,37 @@
 
 A fast, terminal-first multiplexer for managing multiple Claude Code conversations across local and remote hosts.
 
-## Status
+## Features
 
-M0–M5 shipped; post-M5 work continues on the Shape B (embedded-PTY) dashboard and remote session creation. Highlights:
+- **One dashboard for every Claude Code session you have running** — locally and on any SSH-reachable host you've configured. Sessions group by host, then by project. Each row shows live attention state (● needs-input, ◐ working, ○ idle), title, and time since last activity.
+- **Attach without leaving the dashboard.** Pressing Enter hosts the active session inside an embedded terminal pane next to the sidebar: you see tmux + Claude Code on the right, the live session list on the left, and the sidebar keeps updating other sessions' attention state while you work. `--no-embed` reverts to the legacy "take over the whole terminal" behaviour for users who prefer it.
+- **Create new sessions from inside the dashboard.** Press `n` to pick a repo, name a task, and pick a base branch. agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/`, writes task metadata, and launches `claude` inside it. Works equally for local and remote-host repos.
+- **Inline transcript preview.** `p` toggles a right-side pane showing the selected session's recent prompts, replies, tool calls, and tool results — without attaching. Lazy-fetched per selection and cached so navigating back is instant.
+- **Search / filter** the session list by title, project, or host with `/`.
+- **OS notifications** when a session moves into `needs-input` (libnotify on Linux, NSUserNotification on macOS).
+- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`) with per-element overrides. Run `agent-mux themes` for a coloured preview.
 
-- **M1 (session creation).** `n` picks a repo, names a task, picks a base branch; agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/` and launches `claude` inside it.
-- **M2 (remote hosts).** Configured `[hosts.<name>]` entries surface in the dashboard at startup. Attention updates stream live (3s polling over each host's `ControlMaster`); `Enter` / `t` route through the host abstraction so attach + spawn-terminal work locally and remotely with the same dispatch. Remote `find` portability for macOS remotes is the lone open item — see `TODO.md`.
-- **M3 (inline preview).** `p` toggles a right-side pane showing the selected session's recent transcript activity (prompts, assistant prose, tool calls, results) without attaching.
-- **M4 (attention notifications).** OS notifications (libnotify on Linux, NSUserNotification on macOS) fire when a session transitions into `needs-input`. Per-episode and time-window suppression keep the spam in check.
-- **M5 (customization).** `[notifications]` (`enabled`, `sound`, `disabled_hosts`) and `[theme]` (eight presets + per-element overrides) live in `~/.config/agent-mux/config.toml`. Run `agent-mux config` to see what's loaded; `agent-mux themes` for a coloured preview of every preset. Quiet-hours, keybind config, and reload-on-edit are deferred — see `TODO.md`.
-- **Post-M5 remote session creation.** `n` against a remote-host repo creates the worktree on the remote and launches `claude` over SSH; the new session surfaces in the dashboard via the normal discovery pipeline.
-- **Post-M5 embedded-PTY dashboard (Shape B), shipped 2026-05-18.** Pressing Enter hosts the active session inside a ratatui-rendered PTY widget alongside the dashboard sidebar instead of taking over the whole terminal. The sidebar stays live while you work — attention transitions on other sessions surface without detaching. `--no-embed` opts back into the legacy `tmux switch-client` flow.
+## Keybinds
 
-The dashboard runs (`cargo run`), discovers local Claude Code sessions, groups them under host headers (`── local ──`, then any configured SSH hosts alphabetical) with dim project sub-headers beneath each host, labels each row with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to a short session-id suffix), shows live attention state (● needs-input, ◐ working, ○ idle), dims the title when no live tmux pane matches the session (Enter will spin up a fresh `claude --resume` rather than fast-switch into an existing pane), and:
+The dashboard discovers local Claude Code sessions, groups them under host headers (`── local ──`, then any configured SSH hosts alphabetical) with dim project sub-headers beneath each host. Each row leads with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to a short session-id suffix); the title dims when no live tmux pane matches the session (Enter will spin up a fresh `claude --resume` rather than fast-switch into an existing pane).
 
 - `↑`/`↓` or `j`/`k` — navigate the list
 - `J`/`K` — jump to the next / previous **project**. Lands on the first session of the target project; wraps. No-op when only one project is on screen.
 - `Ctrl-j`/`Ctrl-k` — jump to the next / previous **host**. Same semantics as `J`/`K` one level up. No-op with only one host.
 - `Enter` — attach to the selected session inside an embedded terminal pane on the right side of the dashboard; the list collapses to a 40-column sidebar on the left while the pane has focus. Press `Ctrl-a Esc` to return focus to the sidebar without killing the PTY; press `Enter` on a different row to attach to that session instead. (`--no-embed` reverts to the legacy behaviour: `tmux switch-client` from inside tmux, `tmux attach` as a subprocess outside.)
 - `t` — open a new tmux window in the session's cwd (or, outside tmux, drop into `$SHELL` in the cwd)
-- `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created in `<workspace>/.agent-mux-worktrees/<repo>-<task>/` (a hidden sibling of the parent repo, so the workspace folder stays uncluttered) and `claude` is launched in it.
+- `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created in `<workspace>/.agent-mux-worktrees/<repo>-<task>/` (a hidden sibling of the parent repo) and `claude` is launched in it.
 - `/` — search/filter sessions by title, project directory, or host (case-insensitive substring). Type to narrow live, `Enter` to apply (keeps filter and returns focus to the list), `Esc` to clear and exit, `/` again to edit the active filter.
-- `p` — toggle the preview pane: a right-side split showing the last entries of the selected session's transcript (your prompts, the assistant's prose, tool calls, and tool results) without attaching. Lazy-fetched per selection; cached so navigating back is instant; auto-invalidated when the transcript advances. (Disabled while the embedded pane is active — the terminal *is* the preview, in HD.)
+- `p` — toggle the preview pane: a right-side split showing the last entries of the selected session's transcript without attaching. Disabled while the embedded pane is active — the terminal *is* the preview, in HD.
 - `q` / Ctrl-C — quit (in sidebar focus only; inside the embedded pane, Ctrl-C interrupts the running child, the standard tty behaviour)
 
-### Embedded pane (default)
+### Embedded pane
 
-When you press Enter on a session, agent-mux spawns `tmux attach -t <pane>` (or `tmux new-session -A -s agent-mux-<id> claude --resume <id>` if no live pane matches) into a pseudoterminal hosted inside the dashboard's right pane. tmux + Claude Code still own the rendered content — agent-mux is just the surrounding window. Mouse capture and bracketed paste are enabled while embedded so clicks, scroll, and pastes flow through to the child; outside embedded mode they're off so your terminal's native text-selection still works.
+When you press Enter on a session, agent-mux spawns `tmux attach -t <pane>` (or `tmux new-session -A -s agent-mux-<id> claude --resume <id>` if no live pane matches) into a pseudoterminal hosted inside the dashboard's right pane. tmux + Claude Code still own the rendered content — agent-mux is just the surrounding window. Mouse capture and bracketed paste are enabled while embedded so clicks, scroll, and pastes flow through to the child; with `--no-embed`, mouse capture stays off so your terminal's native text-selection works as usual.
 
 Border style reflects focus: bold border = the embedded pane has the keyboard; dim border = the sidebar does. Footer shows the relevant keybinds for current focus.
 
-`--no-embed` disables the embedded pane and reverts to the M2-era `tmux switch-client` / `SuspendAndRun` behaviour for users who prefer it.
+`--no-embed` disables the embedded pane entirely and reverts to the legacy `tmux switch-client` / `SuspendAndRun` behaviour.
 
 ## Configuration
 
@@ -41,32 +41,31 @@ Optional `~/.config/agent-mux/config.toml`:
 ```toml
 workspace_folders = ["~/workspace", "~/code"]
 
-# Remote hosts (M2). Each table is one SSH-reachable machine whose
-# Claude Code sessions show up alongside your local ones at startup.
-# Per-host `workspace_folders` (post-M5) lets `n` create sessions on
-# the remote; omit it to inherit the top-level workspaces.
+# Remote hosts. Each table is one SSH-reachable machine whose Claude
+# Code sessions show up alongside your local ones at startup. Per-host
+# `workspace_folders` lets `n` create sessions on the remote; omit it
+# to inherit the top-level list.
 [hosts.alpenglow]
 ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 # transcript_root = "~/.claude/projects"  # default; tilde-expanded
-# workspace_folders = ["~/work"]          # post-M5; inherits top-level if omitted
+# workspace_folders = ["~/work"]          # inherits top-level if omitted
 
-# Notification behaviour (M5). Every field has a default; the whole
-# section is optional. Master toggle, audible cue, and per-host
-# suppression are the M5-shipped knobs; quiet hours and customizable
-# sound files are post-M5.
+# Notification behaviour. Every field has a default; the whole section
+# is optional. Quiet-hours and per-event sound customization are not
+# yet supported.
 [notifications]
 enabled = true          # master on/off
 sound = false           # play the OS "default" notification sound
 disabled_hosts = []     # host labels to silence entirely
 
-# Theme overrides (M5). Pick a built-in palette via `preset`, then
-# optionally override individual fields. Each value is a string:
-# named ANSI colour, `bright_*` variant, or `#RRGGBB` hex. Empty
-# string (or the literal "default") clears that field — useful for
-# subtracting a colour from a preset. Bad names fail loudly at load.
+# Theme overrides. Pick a built-in palette via `preset`, then optionally
+# override individual fields. Each value is a string: named ANSI colour,
+# `bright_*` variant, or `#RRGGBB` hex. Empty string (or the literal
+# "default") clears that field — useful for subtracting a colour from a
+# preset. Bad names fail loudly at load.
 #
 # Built-in presets:
-#   "default"   — pre-M5 scheme: cyan/green/red preview, uncoloured glyphs.
+#   "default"   — cyan/green/red preview, uncoloured glyphs.
 #   "bright"    — high contrast; every attention state coloured,
 #                 preview switches to bright_* variants.
 #   "mono"      — no colours at all (modifiers like bold/dim still apply).
@@ -82,7 +81,7 @@ preset = "bright"
 needs_input = "#ff5555"    # override one field on top of the preset
 ```
 
-The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; tilde expansion only — env vars not yet supported).
+The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; tilde expansion only, env vars not yet supported).
 
 ### Remote sessions
 
@@ -90,13 +89,11 @@ Pressing `Enter` on a remote session runs `ssh -t <target> tmux attach -t <pane>
 
 **Prefix collisions when nesting tmux.** Running agent-mux from inside an outer tmux puts you in a multi-layer prefix situation:
 
-- Outer tmux owns its prefix (default `C-b`) — the user's normal way to manage their tmux session.
-- agent-mux's embedded-PTY leader is `C-a esc` — pressing `C-a` then `esc` returns focus to the sidebar without killing the inner tmux. `C-a` was picked to *avoid* colliding with tmux's `C-b` default.
-- The tmux server running inside the embedded pane (or the remote tmux you SSH-attached to) owns its own prefix.
+- Outer tmux owns its prefix (default `C-b`) — your normal way to manage that session.
+- agent-mux's embedded-pane leader is `C-a esc` — pressing `C-a` then `esc` returns focus to the sidebar without killing the inner tmux. `C-a` was picked to *avoid* colliding with tmux's `C-b` default.
+- The tmux server inside the embedded pane (or the remote tmux you SSH-attached to) owns its own prefix.
 
-If you've already remapped your outer or remote tmux to use `C-a`, that *will* collide with agent-mux's leader. Workarounds: remap one side (the most common move is configuring remote tmux to use a separate prefix like `C-x`), or use the standard tmux passthrough — send the conflicting prefix twice to pass it through to the inner tmux.
-
-A leader-chord config knob is on the roadmap (`#post-m5 #embedded-pty` in `TODO.md`) for users who can't avoid the `C-a` collision.
+If you've already remapped your outer or remote tmux to use `C-a`, that will collide with agent-mux's leader. Workarounds: remap one side (the most common move is configuring the remote tmux to use a separate prefix like `C-x`), or use the standard tmux passthrough — send the conflicting prefix twice. A leader-chord config knob is planned for users who can't avoid the collision.
 
 **When there's no remote pane to attach to.** If no remote tmux pane has `pane_current_path` matching the session's directory (e.g. the remote tmux server was restarted, or the original window was killed), agent-mux falls back to `tmux new-session -A -s agent-mux-<conv-id> -c <cwd> claude --resume <conv-id>` on the remote — creating a fresh remote tmux session named after the conversation, running `claude --resume`, and attaching the client. `-A` makes this idempotent: a second attach against the same conversation reuses the same remote tmux session rather than spawning a parallel `claude --resume` that would race on the transcript.
 
@@ -106,17 +103,17 @@ These `agent-mux-<id>` tmux sessions accumulate on the remote over time. Clean t
 
 ## Setup
 
-The Rust toolchain is pinned via `rust-toolchain.toml` (channel `1.94.0`). If you have rustup, it will auto-fetch this version on first `cargo` invocation; without rustup, any 1.94.x install satisfies the gate (CI uses exactly `1.94.0`). Pinning is what keeps the local pre-commit hook in sync with CI — bumps are deliberate.
+The Rust toolchain is pinned via `rust-toolchain.toml` (channel `1.94.0`). If you have rustup, it will auto-fetch this version on first `cargo` invocation; without rustup, any 1.94.x install satisfies the gate (CI uses exactly `1.94.0`).
 
 After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hook (fmt-check, clippy, tests, release-build — mirrors CI).
 
 ## How to run
 
-`cargo run` to start the binary. `cargo build --release` for an optimised build. `cargo test` for the test suite. See `PROCESS.md` for the canonical-commands list.
+`cargo run` to start the binary. `cargo build --release` for an optimised build. `cargo test` for the test suite.
 
 ## CLI subcommands and flags
 
-`agent-mux` with no arguments launches the dashboard in embedded-PTY mode (post-M5 default). Two read-only subcommands surface what's tunable without making the user dig through this README:
+`agent-mux` with no arguments launches the dashboard with the embedded pane enabled. Two read-only subcommands surface what's tunable without making you dig through this README:
 
 - `agent-mux themes` — coloured browser of every built-in theme preset, each element rendered in its actual colour so you can pick a palette by eye before editing the config.
 - `agent-mux config` — prints the current resolved config (which path was loaded, parsed `workspace_folders` / `hosts` / `notifications` / theme) followed by a reference TOML skeleton documenting every key with its default. The status block answers "is my config actually being read?" without log-spelunking; the reference is copy-pasteable into `~/.config/agent-mux/config.toml`.
@@ -159,7 +156,7 @@ The repository is a flake. From another flake, add it as an input and reference 
 }
 ```
 
-Pinning is the consumer's `flake.lock` — `nix flake update agent-mux` to pull a new commit, otherwise the same SHA every rebuild. `latest`-the-release staying mutable doesn't affect this path; the flake input resolves to a commit, not a release tag.
+Pinning is the consumer's `flake.lock` — `nix flake update agent-mux` to pull a new commit, otherwise the same SHA every rebuild.
 
 For one-shot or non-flake usage:
 
@@ -169,13 +166,15 @@ For one-shot or non-flake usage:
 
 Runtime dependencies (`tmux`, `ssh`, `git`, `claude`) are intentionally not in the closure — supply them from your normal environment.
 
-## Documents
+## Project documents
+
+These describe how the project is built and worked on, rather than how to use it — useful if you're contributing or just curious:
 
 - `SPEC.md` — what this project is.
 - `ARCHITECTURE.md` — how it's built.
 - `PROCESS.md` — how we work.
-- `FEATURES.md` — what's shipped.
-- `TODO.md` — what's planned.
+- `FEATURES.md` — feature ledger by milestone.
+- `TODO.md` — backlog.
 - `ACCEPTANCE.md` — release gates.
 
 ## License

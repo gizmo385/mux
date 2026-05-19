@@ -414,19 +414,19 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(out, "FLAGS:")?;
     writeln!(
         out,
-        "  --no-embed               Disable the embedded PTY pane (post-M5 default) and"
+        "  --no-embed               Disable the embedded PTY pane and revert to legacy"
     )?;
     writeln!(
         out,
-        "                           revert to legacy `tmux switch-client` / foreground"
+        "                           `tmux switch-client` / foreground `tmux attach`"
     )?;
     writeln!(
         out,
-        "                           `tmux attach` behaviour. Useful when you prefer"
+        "                           behaviour. Useful when you prefer agent-mux to"
     )?;
     writeln!(
         out,
-        "                           agent-mux to hand off the whole terminal."
+        "                           hand off the whole terminal rather than host a pane."
     )?;
     writeln!(out)?;
     writeln!(

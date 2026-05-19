@@ -104,15 +104,20 @@ fn main() -> io::Result<()> {
     // a subcommand. No subcommand → launch the TUI; that's the
     // original behaviour and the common case.
     //
-    // `--embedded` is a TUI-only flag intentionally undocumented for
-    // M5: it opts the run into the Phase-2 embedded-PTY `AttachmentDriver`
-    // arc. With Phase-2 wiring alone it just surfaces a "not yet wired"
-    // status on attach — usable for verifying the dispatch seam end-to-end.
-    // Phase 3 lands the actual embedded widget; Phase 6 documents the flag
-    // (and flips its default).
+    // The embedded-PTY arc landed in 2026-05; the default attach now
+    // renders the active session inside agent-mux's TUI alongside the
+    // sidebar (see SPEC.md / ARCHITECTURE.md for the design).
+    //
+    // `--no-embed` opts back into the legacy `tmux switch-client` /
+    // `SuspendAndRun` behaviour for users who prefer it. `--embedded`
+    // is silently accepted for one release as the inverse — it's a
+    // no-op now (the default already enables it) but eats the flag
+    // so any user with it aliased doesn't see an "unknown subcommand"
+    // error.
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    let embedded = argv.iter().any(|s| s == "--embedded");
-    argv.retain(|s| s != "--embedded");
+    let no_embed = argv.iter().any(|s| s == "--no-embed");
+    argv.retain(|s| s != "--no-embed" && s != "--embedded");
+    let embedded = !no_embed;
     let mut stdout = io::stdout();
     match argv.first().map(String::as_str) {
         None => run_tui(embedded),

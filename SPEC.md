@@ -6,7 +6,7 @@ What this project is. The authoritative description of scope and behaviour, dist
 
 A fast, terminal-first multiplexer for managing multiple Claude Code conversations across local and remote hosts.
 
-The user keeps several Claude Code sessions running in parallel — some on the local workstation, some on remote SSH-reachable machines. agent-mux is the dashboard that tracks them all in one TUI: which projects they cover, which are awaiting input, what they're currently doing. Pressing Enter on a session drops the user into the real Claude Code TUI for that session; detaching returns them to the dashboard. The tool is a control plane on top of `tmux` and Claude Code's on-disk transcripts; it does not re-implement either.
+The user keeps several Claude Code sessions running in parallel — some on the local workstation, some on remote SSH-reachable machines. agent-mux is the dashboard that tracks them all in one TUI: which projects they cover, which are awaiting input, what they're currently doing. Pressing Enter on a session brings the active session up inside an embedded terminal pane next to the dashboard list; the user sees their existing tmux + Claude Code session and can type, paste, slash-command, anything Claude Code supports. The dashboard sidebar stays visible while the user works in the embedded pane — see other sessions' attention state in real time without detaching. The tool is a control plane on top of `tmux` and Claude Code's on-disk transcripts; it does not re-implement either.
 
 The target user is a single developer who already lives in the terminal, already uses tmux, and runs Claude Code conversations frequently enough that "which window was that conversation in again?" is a real friction point.
 
@@ -32,7 +32,7 @@ What agent-mux does, in user-observable terms.
 - **Session discovery.** On startup, scans Claude Code's transcript directory for existing sessions and populates the dashboard. The user does not have to register sessions manually.
 - **Repo discovery (M1).** At startup, agent-mux scans each configured workspace folder one level deep for git repositories and caches the result in the Repo Registry. The new-session picker reads from this cache rather than re-scanning on every keystroke.
 - **Spawn a new session (M1).** From the dashboard, the user picks a repo from the registry, names a task, and picks a base branch; agent-mux creates a git worktree, starts `claude` inside it in a new tmux window, and registers the resulting session. The user is in the new session immediately. Worktree-backed sessions group under their parent repo's header in the dashboard (resolved from each cwd's `.git` pointer file at discovery time), so a session in `discord` and one in a `discord-<task>` worktree share one project group instead of fragmenting into per-worktree entries.
-- **Attach.** Pressing Enter on a session takes the user into that session's tmux window — they are now in the real Claude Code TUI and can type, paste, use slash commands, anything Claude Code supports. Detaching from tmux returns them to the dashboard.
+- **Attach.** Pressing Enter on a session opens the active session inside an embedded terminal pane occupying the right side of the dashboard; the dashboard list collapses to a compact ~40-column sidebar on the left. Inside the pane the user sees their real tmux + Claude Code session and can type, paste, use slash commands, anything Claude Code supports — agent-mux is just hosting the terminal tmux runs in. The sidebar updates live while the embedded pane has focus, so the user can see attention transitions on other sessions without detaching. `Ctrl-a Esc` returns focus to the sidebar without killing the PTY; pressing Enter on a different row drops the old PTY and attaches to the new session. `--no-embed` opts back into the legacy `tmux switch-client` / `SuspendAndRun` flow for users who prefer it.
 - **Spawn terminal in session cwd.** A keybind opens a new tmux window in the session's working directory, so the user can run shell commands alongside Claude Code without leaving agent-mux's mental model.
 - **Remote sessions (M2).** Sessions on configured SSH hosts appear in the same dashboard. Attaching SSH-tunnels into the remote tmux. Attention state for remote sessions is detected the same way as local — by watching the remote transcript file — over the existing SSH connection.
 - **Attention notifications.** When a session moves from `working` or `idle` into `needs-input`, the dashboard updates and (eventually) the user receives an OS-level notification.
@@ -40,8 +40,8 @@ What agent-mux does, in user-observable terms.
 
 What agent-mux does not do.
 
-- It does not render the full conversation in its own UI. The user always sees the real Claude Code TUI when interacting.
-- It does not own panes, splits, scrollback, or copy mode. tmux does those.
+- It does not render the conversation in its own UI. The user always sees the real tmux + Claude Code TUI when interacting; the embedded pane just hosts the terminal that tmux runs in, and the content is whatever tmux paints.
+- It does not implement panes-within-tmux, splits, scrollback, or copy mode. Those remain tmux's job — even with embedded attach, `prefix [`, `prefix %`, `prefix "`, etc. work as they always have, against the tmux server running inside the embedded pane.
 - It does not start, configure, or update Claude Code itself.
 
 ## Roadmap

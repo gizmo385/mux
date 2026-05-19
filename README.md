@@ -4,19 +4,27 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Status
 
-M1 complete. M2 (remote hosts) substantially shipped: with `[hosts.<name>]` entries in the config, the dashboard surfaces sessions from SSH-reachable machines at startup, attention updates stream live (every 3s, over each host's existing `ControlMaster` connection), and `Enter` / `t` attach into the remote tmux. Remote portability and post-M5 remote session *creation* remain in `TODO.md`. M3 (inline preview) substantially shipped: `p` toggles a right-side pane that reads the selected session's recent transcript activity (user prompts, assistant prose, tool calls, tool results) without requiring an attach. M4 (attention notifications) shipped: when a session moves into `needs-input`, agent-mux fires an OS notification (libnotify on Linux, NSUserNotification on macOS) carrying the session's title and host. Per-episode and time-window suppression keep notification spam in check; user-facing on/off and quiet-hours knobs land in M5.
+M1 complete. M2 (remote hosts) substantially shipped: with `[hosts.<name>]` entries in the config, the dashboard surfaces sessions from SSH-reachable machines at startup, attention updates stream live (every 3s, over each host's existing `ControlMaster` connection), and `Enter` / `t` attach into the remote tmux. Remote portability and post-M5 remote session *creation* remain in `TODO.md`. M3 (inline preview) substantially shipped: `p` toggles a right-side pane that reads the selected session's recent transcript activity (user prompts, assistant prose, tool calls, tool results) without requiring an attach. M4 (attention notifications) shipped: when a session moves into `needs-input`, agent-mux fires an OS notification (libnotify on Linux, NSUserNotification on macOS) carrying the session's title and host. Per-episode and time-window suppression keep notification spam in check; user-facing on/off and quiet-hours knobs land in M5. **Post-M5 — embedded-PTY dashboard shipped 2026-05-18:** the default attach now hosts the active session inside a ratatui-rendered PTY widget next to the dashboard sidebar, instead of `tmux switch-client`-ing the whole terminal. The sidebar stays live while you work — attention transitions on other sessions surface without detaching. `--no-embed` opts back into the legacy flow.
 
 The dashboard runs (`cargo run`), discovers local Claude Code sessions, groups them under host headers (`── local ──`, then any configured SSH hosts alphabetical) with dim project sub-headers beneath each host, labels each row with its title (from `.agent-mux/task.toml` or Claude's auto-generated `aiTitle`, falling back to a short session-id suffix), shows live attention state (● needs-input, ◐ working, ○ idle), dims the title when no live tmux pane matches the session (Enter will spin up a fresh `claude --resume` rather than fast-switch into an existing pane), and:
 
 - `↑`/`↓` or `j`/`k` — navigate the list
 - `J`/`K` — jump to the next / previous **project**. Lands on the first session of the target project; wraps. No-op when only one project is on screen.
 - `Ctrl-j`/`Ctrl-k` — jump to the next / previous **host**. Same semantics as `J`/`K` one level up. No-op with only one host.
-- `Enter` — switch into the tmux pane running the selected session; if there is no live pane, resume the conversation in a fresh `claude --resume` in the session's recorded cwd
+- `Enter` — attach to the selected session inside an embedded terminal pane on the right side of the dashboard; the list collapses to a 40-column sidebar on the left while the pane has focus. Press `Ctrl-a Esc` to return focus to the sidebar without killing the PTY; press `Enter` on a different row to attach to that session instead. (`--no-embed` reverts to the legacy behaviour: `tmux switch-client` from inside tmux, `tmux attach` as a subprocess outside.)
 - `t` — open a new tmux window in the session's cwd (or, outside tmux, drop into `$SHELL` in the cwd)
 - `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created in `<workspace>/.agent-mux-worktrees/<repo>-<task>/` (a hidden sibling of the parent repo, so the workspace folder stays uncluttered) and `claude` is launched in it.
 - `/` — search/filter sessions by title, project directory, or host (case-insensitive substring). Type to narrow live, `Enter` to apply (keeps filter and returns focus to the list), `Esc` to clear and exit, `/` again to edit the active filter.
-- `p` — toggle the preview pane: a right-side split showing the last entries of the selected session's transcript (your prompts, the assistant's prose, tool calls, and tool results) without attaching. Lazy-fetched per selection; cached so navigating back is instant; auto-invalidated when the transcript advances.
-- `q` / Ctrl-C — quit
+- `p` — toggle the preview pane: a right-side split showing the last entries of the selected session's transcript (your prompts, the assistant's prose, tool calls, and tool results) without attaching. Lazy-fetched per selection; cached so navigating back is instant; auto-invalidated when the transcript advances. (Disabled while the embedded pane is active — the terminal *is* the preview, in HD.)
+- `q` / Ctrl-C — quit (in sidebar focus only; inside the embedded pane, Ctrl-C interrupts the running child, the standard tty behaviour)
+
+### Embedded pane (default)
+
+When you press Enter on a session, agent-mux spawns `tmux attach -t <pane>` (or `tmux new-session -A -s agent-mux-<id> claude --resume <id>` if no live pane matches) into a pseudoterminal hosted inside the dashboard's right pane. tmux + Claude Code still own the rendered content — agent-mux is just the surrounding window. Mouse capture and bracketed paste are enabled while embedded so clicks, scroll, and pastes flow through to the child; outside embedded mode they're off so your terminal's native text-selection still works.
+
+Border style reflects focus: bold border = the embedded pane has the keyboard; dim border = the sidebar does. Footer shows the relevant keybinds for current focus.
+
+`--no-embed` disables the embedded pane and reverts to the M2-era `tmux switch-client` / `SuspendAndRun` behaviour for users who prefer it.
 
 ## Configuration
 

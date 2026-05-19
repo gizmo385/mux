@@ -1942,6 +1942,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.pending_hosts,
         &app.connect_errors,
         app.focus,
+        &app.config.tools,
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -2003,6 +2004,11 @@ fn compose_search_bar(search: &SearchState, visible: usize) -> String {
 /// feedback isn't drowned out, but stay visible (until the next
 /// transient status, then re-surface) so they're not silently lost
 /// the way a single overwriting `status` field would lose them.
+// Pure formatting helper: 8 small inputs read straight off the App
+// to render one ratatui-paragraph string. Bundling into a struct
+// would buy nothing here — every caller would build the same struct
+// inline at the same call site — so we silence the lint.
+#[allow(clippy::too_many_arguments)]
 fn compose_footer(
     creating: Option<&CreatingSession>,
     status: Option<&str>,
@@ -2011,6 +2017,7 @@ fn compose_footer(
     pending_hosts: usize,
     connect_errors: &[(HostId, String)],
     focus: Focus,
+    tools: &[ToolBinding],
 ) -> String {
     // Terminal focus narrows the footer to a single hint — the
     // embedded child owns every other key, so listing the sidebar
@@ -2043,9 +2050,37 @@ fn compose_footer(
     } else {
         String::new()
     };
+    // Tool hints slot in between the built-ins and `q: quit` so the
+    // quit hint stays last — most-frequently-needed-at-the-edge.
+    // Empty tools list elides cleanly (no leading separator).
+    let tool_hints = if tools.is_empty() {
+        String::new()
+    } else {
+        let entries: Vec<String> = tools
+            .iter()
+            .map(|t| format!("{}: {}", t.key, footer_tool_label(t)))
+            .collect();
+        format!(" · {}", entries.join(" · "))
+    };
     format!(
-        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · d: delete · q: quit  ·  return: {return_hint}{suffix} "
+        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
     )
+}
+
+/// Resolve a tool's footer label: explicit `name` wins, else the
+/// program name (first command token), else a generic `tool` so a
+/// future malformed binding doesn't leave the line dangling.
+/// Same fallback chain as the launch-status line in `launch_tool`.
+fn footer_tool_label(t: &ToolBinding) -> String {
+    if let Some(n) = t.name.as_deref()
+        && !n.is_empty()
+    {
+        return n.to_string();
+    }
+    t.command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "tool".to_string())
 }
 
 /// Embedded-PTY layout: compact sidebar on the left, terminal on the
@@ -2333,9 +2368,64 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(!s.contains("prefix+d"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_keybind_line_lists_configured_tools_with_name_fallback() {
+        // Tools surface inline so the user can spot their custom binds
+        // without checking config. Label precedence: explicit `name`
+        // wins, else `command[0]`. Empty tools list adds nothing.
+        let tools = vec![
+            tool('g', &["lazygit"]),
+            ToolBinding {
+                key: 'v',
+                name: Some("edit".to_string()),
+                command: vec!["nvim".into(), ".".into()],
+            },
+        ];
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+            &tools,
+        );
+        assert!(s.contains("g: lazygit"), "got: {s}");
+        assert!(s.contains("v: edit"), "got: {s}");
+        // Order is "...d: delete · <tools> · q: quit": tool hints land
+        // between the worktree-delete affordance and the trailing quit.
+        let d_pos = s.find("d: delete").expect("delete hint present");
+        let q_pos = s.find("q: quit").expect("quit hint present");
+        let g_pos = s.find("g: lazygit").expect("tool g present");
+        assert!(
+            d_pos < g_pos && g_pos < q_pos,
+            "tools must sit between delete and quit: {s}"
+        );
+    }
+
+    #[test]
+    fn footer_keybind_line_omits_tool_separator_when_no_tools_configured() {
+        // No tools means the footer reads "…d: delete · q: quit…" with
+        // no orphan ` · ` between them — guarding against an empty
+        // join leaving a dangling separator.
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("d: delete · q: quit"), "got: {s}");
     }
 
     #[test]
@@ -2352,6 +2442,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("d: delete"), "got: {s}");
     }
@@ -2366,6 +2457,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("p: preview"), "got: {s}");
     }
@@ -2380,6 +2472,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("J/K: project"), "got: {s}");
         assert!(s.contains("⌃j/⌃k: host"), "got: {s}");
@@ -2395,6 +2488,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("return: prefix+d"), "got: {s}");
         assert!(!s.contains("prefix+s"), "got: {s}");
@@ -2410,6 +2504,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(!s.contains("return:"), "got: {s}");
         assert!(s.contains("no sessions"), "got: {s}");
@@ -2425,6 +2520,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("attach: boom"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
@@ -2444,6 +2540,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("creating worktree"), "got: {s}");
         assert!(s.contains("agent-mux"), "got: {s}");
@@ -2460,6 +2557,7 @@ mod tests {
             2,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("return: prefix+s"), "got: {s}");
         assert!(s.contains("connecting to 2 host(s)"), "got: {s}");
@@ -2478,6 +2576,7 @@ mod tests {
             1,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("connecting to 1 host(s)"), "got: {s}");
         assert!(!s.contains("no sessions"), "got: {s}");
@@ -2493,6 +2592,7 @@ mod tests {
             0,
             &no_connect_errors(),
             Focus::Sidebar,
+            &[],
         );
         assert!(!s.contains("connecting to"), "got: {s}");
     }
@@ -2500,7 +2600,7 @@ mod tests {
     #[test]
     fn footer_renders_connect_errors_as_sticky_line_when_no_status() {
         let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
-        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar);
+        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar, &[]);
         assert!(s.contains("connect failed: alpenglow"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
     }
@@ -2515,7 +2615,7 @@ mod tests {
             (HostId("alpenglow".into()), "first error".to_string()),
             (HostId("gpu-1".into()), "second error".to_string()),
         ];
-        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar);
+        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar, &[]);
         assert!(s.contains("alpenglow"), "got: {s}");
         assert!(s.contains("gpu-1"), "got: {s}");
     }
@@ -2533,6 +2633,7 @@ mod tests {
             0,
             &errors,
             Focus::Sidebar,
+            &[],
         );
         assert!(s.contains("opened terminal"), "got: {s}");
         assert!(!s.contains("connect failed"), "got: {s}");
@@ -2609,6 +2710,7 @@ mod tests {
             Focus::Terminal {
                 leader_armed: false,
             },
+            &[],
         );
         assert!(s.contains("back to sidebar"), "got: {s}");
         assert!(!s.contains("j/k"), "got: {s}");
@@ -2630,6 +2732,7 @@ mod tests {
             Focus::Terminal {
                 leader_armed: false,
             },
+            &[],
         );
         assert!(s.contains("attach: boom"), "got: {s}");
         assert!(!s.contains("back to sidebar"), "got: {s}");

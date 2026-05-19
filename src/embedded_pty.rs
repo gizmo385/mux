@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -308,6 +308,76 @@ pub fn encode_key_for_pty(key: &KeyEvent) -> Vec<u8> {
     payload
 }
 
+/// Encode a crossterm [`MouseEvent`] into an SGR-mode (xterm 1006)
+/// mouse report — `\x1b[<{button};{col};{row}M` (press / scroll /
+/// motion) or `…m` (release). SGR is the modern mouse protocol every
+/// recent terminal speaks, and what tmux / `claude` parse on stdin.
+///
+/// `pty_col` and `pty_row` are PTY-relative, 1-based coordinates. The
+/// caller is responsible for the terminal-to-PTY translation (subtract
+/// the embedded pane's origin, then add 1 to match SGR's base).
+///
+/// Returns `None` for unhandled kinds (`ScrollLeft` / `ScrollRight`,
+/// `Moved` without a held button) — those are rare and would need
+/// terminal-specific encoding; emit nothing rather than guessing.
+#[must_use]
+pub fn encode_mouse_event(ev: &MouseEvent, pty_col: u16, pty_row: u16) -> Option<Vec<u8>> {
+    let modifier_bits = mouse_modifier_bits(*ev);
+    let (button_code, kind_byte) = match ev.kind {
+        MouseEventKind::Down(b) => (button_code(b), b'M'),
+        MouseEventKind::Up(b) => (button_code(b), b'm'),
+        MouseEventKind::Drag(b) => (button_code(b) + 32, b'M'),
+        MouseEventKind::ScrollUp => (64, b'M'),
+        MouseEventKind::ScrollDown => (65, b'M'),
+        // Moved-without-button + horizontal scroll: deliberate gaps —
+        // see the function-level comment.
+        MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+            return None;
+        }
+    };
+    let code = button_code | modifier_bits;
+    Some(format!("\x1b[<{code};{pty_col};{pty_row}{}", kind_byte as char).into_bytes())
+}
+
+fn button_code(b: MouseButton) -> u32 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn mouse_modifier_bits(ev: MouseEvent) -> u32 {
+    let mut bits = 0u32;
+    if ev.modifiers.contains(KeyModifiers::SHIFT) {
+        bits |= 4;
+    }
+    if ev.modifiers.contains(KeyModifiers::ALT) {
+        bits |= 8;
+    }
+    if ev.modifiers.contains(KeyModifiers::CONTROL) {
+        bits |= 16;
+    }
+    bits
+}
+
+/// Wrap pasted text in bracketed-paste markers (`\e[200~ … \e[201~`),
+/// the protocol the embedded child opts into via `DECSET 2004`. Any
+/// `\e[201~` sequence inside the paste is stripped first — a paste
+/// containing that close-bracket would prematurely terminate the
+/// paste mode and inject the rest as raw keystrokes, which is a
+/// real security concern (think pasting from a maliciously-crafted
+/// URL into a sudo prompt).
+#[must_use]
+pub fn encode_paste(text: &str) -> Vec<u8> {
+    let sanitized = text.replace("\x1b[201~", "");
+    let mut out = Vec::with_capacity(sanitized.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(sanitized.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 /// Manual `Debug` because `MasterPty` and the boxed writer don't
 /// implement it. We don't need the field contents in a diagnostic — the
 /// existence of the struct is enough for `assert_*!`-style failure
@@ -564,6 +634,123 @@ mod tests {
         // Shift-Tab. Distinct from regular Tab so terminals can move
         // backwards through focusable elements.
         assert_eq!(encode_key_for_pty(&key(KeyCode::BackTab)), b"\x1b[Z");
+    }
+
+    // ---- encode_mouse_event ----
+
+    fn mouse(kind: MouseEventKind, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn encode_mouse_left_down_uses_sgr_press_form() {
+        let ev = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::empty(),
+        );
+        assert_eq!(encode_mouse_event(&ev, 10, 5).unwrap(), b"\x1b[<0;10;5M",);
+    }
+
+    #[test]
+    fn encode_mouse_left_up_uses_lowercase_terminator() {
+        // SGR distinguishes press (M) from release (m) by terminator
+        // case. The terminal program needs both to track drag state.
+        let ev = mouse(MouseEventKind::Up(MouseButton::Left), KeyModifiers::empty());
+        assert_eq!(encode_mouse_event(&ev, 10, 5).unwrap(), b"\x1b[<0;10;5m",);
+    }
+
+    #[test]
+    fn encode_mouse_right_down_uses_button_code_2() {
+        let ev = mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            KeyModifiers::empty(),
+        );
+        assert_eq!(encode_mouse_event(&ev, 1, 1).unwrap(), b"\x1b[<2;1;1M",);
+    }
+
+    #[test]
+    fn encode_mouse_scroll_up_uses_button_code_64() {
+        let ev = mouse(MouseEventKind::ScrollUp, KeyModifiers::empty());
+        assert_eq!(encode_mouse_event(&ev, 12, 8).unwrap(), b"\x1b[<64;12;8M",);
+    }
+
+    #[test]
+    fn encode_mouse_scroll_down_uses_button_code_65() {
+        let ev = mouse(MouseEventKind::ScrollDown, KeyModifiers::empty());
+        assert_eq!(encode_mouse_event(&ev, 12, 8).unwrap(), b"\x1b[<65;12;8M",);
+    }
+
+    #[test]
+    fn encode_mouse_drag_adds_motion_bit_32() {
+        let ev = mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::empty(),
+        );
+        assert_eq!(
+            encode_mouse_event(&ev, 5, 5).unwrap(),
+            // Left (0) + drag (32) = 32
+            b"\x1b[<32;5;5M",
+        );
+    }
+
+    #[test]
+    fn encode_mouse_modifiers_add_to_button_code() {
+        // SGR encodes Shift=4, Alt=8, Ctrl=16 on top of the base
+        // button code. Ctrl-Shift-LeftClick at (1,1) yields
+        // (0 | 4 | 16) = 20.
+        let ev = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(encode_mouse_event(&ev, 1, 1).unwrap(), b"\x1b[<20;1;1M",);
+    }
+
+    #[test]
+    fn encode_mouse_moved_without_button_returns_none() {
+        // Motion-without-button events would need terminal-specific
+        // encoding; emit nothing rather than guessing wrong.
+        let ev = mouse(MouseEventKind::Moved, KeyModifiers::empty());
+        assert!(encode_mouse_event(&ev, 10, 5).is_none());
+    }
+
+    // ---- encode_paste ----
+
+    #[test]
+    fn encode_paste_wraps_text_in_bracketed_paste_markers() {
+        let out = encode_paste("hello world");
+        assert_eq!(out, b"\x1b[200~hello world\x1b[201~");
+    }
+
+    #[test]
+    fn encode_paste_strips_embedded_close_marker_to_prevent_injection() {
+        // A paste containing the close-bracket could otherwise
+        // terminate the paste prematurely and inject the trailing
+        // bytes as raw keystrokes — a real concern when pasting from
+        // a hostile source (e.g. a maliciously-crafted snippet).
+        let injected = "innocent\x1b[201~rm -rf /";
+        let out = encode_paste(injected);
+        let expected = b"\x1b[200~innocentrm -rf /\x1b[201~";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn encode_paste_handles_empty_text() {
+        let out = encode_paste("");
+        assert_eq!(out, b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn encode_paste_preserves_newlines() {
+        // Multi-line pastes are a common case (a snippet of code) and
+        // the embedded child needs to receive the newlines verbatim,
+        // not translated.
+        let out = encode_paste("line1\nline2");
+        assert_eq!(out, b"\x1b[200~line1\nline2\x1b[201~");
     }
 
     #[test]

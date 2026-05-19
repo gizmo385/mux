@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, SystemTime};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -32,7 +35,9 @@ use agent_mux::dashboard::{
     next_session_index, prev_host_index, prev_project_index, prev_session_index,
 };
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
-use agent_mux::embedded_pty::{EmbeddedPty, PtyEvent, encode_key_for_pty};
+use agent_mux::embedded_pty::{
+    EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
+};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
 use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
@@ -140,10 +145,10 @@ fn run_tui(embedded: bool) -> io::Result<()> {
     } else {
         Box::new(TmuxDriver::new())
     };
-    let mut app = App::new(driver)?;
-    let mut terminal = setup_terminal()?;
+    let mut app = App::new(driver, embedded)?;
+    let mut terminal = setup_terminal(embedded)?;
     let result = run(&mut terminal, &mut app);
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, embedded)?;
     result
 }
 
@@ -155,25 +160,38 @@ fn stdout_is_terminal() -> bool {
     io::stdout().is_terminal()
 }
 
-fn enter_screen() -> io::Result<()> {
+fn enter_screen(embedded: bool) -> io::Result<()> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    if embedded {
+        // Mouse + bracketed paste are only enabled in embedded mode.
+        // Non-embedded runs preserve the terminal's normal text-
+        // selection-with-mouse behaviour. Inside embedded mode the
+        // user expects mouse to work against the running child; native
+        // selection still works behind Shift.
+        execute!(stdout, EnableMouseCapture, EnableBracketedPaste)?;
+    }
     Ok(())
 }
 
-fn leave_screen() -> io::Result<()> {
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+fn leave_screen(embedded: bool) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    if embedded {
+        execute!(stdout, DisableBracketedPaste, DisableMouseCapture)?;
+    }
+    execute!(stdout, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
 }
 
-fn setup_terminal() -> io::Result<Tui> {
-    enter_screen()?;
+fn setup_terminal(embedded: bool) -> io::Result<Tui> {
+    enter_screen(embedded)?;
     Terminal::new(CrosstermBackend::new(io::stdout()))
 }
 
-fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
-    leave_screen()?;
+fn restore_terminal(terminal: &mut Tui, embedded: bool) -> io::Result<()> {
+    leave_screen(embedded)?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -182,15 +200,19 @@ fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
 /// the terminal, run it, then re-enter and force a redraw. Used when the
 /// attachment driver hands a command off (e.g. `tmux attach` from outside
 /// tmux, or `$SHELL` for an outside-tmux spawn-terminal).
-fn suspend_and_run(terminal: &mut Tui, cmd: &SuspendCommand) -> io::Result<Option<String>> {
-    leave_screen()?;
+fn suspend_and_run(
+    terminal: &mut Tui,
+    cmd: &SuspendCommand,
+    embedded: bool,
+) -> io::Result<Option<String>> {
+    leave_screen(embedded)?;
     let mut process = Command::new(&cmd.program);
     process.args(&cmd.args);
     if let Some(cwd) = &cmd.cwd {
         process.current_dir(cwd);
     }
     let status = process.status();
-    enter_screen()?;
+    enter_screen(embedded)?;
     terminal.clear()?;
     match status {
         Ok(_) => Ok(None),
@@ -288,6 +310,11 @@ struct App {
     /// successful `EmbedPty` attach; back to `Sidebar` on prefix-escape
     /// (`Ctrl-a Esc`) or PTY exit.
     focus: Focus,
+    /// Whether the binary was launched with `--embedded`. Drives the
+    /// mouse-capture + bracketed-paste opt-ins at terminal-setup time
+    /// and gates the corresponding input routing in the main loop.
+    /// Static for the life of the run (no in-app toggle).
+    embedded_mode: bool,
 }
 
 /// Owns the embedded pseudoterminal and remembers which session it's
@@ -299,10 +326,16 @@ struct App {
 /// draw path compares the current rendered area against this and
 /// fires `EmbeddedPty::resize` only on change — sending SIGWINCH on
 /// every frame would be 60 wakeups/sec for nothing.
+///
+/// `last_inner` is the `Rect` of the PTY's content area (inside the
+/// block border) from the most recent draw — used by the mouse event
+/// handler to translate terminal-absolute click coordinates into
+/// PTY-relative ones. `None` until the first frame renders.
 struct Embedded {
     pty: EmbeddedPty,
     session_id: SessionId,
     last_size: (u16, u16),
+    last_inner: Option<ratatui::layout::Rect>,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -378,7 +411,7 @@ enum RemoteDiscoveryResult {
 }
 
 impl App {
-    fn new(driver: Box<dyn AttachmentDriver>) -> io::Result<Self> {
+    fn new(driver: Box<dyn AttachmentDriver>, embedded_mode: bool) -> io::Result<Self> {
         // Config drives both the cache-load (which `[hosts.<name>]`
         // do we have snapshots for) and the SSH-discovery spawn loop,
         // so it's loaded first.
@@ -508,6 +541,7 @@ impl App {
             theme,
             embedded: None,
             focus: Focus::default(),
+            embedded_mode,
         })
     }
 
@@ -1064,6 +1098,7 @@ impl App {
                     pty,
                     session_id,
                     last_size: (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
+                    last_inner: None,
                 });
                 self.focus = Focus::Terminal {
                     leader_armed: false,
@@ -1120,6 +1155,57 @@ impl App {
         if let Err(e) = embedded.pty.write_input(bytes) {
             self.status = Some(format!("pty write: {e}"));
         }
+    }
+
+    /// Translate a terminal-absolute mouse event into PTY-relative
+    /// coordinates (1-based) and forward it as an SGR mouse report.
+    /// Drops the event when:
+    /// - The embedded PTY isn't focused (mouse outside the terminal
+    ///   pane is meaningless for the running child).
+    /// - The click landed outside the PTY's content area (sidebar,
+    ///   borders, header, footer).
+    /// - The event kind isn't supported by `encode_mouse_event` (e.g.
+    ///   horizontal scroll).
+    fn handle_terminal_mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        if !matches!(self.focus, Focus::Terminal { .. }) {
+            return;
+        }
+        let Some(embedded) = self.embedded.as_ref() else {
+            return;
+        };
+        let Some(inner) = embedded.last_inner else {
+            return;
+        };
+        // crossterm reports 0-based terminal coordinates; SGR mouse
+        // expects 1-based PTY-relative. Bounds check first so a click
+        // in the sidebar doesn't get encoded as a negative coord.
+        let col = ev.column;
+        let row = ev.row;
+        if col < inner.x
+            || row < inner.y
+            || col >= inner.x + inner.width
+            || row >= inner.y + inner.height
+        {
+            return;
+        }
+        let pty_col = col - inner.x + 1;
+        let pty_row = row - inner.y + 1;
+        if let Some(bytes) = encode_mouse_event(&ev, pty_col, pty_row) {
+            self.write_to_embedded(&bytes);
+        }
+    }
+
+    /// Forward a bracketed-paste payload to the embedded PTY, wrapped
+    /// in the `\e[200~ … \e[201~` markers the child opted into. No-op
+    /// in Sidebar focus — pasting into the dashboard list is
+    /// undefined and silently ignored is better than corrupting the
+    /// search query.
+    fn handle_terminal_paste(&mut self, text: &str) {
+        if !matches!(self.focus, Focus::Terminal { .. }) {
+            return;
+        }
+        let bytes = encode_paste(text);
+        self.write_to_embedded(&bytes);
     }
 
     /// Drain pending events from the embedded PTY's reader thread.
@@ -1249,11 +1335,29 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         app.drain_repo_scans();
         app.drain_pty_events();
         if let Some(cmd) = app.drain_creates()
-            && let Some(err) = suspend_and_run(terminal, &cmd)?
+            && let Some(err) = suspend_and_run(terminal, &cmd, app.embedded_mode)?
         {
             app.status = Some(err);
         }
-        if has_event && let Event::Key(key) = event::read()? {
+        if has_event {
+            let raw = event::read()?;
+            match raw {
+                Event::Mouse(mev) => {
+                    app.handle_terminal_mouse(mev);
+                    continue;
+                }
+                Event::Paste(text) => {
+                    app.handle_terminal_paste(&text);
+                    continue;
+                }
+                // Resize falls through — the next draw's resize cascade
+                // picks up the new terminal size automatically.
+                // FocusGained/FocusLost don't fire (we didn't enable
+                // them) but a stray instance is a safe no-op.
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => continue,
+                Event::Key(_) => {}
+            }
+            let Event::Key(key) = raw else { continue };
             // Embedded-terminal focus owns the keyboard. Ctrl-C goes
             // to the running child (the standard "interrupt" gesture);
             // the only way out is the leader chord (`Ctrl-a Esc`).
@@ -1284,52 +1388,14 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             if app.route_search_active_key(key) {
                 continue;
             }
-            let pending = match action_for(key) {
-                Some(Action::Quit) => return Ok(()),
-                Some(Action::Next) => {
-                    app.next();
-                    None
+            match dispatch_action(app, action_for(key)) {
+                ActionOutcome::Quit => return Ok(()),
+                ActionOutcome::Continue => {}
+                ActionOutcome::Suspend(cmd) => {
+                    if let Some(err) = suspend_and_run(terminal, &cmd, app.embedded_mode)? {
+                        app.status = Some(err);
+                    }
                 }
-                Some(Action::Prev) => {
-                    app.prev();
-                    None
-                }
-                Some(Action::NextProject) => {
-                    app.next_project();
-                    None
-                }
-                Some(Action::PrevProject) => {
-                    app.prev_project();
-                    None
-                }
-                Some(Action::NextHost) => {
-                    app.next_host();
-                    None
-                }
-                Some(Action::PrevHost) => {
-                    app.prev_host();
-                    None
-                }
-                Some(Action::Attach) => app.attach_selected(),
-                Some(Action::SpawnTerminal) => app.spawn_terminal_selected(),
-                Some(Action::NewSession) => {
-                    app.open_new_session();
-                    None
-                }
-                Some(Action::OpenSearch) => {
-                    app.open_search();
-                    None
-                }
-                Some(Action::TogglePreview) => {
-                    app.toggle_preview();
-                    None
-                }
-                None => None,
-            };
-            if let Some(cmd) = pending
-                && let Some(err) = suspend_and_run(terminal, &cmd)?
-            {
-                app.status = Some(err);
             }
         }
         // Run on every loop iteration — covers all causes of "selected
@@ -1403,6 +1469,72 @@ fn connect_and_discover(
         let _ = cache::write_for_host(&dir, &host_id, &sessions);
     }
     let _ = tx.send(RemoteDiscoveryResult::Ready { host_id, sessions });
+}
+
+/// Outcome of a sidebar-focus key dispatch. Lets `run` keep its event
+/// loop linear instead of nesting `Option<SuspendCommand>` and
+/// early-return inside a `match` arm.
+enum ActionOutcome {
+    Quit,
+    Continue,
+    Suspend(SuspendCommand),
+}
+
+/// Apply a sidebar `Action` to the app and report back what the main
+/// loop should do. Pulled out of `run` to keep that function under the
+/// line cap; pure dispatch with no terminal handoff (the caller
+/// invokes `suspend_and_run` for the `Suspend` variant).
+fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
+    let Some(action) = action else {
+        return ActionOutcome::Continue;
+    };
+    match action {
+        Action::Quit => ActionOutcome::Quit,
+        Action::Next => {
+            app.next();
+            ActionOutcome::Continue
+        }
+        Action::Prev => {
+            app.prev();
+            ActionOutcome::Continue
+        }
+        Action::NextProject => {
+            app.next_project();
+            ActionOutcome::Continue
+        }
+        Action::PrevProject => {
+            app.prev_project();
+            ActionOutcome::Continue
+        }
+        Action::NextHost => {
+            app.next_host();
+            ActionOutcome::Continue
+        }
+        Action::PrevHost => {
+            app.prev_host();
+            ActionOutcome::Continue
+        }
+        Action::Attach => match app.attach_selected() {
+            Some(cmd) => ActionOutcome::Suspend(cmd),
+            None => ActionOutcome::Continue,
+        },
+        Action::SpawnTerminal => match app.spawn_terminal_selected() {
+            Some(cmd) => ActionOutcome::Suspend(cmd),
+            None => ActionOutcome::Continue,
+        },
+        Action::NewSession => {
+            app.open_new_session();
+            ActionOutcome::Continue
+        }
+        Action::OpenSearch => {
+            app.open_search();
+            ActionOutcome::Continue
+        }
+        Action::TogglePreview => {
+            app.toggle_preview();
+            ActionOutcome::Continue
+        }
+    }
 }
 
 enum Action {
@@ -1702,6 +1834,7 @@ fn draw_embedded(
         embedded.last_size = new_size;
     }
 
+    embedded.last_inner = Some(inner);
     frame.render_widget(term_block, split[1]);
     embedded.pty.render(frame, inner);
 }

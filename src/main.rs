@@ -18,7 +18,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
-use agent_mux::attachment::{AttachOutcome, AttachmentDriver, SuspendCommand, TmuxDriver};
+use agent_mux::attachment::{
+    AttachOutcome, AttachmentDriver, PtyDriver, SuspendCommand, TmuxDriver,
+};
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
@@ -74,10 +76,19 @@ fn main() -> io::Result<()> {
     // `args().skip(1)` drops argv[0] (program path). Anything left is
     // a subcommand. No subcommand → launch the TUI; that's the
     // original behaviour and the common case.
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    //
+    // `--embedded` is a TUI-only flag intentionally undocumented for
+    // M5: it opts the run into the Phase-2 embedded-PTY `AttachmentDriver`
+    // arc. With Phase-2 wiring alone it just surfaces a "not yet wired"
+    // status on attach — usable for verifying the dispatch seam end-to-end.
+    // Phase 3 lands the actual embedded widget; Phase 6 documents the flag
+    // (and flips its default).
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let embedded = argv.iter().any(|s| s == "--embedded");
+    argv.retain(|s| s != "--embedded");
     let mut stdout = io::stdout();
     match argv.first().map(String::as_str) {
-        None => run_tui(),
+        None => run_tui(embedded),
         Some("themes") => cli::print_themes(&mut stdout, stdout_is_terminal()),
         Some("config") => {
             let searched = config::config_search_paths();
@@ -98,8 +109,16 @@ fn main() -> io::Result<()> {
     }
 }
 
-fn run_tui() -> io::Result<()> {
-    let mut app = App::new()?;
+fn run_tui(embedded: bool) -> io::Result<()> {
+    // The driver choice is decided once at boot and stays for the life
+    // of the process — there's no in-app switcher. Dogfooders flip the
+    // flag between runs.
+    let driver: Box<dyn AttachmentDriver> = if embedded {
+        Box::new(PtyDriver::new())
+    } else {
+        Box::new(TmuxDriver::new())
+    };
+    let mut app = App::new(driver)?;
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
@@ -168,7 +187,7 @@ struct App {
     hosts: HashMap<HostId, Arc<dyn Host>>,
     watcher: TranscriptWatcher,
     updates: Receiver<WatcherEvent>,
-    driver: TmuxDriver,
+    driver: Box<dyn AttachmentDriver>,
     status: Option<String>,
     config: Config,
     registry: RepoRegistry,
@@ -309,7 +328,7 @@ enum RemoteDiscoveryResult {
 }
 
 impl App {
-    fn new() -> io::Result<Self> {
+    fn new(driver: Box<dyn AttachmentDriver>) -> io::Result<Self> {
         // Config drives both the cache-load (which `[hosts.<name>]`
         // do we have snapshots for) and the SSH-discovery spawn loop,
         // so it's loaded first.
@@ -416,7 +435,7 @@ impl App {
             hosts,
             watcher,
             updates,
-            driver: TmuxDriver::new(),
+            driver,
             status: None,
             config,
             registry,
@@ -759,6 +778,20 @@ impl App {
                             self.status = None;
                             return Some(cmd);
                         }
+                        Ok(AttachOutcome::EmbedPty(_)) => {
+                            // Today's `PtyDriver::spawn_session` delegates
+                            // to `TmuxDriver`, so this arm is defensive —
+                            // it stops a future driver impl that *does*
+                            // emit `EmbedPty` for new-session creation
+                            // from panicking the binary. The worktree is
+                            // already on disk; surfacing a clear status
+                            // means dogfooders can re-launch agent-mux
+                            // without `--embedded` and continue.
+                            self.status = Some(format!(
+                                "worktree created at {} — embedded session spawn not yet wired (Phase 3)",
+                                path.display()
+                            ));
+                        }
                         Err(e) => {
                             self.status = Some(format!(
                                 "worktree created at {} but spawn failed: {e}",
@@ -930,6 +963,19 @@ impl App {
                 self.status = None;
                 Some(cmd)
             }
+            Ok(AttachOutcome::EmbedPty(spec)) => {
+                // Phase 2 stub for `--embedded` dogfooding. Phase 3
+                // replaces this with a real `EmbeddedPty::spawn` against
+                // `spec.argv`. The label echoes what the future widget
+                // will title — useful for verifying the dispatch shape
+                // (right argv, right host wrap) without standing the
+                // widget up yet.
+                self.status = Some(format!(
+                    "embedded attach not yet wired (Phase 3) — would spawn: {}",
+                    spec.label
+                ));
+                None
+            }
             Err(e) => {
                 self.status = Some(format!("attach: {e}"));
                 None
@@ -952,6 +998,12 @@ impl App {
             (Ok(AttachOutcome::SuspendAndRun(cmd)), _) => {
                 self.status = None;
                 Some(cmd)
+            }
+            (Ok(AttachOutcome::EmbedPty(_)), _) => {
+                // Defensive — `PtyDriver::spawn_terminal` delegates to
+                // `TmuxDriver`, so this arm shouldn't fire today.
+                self.status = Some("embedded terminal not yet wired (Phase 3)".to_string());
+                None
             }
             (Err(e), _) => {
                 self.status = Some(format!("terminal: {e}"));

@@ -42,6 +42,13 @@ pub enum AttachOutcome {
     /// process (running `tmux attach` from outside tmux, or dropping into
     /// a plain shell when tmux isn't in the picture).
     SuspendAndRun(SuspendCommand),
+    /// The dashboard should spawn this command inside an embedded PTY
+    /// widget — the dashboard list stays visible as a sidebar while the
+    /// active session renders in the embedded terminal. Returned by
+    /// `PtyDriver`; `TmuxDriver` never emits this variant. Phase 3 of
+    /// the embedded-PTY arc plumbs this into the main loop; Phase 2
+    /// surfaces a "not yet wired" status when consumed.
+    EmbedPty(EmbedSpec),
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +56,30 @@ pub struct SuspendCommand {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+}
+
+/// Spec for an embedded-PTY spawn. Mirrors `SuspendCommand` in shape so
+/// the call sites differ only in the variant arm.
+///
+/// `argv[0]` is the program; the rest are its arguments. For local
+/// hosts this is the literal `tmux …` command line; for remote hosts
+/// it's the `ssh -t target tmux …` wrapped argv from
+/// `Host::ssh_argv` — the embedded widget runs whatever we hand it
+/// without caring about the host/transport distinction.
+///
+/// `cwd` is the process-level working directory. `None` is the common
+/// case because tmux honors its own `-c` flag; the field exists so
+/// future non-tmux callers (a hypothetical no-tmux Shape B) can set it
+/// without a trait change.
+///
+/// `label` is the human-readable string the widget renders in its
+/// title — session title, falling back to a short id suffix. Phase 2
+/// stores it; Phase 3 plumbs it into the widget block.
+#[derive(Debug, Clone)]
+pub struct EmbedSpec {
+    pub argv: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub label: String,
 }
 
 pub trait AttachmentDriver {
@@ -160,9 +191,11 @@ impl TmuxDriver {
             run_tmux(&["switch-client", "-t", target])?;
             Ok(AttachOutcome::Done)
         } else {
+            let argv = tmux_attach_argv(target);
+            let (program, rest) = argv.split_first().expect("tmux_attach_argv non-empty");
             Ok(AttachOutcome::SuspendAndRun(SuspendCommand {
-                program: "tmux".to_string(),
-                args: vec!["attach".to_string(), "-t".to_string(), target.to_string()],
+                program: program.clone(),
+                args: rest.to_vec(),
                 cwd: None,
             }))
         }
@@ -241,22 +274,9 @@ impl TmuxDriver {
     ///   - server but no `agent-mux-<id>` session: creates it.
     ///   - `agent-mux-<id>` exists (prior fallback): attaches to it.
     fn resume_remote(session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
-        let session_name = format!("agent-mux-{}", session.id.0);
-        let cwd = session.project_dir.to_string_lossy().into_owned();
-        let claude_cmd = format!("claude --resume {}", session.id.0);
-        Self::run_remote_interactive(
-            host,
-            &[
-                "tmux",
-                "new-session",
-                "-A",
-                "-s",
-                &session_name,
-                "-c",
-                &cwd,
-                &claude_cmd,
-            ],
-        )
+        let argv = tmux_resume_argv(session);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        Self::run_remote_interactive(host, &argv_refs)
     }
 
     fn spawn_terminal_remote(
@@ -384,7 +404,153 @@ fn find_pane_remote(host: &dyn Host, project_dir: &Path) -> Result<String, Attac
     parse_pane_match(&stdout, project_dir).ok_or(AttachError::NotFound)
 }
 
+// ---------- PtyDriver ----------
+
+/// Embedded-PTY `AttachmentDriver`. Same dispatch shape as
+/// [`TmuxDriver`], but emits [`AttachOutcome::EmbedPty`] for `attach`
+/// so the dashboard hosts the active session inside a PTY widget
+/// instead of handing the terminal off.
+///
+/// `spawn_terminal` and `spawn_session` deliberately delegate to
+/// `TmuxDriver` — those are out-of-band actions (open-shell, new-
+/// session-creation flow) that don't fit the "embed the active
+/// attach" model. Phase 6 may revisit if dogfooding asks for it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PtyDriver;
+
+impl PtyDriver {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl AttachmentDriver for PtyDriver {
+    fn attach(&self, session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+        if session.host.is_local() {
+            Ok(Self::attach_local(session))
+        } else {
+            Self::attach_remote(session, host)
+        }
+    }
+
+    fn spawn_terminal(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+    ) -> Result<AttachOutcome, AttachError> {
+        TmuxDriver.spawn_terminal(session, host)
+    }
+
+    fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+        TmuxDriver.spawn_session(cwd, host)
+    }
+}
+
+impl PtyDriver {
+    /// Local attach in embedded mode. The argv runs directly inside the
+    /// PTY widget — no SSH wrap, no `switch-client` branch. We still
+    /// prefer a live-pane attach over a fresh resume when one exists,
+    /// so the user's existing tmux work shows up in the widget rather
+    /// than a parallel claude session that doesn't see their open
+    /// terminals.
+    ///
+    /// Infallible by construction — `find_pane_local`'s error path
+    /// folds into the resume fallback, so this never produces an
+    /// `Err`. Returning `AttachOutcome` directly keeps the local
+    /// branch readable; the dispatcher in `attach` wraps it in `Ok`.
+    fn attach_local(session: &Session) -> AttachOutcome {
+        let argv = match find_pane_local(&session.project_dir) {
+            Ok(target) => tmux_attach_argv(&target),
+            // `TmuxCommandFailed` here means tmux isn't running or
+            // list-panes errored — same condition the legacy driver
+            // treats as "no live pane." Fall through to resume.
+            Err(_) => tmux_resume_argv(session),
+        };
+        AttachOutcome::EmbedPty(EmbedSpec {
+            argv,
+            cwd: None,
+            label: embed_label(session),
+        })
+    }
+
+    /// Remote attach in embedded mode. Same try-pane-then-resume shape
+    /// as [`TmuxDriver::attach_remote`]; the difference is the outcome
+    /// variant. The ssh wrap comes from `Host::ssh_argv(true, …)` —
+    /// identical to the `SuspendAndRun` path so the embedded widget
+    /// sees the same argv the legacy outside-tmux path would.
+    fn attach_remote(session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+        let remote_cmd = match find_pane_remote(host, &session.project_dir) {
+            Ok(target) => tmux_attach_argv(&target),
+            Err(AttachError::NotFound) => tmux_resume_argv(session),
+            Err(other) => return Err(other),
+        };
+        let remote_cmd_refs: Vec<&str> = remote_cmd.iter().map(String::as_str).collect();
+        let argv = host
+            .ssh_argv(true, &remote_cmd_refs)
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        Ok(AttachOutcome::EmbedPty(EmbedSpec {
+            argv,
+            cwd: None,
+            label: embed_label(session),
+        }))
+    }
+}
+
+/// Human-readable label for the embedded pane title. Prefers the
+/// session's resolved title (from `.agent-mux/task.toml` or
+/// `aiTitle`); falls back to a short id suffix so multiple title-less
+/// sessions stay distinguishable. Mirrors `preview_pane_title` in
+/// main.rs.
+fn embed_label(session: &Session) -> String {
+    if let Some(title) = &session.title {
+        return title.clone();
+    }
+    let id = &session.id.0;
+    let suffix: String = id.chars().rev().take(6).collect();
+    let suffix: String = suffix.chars().rev().collect();
+    format!("…{suffix}")
+}
+
 // ---------- shared helpers ----------
+
+/// The `remote_cmd` for "attach to an existing pane." Used by both
+/// drivers — `TmuxDriver` wraps it in `SuspendAndRun` (or ssh + tmux
+/// new-window for the remote-with-pane case); `PtyDriver` hands it to
+/// the embedded widget. Centralised here so a future tmux flag change
+/// (e.g. `-d` for detach-other-clients) lands in one place.
+#[must_use]
+fn tmux_attach_argv(target: &str) -> Vec<String> {
+    vec!["tmux".into(), "attach".into(), "-t".into(), target.into()]
+}
+
+/// The `remote_cmd` for "no live pane — spin up a fresh tmux session
+/// named after the conversation and run `claude --resume <id>` in it."
+/// The `-A` flag makes the spawn idempotent: a second invocation
+/// attaches to the existing `agent-mux-<id>` session instead of
+/// spawning a parallel `claude --resume` that would race the first on
+/// the same transcript.
+///
+/// Used by `TmuxDriver::resume_remote` (preserves the M2-shipped
+/// remote-resume behaviour exactly) and by `PtyDriver` for both local
+/// and remote — `PtyDriver` always wants the named-session-with-`-A`
+/// shape because the embedded widget can be re-attached freely.
+#[must_use]
+fn tmux_resume_argv(session: &Session) -> Vec<String> {
+    let session_name = format!("agent-mux-{}", session.id.0);
+    let cwd = session.project_dir.to_string_lossy().into_owned();
+    let claude_cmd = format!("claude --resume {}", session.id.0);
+    vec![
+        "tmux".into(),
+        "new-session".into(),
+        "-A".into(),
+        "-s".into(),
+        session_name,
+        "-c".into(),
+        cwd,
+        claude_cmd,
+    ]
+}
 
 fn build_new_session_command(cwd: &str, command: &str) -> SuspendCommand {
     SuspendCommand {
@@ -729,5 +895,127 @@ mod tests {
             parent_repo: None,
             has_live_pane: None,
         }
+    }
+
+    // ---- shared argv helpers ----
+
+    #[test]
+    fn tmux_attach_argv_produces_attach_target_form() {
+        // The helper is the single point of truth for "tmux attach to a
+        // pane"; both TmuxDriver's outside-tmux SuspendAndRun branch and
+        // PtyDriver's live-pane EmbedPty branch route through it.
+        assert_eq!(
+            tmux_attach_argv("main:0.0"),
+            vec![
+                "tmux".to_string(),
+                "attach".to_string(),
+                "-t".to_string(),
+                "main:0.0".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tmux_resume_argv_produces_named_session_with_dash_a_and_claude_resume() {
+        // Pins the resume shape used by TmuxDriver::resume_remote *and*
+        // PtyDriver for both local and remote: the -A flag plus the
+        // deterministic agent-mux-<id> session name is what makes
+        // repeated attach attempts converge instead of racing parallel
+        // `claude --resume` invocations on the same transcript.
+        let session = make_session(HostId("remote".into()), "/work/proj");
+        assert_eq!(
+            tmux_resume_argv(&session),
+            vec![
+                "tmux".to_string(),
+                "new-session".to_string(),
+                "-A".to_string(),
+                "-s".to_string(),
+                "agent-mux-abc".to_string(),
+                "-c".to_string(),
+                "/work/proj".to_string(),
+                "claude --resume abc".to_string(),
+            ]
+        );
+    }
+
+    // ---- PtyDriver ----
+
+    #[test]
+    fn embed_label_uses_session_title_when_present() {
+        let mut session = make_session(HostId::local(), "/p");
+        session.title = Some("refactor parser".to_string());
+        assert_eq!(embed_label(&session), "refactor parser");
+    }
+
+    #[test]
+    fn embed_label_falls_back_to_id_suffix_when_no_title() {
+        // Mirrors the fallback in main.rs's `preview_pane_title` and the
+        // dashboard's title-less row rendering — last 6 chars of the
+        // session id, prefixed with "…".
+        let session = Session {
+            id: crate::session::SessionId("1234567890abcdef".into()),
+            ..make_session(HostId::local(), "/p")
+        };
+        assert_eq!(embed_label(&session), "…abcdef");
+    }
+
+    #[test]
+    fn embed_label_short_id_appears_without_truncation_marker_collision() {
+        // For ids shorter than 6 chars the whole id is used; the "…"
+        // prefix still appears because callers rely on it as a "this
+        // is a fallback, not a real title" hint.
+        let session = Session {
+            id: crate::session::SessionId("abc".into()),
+            ..make_session(HostId::local(), "/p")
+        };
+        assert_eq!(embed_label(&session), "…abc");
+    }
+
+    #[test]
+    fn pty_driver_local_attach_no_pane_returns_embed_pty_with_resume_argv() {
+        // PtyDriver's local attach: when `find_pane_local` returns Err
+        // (no tmux server, or no pane matching the cwd — both common
+        // for a test machine where tmux isn't running against this
+        // exact /nonexistent path), the driver falls through to the
+        // resume form. The argv we send to the embedded widget should
+        // be the `tmux_resume_argv` output, run directly (no ssh wrap
+        // because the host is local).
+        //
+        // If a test environment happens to have a tmux pane in
+        // `/agent-mux-pty-test-no-such-path-XXXX`, this test will see
+        // the attach-target form instead — wildly unlikely; assert on
+        // either shape rather than fail the whole suite.
+        let session = make_session(HostId::local(), "/agent-mux-pty-test-no-such-path");
+        let outcome = PtyDriver::new()
+            .attach(&session, &LocalHost::new())
+            .expect("local attach should not error");
+        let AttachOutcome::EmbedPty(spec) = outcome else {
+            panic!("expected EmbedPty, got {outcome:?}");
+        };
+        let resume = tmux_resume_argv(&session);
+        let is_resume = spec.argv == resume;
+        let is_attach = spec.argv.len() == 4 && spec.argv[0] == "tmux" && spec.argv[1] == "attach";
+        assert!(
+            is_resume || is_attach,
+            "argv must be resume or attach-target form; got {:?}",
+            spec.argv
+        );
+        assert_eq!(spec.cwd, None, "tmux honours -c; process cwd stays None");
+    }
+
+    #[test]
+    fn pty_driver_label_propagates_into_embed_spec() {
+        // The label that ends up in EmbedSpec is what the Phase 3 widget
+        // will render in its title bar. Pin that the spec carries the
+        // session's title verbatim.
+        let mut session = make_session(HostId::local(), "/p");
+        session.title = Some("hello-world".to_string());
+        let outcome = PtyDriver::new()
+            .attach(&session, &LocalHost::new())
+            .expect("local attach should not error");
+        let AttachOutcome::EmbedPty(spec) = outcome else {
+            panic!("expected EmbedPty");
+        };
+        assert_eq!(spec.label, "hello-world");
     }
 }

@@ -13,7 +13,7 @@ The dashboard runs (`cargo run`), discovers local Claude Code sessions, groups t
 - `Ctrl-j`/`Ctrl-k` — jump to the next / previous **host**. Same semantics as `J`/`K` one level up. No-op with only one host.
 - `Enter` — switch into the tmux pane running the selected session; if there is no live pane, resume the conversation in a fresh `claude --resume` in the session's recorded cwd
 - `t` — open a new tmux window in the session's cwd (or, outside tmux, drop into `$SHELL` in the cwd)
-- `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created alongside the parent repo and `claude` is launched in it.
+- `n` — create a new session: pick a repo, name a task, confirm the base branch. A git worktree is created in `<workspace>/.agent-mux-worktrees/<repo>-<task>/` (a hidden sibling of the parent repo, so the workspace folder stays uncluttered) and `claude` is launched in it.
 - `/` — search/filter sessions by title, project directory, or host (case-insensitive substring). Type to narrow live, `Enter` to apply (keeps filter and returns focus to the list), `Esc` to clear and exit, `/` again to edit the active filter.
 - `p` — toggle the preview pane: a right-side split showing the last entries of the selected session's transcript (your prompts, the assistant's prose, tool calls, and tool results) without attaching. Lazy-fetched per selection; cached so navigating back is instant; auto-invalidated when the transcript advances.
 - `q` / Ctrl-C — quit

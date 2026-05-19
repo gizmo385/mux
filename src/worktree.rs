@@ -60,10 +60,13 @@ impl WorktreeManager {
         Self
     }
 
-    /// Create a worktree alongside the parent repo on `host`.
+    /// Create a worktree in a hidden sibling of the parent repo on `host`.
     ///
-    /// The new worktree lives at `<repo-parent>/<repo-name>-<slug>` on a new
-    /// branch named `<slug>` branched off `base_branch`. A `task.toml` file
+    /// The new worktree lives at `<repo-parent>/.agent-mux-worktrees/<repo-name>-<slug>`
+    /// on a new branch named `<slug>` branched off `base_branch`. The
+    /// dot-prefixed parent keeps the workspace folder uncluttered under
+    /// default `ls`; `git worktree add` creates intermediate directories
+    /// on its own, so no explicit `mkdir -p` is needed. A `task.toml` file
     /// inside the worktree records the task metadata. All git invocations
     /// and the metadata write route through the [`Host`] trait, so the
     /// same code path works for local and SSH-reachable hosts — the trait
@@ -242,7 +245,9 @@ fn worktree_path(repo_root: &Path, slug: &str) -> PathBuf {
     let repo_name = repo_root
         .file_name()
         .map_or_else(|| "repo".to_string(), |n| n.to_string_lossy().into_owned());
-    parent.join(format!("{repo_name}-{slug}"))
+    parent
+        .join(".agent-mux-worktrees")
+        .join(format!("{repo_name}-{slug}"))
 }
 
 fn repo_toplevel(host: &dyn Host, repo: &Path) -> Result<PathBuf, WorktreeError> {
@@ -418,9 +423,17 @@ mod tests {
     }
 
     #[test]
-    fn worktree_path_is_alongside_repo() {
+    fn worktree_path_lands_in_hidden_workspace_sibling() {
+        // Worktrees live under `<repo-parent>/.agent-mux-worktrees/` so
+        // they don't clutter the workspace folder under default `ls`.
+        // The directory name keeps the `<repo>-<slug>` shape so two
+        // worktrees off different repos with the same task name don't
+        // collide.
         let path = worktree_path(Path::new("/work/agent-mux"), "fix-bug");
-        assert_eq!(path, PathBuf::from("/work/agent-mux-fix-bug"));
+        assert_eq!(
+            path,
+            PathBuf::from("/work/.agent-mux-worktrees/agent-mux-fix-bug")
+        );
     }
 
     #[test]

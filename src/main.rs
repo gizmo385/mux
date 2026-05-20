@@ -282,6 +282,15 @@ struct App {
     /// stay around so a connect failure isn't silently lost when the
     /// transient `status` field cycles to a different message.
     connect_errors: Vec<(HostId, String)>,
+    /// Hosts whose remote workspace scan completed with zero repos.
+    /// Carries the folders the scan visited so the footer hint can be
+    /// specific: "no repos in <folders> on <host>." Cleared when a
+    /// subsequent (non-empty) scan lands for the same host. Surfaces
+    /// the silent-empty case dogfooding hit 2026-05-19 — a configured
+    /// path that doesn't exist (or contains no `.git/` children) on
+    /// the remote box looked indistinguishable from "host hasn't
+    /// connected yet" before this.
+    empty_scans: Vec<(HostId, Vec<PathBuf>)>,
     /// Captured at startup: `$TMUX` set means we attach via `tmux
     /// switch-client` (no parent/child relationship to break), so the return
     /// hint differs from the outside-tmux case where we suspend and run
@@ -395,6 +404,13 @@ enum DeleteWorktreeResult {
 struct RepoScanResult {
     host_id: HostId,
     repos: Vec<Repo>,
+    /// The workspace folders the scan visited. Echoed back from the
+    /// spawn site so [`App::drain_repo_scans`] can surface a sticky
+    /// "no repos found in <folders> on <host>" footer hint when
+    /// `repos` is empty — the silent failure that bit the 2026-05-19
+    /// dogfood session (configured paths simply didn't exist on the
+    /// remote box).
+    folders_scanned: Vec<PathBuf>,
 }
 
 /// Payload sent from a preview-fetch thread back to the main loop. The
@@ -566,6 +582,7 @@ impl App {
             remote_rx,
             pending_hosts,
             connect_errors: Vec::new(),
+            empty_scans: Vec::new(),
             in_tmux: std::env::var_os("TMUX").is_some(),
             search: None,
             preview_open: false,
@@ -762,6 +779,7 @@ impl App {
                                 let _ = tx.send(RepoScanResult {
                                     host_id: host_id_for_scan,
                                     repos,
+                                    folders_scanned: folders,
                                 });
                             });
                         }
@@ -790,9 +808,18 @@ impl App {
     /// Drain finished remote workspace scans into the registry. Each
     /// host's slice is replaced wholesale via `reconcile_host`, so
     /// re-running a scan (e.g. on a future reconnect) idempotently
-    /// refreshes that host without disturbing the others.
+    /// refreshes that host without disturbing the others. An empty
+    /// `repos` field flags `empty_scans` so the footer can surface
+    /// the silent-empty case (configured paths that don't exist or
+    /// contain no repos on the remote); a non-empty result clears any
+    /// prior warning for the same host.
     fn drain_repo_scans(&mut self) {
         while let Ok(result) = self.repo_scan_rx.try_recv() {
+            self.empty_scans.retain(|(h, _)| h != &result.host_id);
+            if result.repos.is_empty() {
+                self.empty_scans
+                    .push((result.host_id.clone(), result.folders_scanned));
+            }
             self.registry.reconcile_host(&result.host_id, result.repos);
         }
     }
@@ -2015,6 +2042,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.in_tmux,
         app.pending_hosts,
         &app.connect_errors,
+        &app.empty_scans,
         app.focus,
         &app.config.tools,
     );
@@ -2065,20 +2093,25 @@ fn compose_search_bar(search: &SearchState, visible: usize) -> String {
 
 /// Pure footer composition so the keybind/return hint logic is unit-testable
 /// without standing up a ratatui frame. Precedence: in-flight create >
-/// transient status > sticky connect-failure line > empty catalog >
-/// keybind line. The keybind line gets a trailing "· connecting to N
-/// host(s)…" suffix while remote SSH discovery is still pending. The
-/// return hint is mode-aware because attach takes two different code
-/// paths (see `App.in_tmux`).
+/// transient status > sticky connect-failure line > sticky empty-scan
+/// line > empty catalog > keybind line. The keybind line gets a
+/// trailing "· connecting to N host(s)…" suffix while remote SSH
+/// discovery is still pending. The return hint is mode-aware because
+/// attach takes two different code paths (see `App.in_tmux`).
 ///
 /// Connect failures sit *below* transient status so a fresh action's
 /// feedback isn't drowned out, but stay visible (until the next
 /// transient status, then re-surface) so they're not silently lost
 /// the way a single overwriting `status` field would lose them.
-// Pure formatting helper: 8 small inputs read straight off the App
-// to render one ratatui-paragraph string. Bundling into a struct
-// would buy nothing here — every caller would build the same struct
-// inline at the same call site — so we silence the lint.
+/// Empty-scan hints sit one tier below connect failures — a host that
+/// connected but found no repos is less severe than one that didn't
+/// connect at all, but it's the silent-failure mode dogfooding hit
+/// 2026-05-19 (configured paths didn't exist on the remote box) so
+/// it earns a sticky line.
+// Pure formatting helper: small inputs read straight off the App to
+// render one ratatui-paragraph string. Bundling into a struct would
+// buy nothing here — every caller would build the same struct inline
+// at the same call site — so we silence the lint.
 #[allow(clippy::too_many_arguments)]
 fn compose_footer(
     creating: Option<&CreatingSession>,
@@ -2087,6 +2120,7 @@ fn compose_footer(
     in_tmux: bool,
     pending_hosts: usize,
     connect_errors: &[(HostId, String)],
+    empty_scans: &[(HostId, Vec<PathBuf>)],
     focus: Focus,
     tools: &[ToolBinding],
 ) -> String {
@@ -2108,6 +2142,9 @@ fn compose_footer(
     if !connect_errors.is_empty() {
         let names: Vec<String> = connect_errors.iter().map(|(h, _)| h.to_string()).collect();
         return format!(" connect failed: {} ", names.join(", "));
+    }
+    if !empty_scans.is_empty() {
+        return format_empty_scans_hint(empty_scans);
     }
     if catalog_empty {
         if pending_hosts > 0 {
@@ -2142,6 +2179,27 @@ fn compose_footer(
 /// program name (first command token), else a generic `tool` so a
 /// future malformed binding doesn't leave the line dangling.
 /// Same fallback chain as the launch-status line in `launch_tool`.
+/// Format the sticky empty-scan hint. Single-host gets a specific
+/// "host: no repos in <folder>" line so the user can see exactly what
+/// path was searched and fix the config; multi-host aggregates to
+/// "no repos found: host1, host2" because the per-host folders would
+/// truncate the line beyond usefulness. First-folder-only for the
+/// single-host case keeps the line bounded; the user can `agent-mux
+/// config` for the full list if they configured more.
+fn format_empty_scans_hint(empty_scans: &[(HostId, Vec<PathBuf>)]) -> String {
+    debug_assert!(!empty_scans.is_empty(), "caller guards on non-empty");
+    if empty_scans.len() == 1 {
+        let (host, folders) = &empty_scans[0];
+        let folder = folders.first().map_or_else(
+            || "workspace_folders".to_string(),
+            |p| p.display().to_string(),
+        );
+        return format!(" {host}: no repos in {folder} ");
+    }
+    let names: Vec<String> = empty_scans.iter().map(|(h, _)| h.to_string()).collect();
+    format!(" no repos found: {} ", names.join(", "))
+}
+
 fn footer_tool_label(t: &ToolBinding) -> String {
     if let Some(n) = t.name.as_deref()
         && !n.is_empty()
@@ -2383,6 +2441,10 @@ mod tests {
         Vec::new()
     }
 
+    fn no_empty_scans() -> Vec<(HostId, Vec<PathBuf>)> {
+        Vec::new()
+    }
+
     fn tool(key: char, command: &[&str]) -> ToolBinding {
         ToolBinding {
             key,
@@ -2458,6 +2520,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2473,6 +2536,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2500,6 +2564,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &tools,
         );
@@ -2528,6 +2593,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2547,6 +2613,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2562,6 +2629,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2577,6 +2645,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2593,6 +2662,7 @@ mod tests {
             false,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2609,6 +2679,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2625,6 +2696,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2645,6 +2717,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2662,6 +2735,7 @@ mod tests {
             true,
             2,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2681,6 +2755,7 @@ mod tests {
             true,
             1,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2697,6 +2772,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2704,9 +2780,103 @@ mod tests {
     }
 
     #[test]
+    fn footer_renders_single_empty_scan_with_host_and_first_folder() {
+        // The dogfood-triggered hint: when a remote scan returns
+        // zero repos, name the host and the first folder it searched
+        // so the user can immediately see what to fix. Bounded length
+        // — only the first folder is shown even if multiple were
+        // configured, to keep the line readable.
+        let empty = vec![(
+            HostId("alpenglow".into()),
+            vec![PathBuf::from("/home/gizmo/workspace")],
+        )];
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            &empty,
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("alpenglow:"), "got: {s}");
+        assert!(s.contains("/home/gizmo/workspace"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_aggregates_multiple_empty_scans_into_host_list() {
+        // Multiple hosts with empty scans: aggregate to "no repos
+        // found: a, b" rather than concatenating per-host folder
+        // info, which would truncate beyond usefulness. User can
+        // `agent-mux config` for the per-host folders.
+        let empty = vec![
+            (
+                HostId("alpenglow".into()),
+                vec![PathBuf::from("/srv/alpenglow/workspace")],
+            ),
+            (
+                HostId("beta".into()),
+                vec![PathBuf::from("/srv/beta/workspace")],
+            ),
+        ];
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            &empty,
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("no repos found:"), "got: {s}");
+        assert!(s.contains("alpenglow"), "got: {s}");
+        assert!(s.contains("beta"), "got: {s}");
+    }
+
+    #[test]
+    fn footer_connect_errors_take_precedence_over_empty_scans() {
+        // A host that failed to even connect is a more severe signal
+        // than one that connected but found no repos. Connect errors
+        // win the slot when both are present; user fixes the connect
+        // failure first, sees the empty-scan once that clears.
+        let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
+        let empty = vec![(
+            HostId("beta".into()),
+            vec![PathBuf::from("/srv/beta/workspace")],
+        )];
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &errors,
+            &empty,
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("connect failed"), "got: {s}");
+        assert!(!s.contains("no repos"), "got: {s}");
+    }
+
+    #[test]
     fn footer_renders_connect_errors_as_sticky_line_when_no_status() {
         let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
-        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar, &[]);
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &errors,
+            &no_empty_scans(),
+            Focus::Sidebar,
+            &[],
+        );
         assert!(s.contains("connect failed: alpenglow"), "got: {s}");
         assert!(!s.contains("return:"), "got: {s}");
     }
@@ -2721,7 +2891,17 @@ mod tests {
             (HostId("alpenglow".into()), "first error".to_string()),
             (HostId("gpu-1".into()), "second error".to_string()),
         ];
-        let s = compose_footer(None, None, false, true, 0, &errors, Focus::Sidebar, &[]);
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &errors,
+            &no_empty_scans(),
+            Focus::Sidebar,
+            &[],
+        );
         assert!(s.contains("alpenglow"), "got: {s}");
         assert!(s.contains("gpu-1"), "got: {s}");
     }
@@ -2738,6 +2918,7 @@ mod tests {
             true,
             0,
             &errors,
+            &no_empty_scans(),
             Focus::Sidebar,
             &[],
         );
@@ -2813,6 +2994,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Terminal {
                 leader_armed: false,
             },
@@ -2835,6 +3017,7 @@ mod tests {
             true,
             0,
             &no_connect_errors(),
+            &no_empty_scans(),
             Focus::Terminal {
                 leader_armed: false,
             },

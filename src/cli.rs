@@ -3,13 +3,17 @@
 //! `agent-mux themes` — coloured browser of every built-in preset, so
 //! the user can see the actual palette before editing `config.toml`.
 //!
-//! `agent-mux config` — printable reference of every config key, its
-//! default, and a one-line description. Doubles as the answer to
-//! "what can I tune here?" without spelunking through README/SPEC.
+//! `agent-mux config` — diagnostic view of the live-parsed configuration:
+//! which file was loaded, every value agent-mux saw. Answers "is my
+//! config actually being read?" without spelunking through logs.
 //!
-//! Both write to a caller-supplied `Write` so the output is unit-testable
-//! against an in-memory buffer. Production wiring in `main.rs` passes
-//! `io::stdout()`.
+//! `agent-mux help` — subcommand overview *plus* the compact reference
+//! of every config key. Reference lives here (instead of with `config`)
+//! so the diagnostic view stays focused.
+//!
+//! All three write to a caller-supplied `Write` so the output is unit-
+//! testable against an in-memory buffer. Production wiring in `main.rs`
+//! passes `io::stdout()`.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -68,7 +72,7 @@ pub fn print_themes<W: Write>(out: &mut W, color: bool) -> io::Result<()> {
         "  needs_input = \"red\"      # optional per-field override"
     )?;
     writeln!(out)?;
-    writeln!(out, "See `agent-mux config` for the full key reference.")?;
+    writeln!(out, "See `agent-mux help` for the full key reference.")?;
     Ok(())
 }
 
@@ -156,17 +160,16 @@ fn write_ansi_fg<W: Write>(out: &mut W, c: Color) -> io::Result<()> {
     }
 }
 
-/// Print the current resolved config state followed by the reference
-/// documentation. The status section shows which path agent-mux loaded
-/// (or searched, if none existed) and the parsed values — the answer
-/// to "is my config actually being read?" without spelunking through
-/// logs.
+/// Print the current resolved config state: which path agent-mux
+/// loaded (or searched, if none existed) and the parsed values. This
+/// is the answer to "is my config actually being read?" — kept tight
+/// so the diagnostic signal isn't buried under reference scroll. The
+/// config-key reference moved to `agent-mux help` 2026-05-20.
 ///
 /// `searched` is the priority-ordered list of paths agent-mux looked
 /// at; `loaded_from` is `Some(path)` when one of them existed and was
 /// read, `None` when every candidate was absent. `result` is the
-/// outcome of the load — `Err` paths still show what failed before
-/// the reference section.
+/// outcome of the load — `Err` paths surface what failed.
 ///
 /// # Errors
 ///
@@ -177,16 +180,14 @@ pub fn print_config<W: Write>(
     loaded_from: Option<&Path>,
     result: &Result<Config, ConfigError>,
 ) -> io::Result<()> {
-    print_config_status(out, searched, loaded_from, result)?;
-    writeln!(out)?;
-    print_config_reference(out)
+    print_config_status(out, searched, loaded_from, result)
 }
 
-/// Print only the status section: which path was loaded, parsed
-/// values (or the load error). Factored from [`print_config`] so the
-/// reference docs can be omitted in contexts that just want the
-/// debugging view (none today, but the split keeps the layers
-/// independently testable).
+/// Print only the status block. Identical to [`print_config`] today —
+/// the indirection survives from when `print_config` also emitted the
+/// long reference, and stays around so a future addition to `config`'s
+/// surface (e.g. flagging unknown keys) can extend `print_config`
+/// without disturbing this slice.
 ///
 /// # Errors
 ///
@@ -293,150 +294,76 @@ fn theme_override_count(t: &crate::config::ThemeConfig) -> usize {
     .count()
 }
 
-/// Print a reference of every config key with its default and a
-/// one-line description. The output is a self-contained TOML skeleton
-/// the user can copy verbatim into `config.toml` and tune from.
+/// Print a compact one-screen reference of every config key. Lives at
+/// the bottom of `agent-mux help` (previously the long-form TOML
+/// skeleton printed by `agent-mux config`, but dogfooding 2026-05-20
+/// surfaced that anyone who needs the reference is already in "look
+/// it up" mode — `help` is the natural home, and the user is browsing
+/// rather than copy-pasting). `agent-mux config` now only prints the
+/// live-parsed status so its diagnostic value isn't buried under
+/// reference scroll.
 ///
 /// # Errors
 ///
 /// Propagates any `io::Error` from `out`.
 pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
-    writeln!(out, "Reference")?;
-    writeln!(out, "─────────")?;
-    writeln!(out, "Configuration: ~/.config/agent-mux/config.toml")?;
+    let preset_list = Theme::preset_names().join(", ");
+    writeln!(out, "CONFIG KEYS (~/.config/agent-mux/config.toml):")?;
     writeln!(
         out,
-        "Missing file or missing keys fall back to the defaults below."
+        "  workspace_folders = []         absolute paths; depth-1 git scan"
+    )?;
+    writeln!(
+        out,
+        "  [hosts.<name>]                 one per SSH-reachable host (`local` is reserved)"
+    )?;
+    writeln!(
+        out,
+        "    ssh = \"alias-or-user@host\"   required: ~/.ssh/config alias or user@host"
+    )?;
+    writeln!(
+        out,
+        "    transcript_root = \"...\"      default ~/.claude/projects (tilde → remote home)"
+    )?;
+    writeln!(
+        out,
+        "    workspace_folders = [...]    optional per-host; tildes → remote home"
+    )?;
+    writeln!(
+        out,
+        "  [notifications]                enabled, sound, disabled_hosts — all optional"
+    )?;
+    writeln!(out, "  [theme]")?;
+    writeln!(
+        out,
+        "    preset = \"default\"           one of: {preset_list}"
+    )?;
+    writeln!(
+        out,
+        "    needs_input / working / idle / unknown / tool_use / tool_result_ok / tool_result_err"
+    )?;
+    writeln!(
+        out,
+        "                                 colour: \"red\" | \"bright_red\" | \"#RRGGBB\" | \"\""
+    )?;
+    writeln!(out, "  [[tools]]                      custom keybinds")?;
+    writeln!(
+        out,
+        "    key = \"g\", command = [...]   single char (not q j k J K t n N p d /);"
+    )?;
+    writeln!(
+        out,
+        "                                 {{cwd}} and {{host}} substituted at fire time."
+    )?;
+    writeln!(
+        out,
+        "    name = \"...\"                 optional launch label"
     )?;
     writeln!(out)?;
     writeln!(
         out,
-        "# ─── Workspaces (M1) ────────────────────────────────"
+        "`agent-mux config` shows the live-parsed values + which file was loaded."
     )?;
-    writeln!(
-        out,
-        "workspace_folders = []  # absolute paths only (depth-1 scan); top-level tildes rejected — \
-         use per-host workspace_folders for tilde-relative paths."
-    )?;
-    writeln!(out)?;
-    writeln!(
-        out,
-        "# ─── Remote SSH hosts (M2) ──────────────────────────"
-    )?;
-    writeln!(out, "# One table per host. `local` is reserved.")?;
-    writeln!(out, "# [hosts.alpenglow]")?;
-    writeln!(
-        out,
-        "# ssh = \"alpenglow\"                       # required: ~/.ssh/config alias or user@host"
-    )?;
-    writeln!(
-        out,
-        "# transcript_root = \"~/.claude/projects\"  # default; tilde resolves on the remote"
-    )?;
-    writeln!(out)?;
-    writeln!(out, "# ─── Notifications (M4 + M5) ───────────────────────")?;
-    writeln!(out, "[notifications]")?;
-    writeln!(
-        out,
-        "enabled = true          # master on/off — when false, every dispatch is suppressed"
-    )?;
-    writeln!(
-        out,
-        "sound = false           # request the OS \"default\" notification sound"
-    )?;
-    writeln!(
-        out,
-        "disabled_hosts = []     # silence specific hosts by their [hosts.<name>] label"
-    )?;
-    writeln!(out)?;
-    writeln!(
-        out,
-        "# ─── Theme (M5) ─────────────────────────────────────"
-    )?;
-    writeln!(out, "[theme]")?;
-    let preset_list = Theme::preset_names()
-        .iter()
-        .map(|s| format!("\"{s}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    writeln!(out, "preset = \"default\"      # one of: {preset_list}")?;
-    writeln!(
-        out,
-        "                         # see `agent-mux themes` for a coloured browser."
-    )?;
-    writeln!(out, "# Per-field overrides apply on top of the preset.")?;
-    writeln!(out, "# Each value: named ANSI (\"red\"), bright_* variant")?;
-    writeln!(
-        out,
-        "# (\"bright_red\"), #RRGGBB hex, or empty for terminal default."
-    )?;
-    writeln!(
-        out,
-        "needs_input     = \"\"    # ● glyph for needs-input sessions"
-    )?;
-    writeln!(
-        out,
-        "working         = \"\"    # ◐ glyph for working sessions"
-    )?;
-    writeln!(out, "idle            = \"\"    # ○ glyph for idle sessions")?;
-    writeln!(
-        out,
-        "unknown         = \"\"    # · glyph for unknown-state sessions"
-    )?;
-    writeln!(
-        out,
-        "tool_use        = \"\"    # ⚒ Tool: … lines in preview pane"
-    )?;
-    writeln!(
-        out,
-        "tool_result_ok  = \"\"    # ↳ ok lines in preview pane"
-    )?;
-    writeln!(
-        out,
-        "tool_result_err = \"\"    # ↳ error lines in preview pane"
-    )?;
-    print_tools_reference(out)?;
-    Ok(())
-}
-
-/// Pulled out of [`print_config_reference`] so that function stays
-/// under the clippy line cap. Prints the commented-out `[[tools]]`
-/// skeleton the user can copy into their config.
-fn print_tools_reference<W: Write>(out: &mut W) -> io::Result<()> {
-    writeln!(out)?;
-    writeln!(out, "# ─── Tool keybinds (post-M5) ───────────────────────")?;
-    writeln!(
-        out,
-        "# One [[tools]] array entry per custom keybind. `key` is a single"
-    )?;
-    writeln!(
-        out,
-        "# character that must not collide with built-ins (q j k J K t n p d /)."
-    )?;
-    writeln!(
-        out,
-        "# `command` is the argv to spawn; `{{cwd}}` and `{{host}}` are"
-    )?;
-    writeln!(
-        out,
-        "# substituted at fire time. Inside tmux the tool opens in a new"
-    )?;
-    writeln!(
-        out,
-        "# window in the session's cwd; outside tmux it takes over the"
-    )?;
-    writeln!(
-        out,
-        "# terminal as a foreground subprocess. `name` is an optional label"
-    )?;
-    writeln!(out, "# shown in the dashboard status line at launch.")?;
-    writeln!(out, "# [[tools]]")?;
-    writeln!(out, "# key = \"g\"")?;
-    writeln!(out, "# command = [\"lazygit\"]")?;
-    writeln!(out, "# [[tools]]")?;
-    writeln!(out, "# key = \"v\"")?;
-    writeln!(out, "# name = \"edit\"")?;
-    writeln!(out, "# command = [\"nvim\", \".\"]")?;
     Ok(())
 }
 
@@ -460,7 +387,7 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  agent-mux config         Print every config key, its default, and a description."
+        "  agent-mux config         Print the live-parsed config (which file was loaded, parsed values)."
     )?;
     writeln!(out, "  agent-mux help           Show this help.")?;
     writeln!(out)?;
@@ -482,10 +409,8 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
         "                           hand off the whole terminal rather than host a pane."
     )?;
     writeln!(out)?;
-    writeln!(
-        out,
-        "Configuration lives at ~/.config/agent-mux/config.toml."
-    )?;
+    print_config_reference(out)?;
+    writeln!(out)?;
     writeln!(
         out,
         "See SPEC.md / ARCHITECTURE.md / PROCESS.md for the canonical project docs."
@@ -705,9 +630,11 @@ mod tests {
     }
 
     #[test]
-    fn config_prints_status_then_reference() {
-        // `agent-mux config` shows the live state up top so the
-        // most useful info is visible before the reference scroll.
+    fn config_prints_only_status_no_reference() {
+        // The reference moved to `agent-mux help` 2026-05-20 — `config`
+        // is the diagnostic surface ("what did agent-mux actually parse?"),
+        // so it stays focused on the live state. Reference scroll was
+        // burying that signal.
         let path = PathBuf::from("/h/.config/agent-mux/config.toml");
         let out = run(|w| {
             print_config(
@@ -717,13 +644,13 @@ mod tests {
                 &Ok(Config::default()),
             )
         });
-        let status_at = out
-            .find("Current configuration")
-            .expect("status header present");
-        let ref_at = out.find("Reference").expect("reference header present");
         assert!(
-            status_at < ref_at,
-            "status section must precede reference:\n{out}"
+            out.contains("Current configuration"),
+            "missing status header:\n{out}"
+        );
+        assert!(
+            !out.contains("CONFIG KEYS"),
+            "reference moved to help; config should no longer print it:\n{out}"
         );
     }
 
@@ -732,6 +659,33 @@ mod tests {
         let out = run(print_help);
         for cmd in ["themes", "config", "help"] {
             assert!(out.contains(cmd), "missing subcommand {cmd:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn help_ends_with_compact_config_reference() {
+        // The reference reads at the bottom of help so the
+        // subcommand/flag listing leads. Every section / theme field /
+        // preset still needs to appear so users can write a config
+        // without leaving this output.
+        let out = run(print_help);
+        for marker in [
+            "CONFIG KEYS",
+            "workspace_folders",
+            "[hosts.<name>]",
+            "[notifications]",
+            "[theme]",
+            "[[tools]]",
+            "needs_input",
+            "tool_result_ok",
+        ] {
+            assert!(out.contains(marker), "missing {marker:?} in help:\n{out}");
+        }
+        for preset in Theme::preset_names() {
+            assert!(
+                out.contains(preset),
+                "missing preset {preset:?} in help:\n{out}"
+            );
         }
     }
 }

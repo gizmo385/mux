@@ -126,8 +126,8 @@ After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hoo
 `agent-mux` with no arguments launches the dashboard with the embedded pane enabled. Two read-only subcommands surface what's tunable without making you dig through this README:
 
 - `agent-mux themes` — coloured browser of every built-in theme preset, each element rendered in its actual colour so you can pick a palette by eye before editing the config.
-- `agent-mux config` — prints the current resolved config (which path was loaded, parsed `workspace_folders` / `hosts` / `notifications` / theme) followed by a reference TOML skeleton documenting every key with its default. The status block answers "is my config actually being read?" without log-spelunking; the reference is copy-pasteable into `~/.config/agent-mux/config.toml`.
-- `agent-mux help` / `--help` — subcommand overview.
+- `agent-mux config` — prints the current resolved config (which path was loaded, parsed `workspace_folders` / `hosts` / `notifications` / theme). Diagnostic-only — answers "is my config actually being read?" without log-spelunking.
+- `agent-mux help` / `--help` — subcommand overview plus a one-screen reference of every config key, default, and accepted value.
 
 Flags for the dashboard:
 

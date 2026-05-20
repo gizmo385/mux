@@ -1944,10 +1944,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.focus,
         &app.config.tools,
     );
-    let footer = Paragraph::new(Line::from(Span::styled(
-        footer_text,
-        Style::new().add_modifier(Modifier::DIM),
-    )));
+    let footer = Paragraph::new(Line::from(footer_text));
     frame.render_widget(footer, layout[footer_idx]);
 
     draw_modal_overlay(frame, app);

@@ -58,11 +58,19 @@ impl RepoRegistry {
         }
     }
 
-    /// Re-scan from the (possibly updated) Config. Replaces the cached
-    /// local slice; remote slices added via `reconcile_host` are
-    /// dropped on refresh (they'll be re-added next Connect tick).
+    /// Re-scan the local host from the (possibly updated) Config and
+    /// merge the result with the existing remote slices. Remote
+    /// entries — added asynchronously by [`Self::reconcile_host`] when
+    /// each `[hosts.<name>]` reaches `Connected` — survive the refresh
+    /// because `Connected` only fires once per agent-mux process; if
+    /// we dropped them here, the picker would lose them permanently on
+    /// the first TTL-driven re-scan and the user would need to
+    /// restart agent-mux to see remote repos again.
     pub fn refresh(&mut self, config: &Config) {
-        *self = Self::from_config(config);
+        let local = LocalHost::new();
+        let local_repos = scan_host_workspaces(&local, &config.workspace_folders);
+        self.reconcile_host(&HostId::local(), local_repos);
+        self.last_scanned = SystemTime::now();
     }
 
     /// Re-scan only if the cached snapshot is older than `ttl`. Returns
@@ -341,6 +349,54 @@ mod tests {
         assert!(did_refresh);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.repos()[0].name, "added-after-boot");
+    }
+
+    #[test]
+    fn refresh_preserves_remote_slices_added_via_reconcile_host() {
+        // Pre-2026-05-19 regression: `refresh` used to overwrite the
+        // whole registry via `from_config`, which dropped every remote
+        // slice. Because `Connected` only fires once per agent-mux
+        // process, the picker then lost remote repos permanently on
+        // the first TTL-driven re-scan and the user had to restart
+        // agent-mux to see them again. Pin the new behaviour so a
+        // future "simplification" of `refresh` can't re-introduce the
+        // bug.
+        let tmp = TempDir::new().expect("tempdir");
+        let work = make_plain_dir(tmp.path(), "work");
+        make_repo_dir(&work, "local-repo");
+        let cfg = Config {
+            workspace_folders: vec![work.clone()],
+            ..Default::default()
+        };
+        let mut reg = RepoRegistry::from_config(&cfg);
+
+        let remote = HostId("gizmo".into());
+        reg.reconcile_host(
+            &remote,
+            vec![Repo::new(remote.clone(), PathBuf::from("/srv/work/alpha"))],
+        );
+        assert_eq!(reg.len(), 2);
+
+        // Refresh: rescans local (picks up newly-added local repo)
+        // and keeps the remote slice intact.
+        make_repo_dir(&work, "second-local");
+        reg.refresh(&cfg);
+
+        let mut by_host = reg
+            .repos()
+            .iter()
+            .map(|r| (r.host.as_str(), r.name.as_str()))
+            .collect::<Vec<_>>();
+        by_host.sort_unstable();
+        assert_eq!(
+            by_host,
+            vec![
+                ("gizmo", "alpha"),
+                (HostId::local().as_str(), "local-repo"),
+                (HostId::local().as_str(), "second-local"),
+            ],
+            "refresh must preserve remote slices while re-scanning local"
+        );
     }
 
     #[test]

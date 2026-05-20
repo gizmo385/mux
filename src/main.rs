@@ -914,19 +914,25 @@ impl App {
                             self.status = None;
                             return Some(cmd);
                         }
-                        Ok(AttachOutcome::EmbedPty(_)) => {
-                            // Today's `PtyDriver::spawn_session` delegates
-                            // to `TmuxDriver`, so this arm is defensive —
-                            // it stops a future driver impl that *does*
-                            // emit `EmbedPty` for new-session creation
-                            // from panicking the binary. The worktree is
-                            // already on disk; surfacing a clear status
-                            // means dogfooders can re-launch agent-mux
-                            // without `--embedded` and continue.
-                            self.status = Some(format!(
-                                "worktree created at {} — embedded session spawn not yet wired (Phase 3)",
-                                path.display()
-                            ));
+                        Ok(AttachOutcome::EmbedPty(spec)) => {
+                            // `PtyDriver::spawn_session` creates a
+                            // detached tmux session and asks us to
+                            // attach the embedded pane to it. We don't
+                            // yet have a `SessionId` (the transcript
+                            // hasn't been written), so synthesise one
+                            // from the worktree path — it's unique per
+                            // spawn and unlikely to collide with a
+                            // real Claude conversation id. Discovery
+                            // will surface the real session later;
+                            // pressing Enter on that row then routes
+                            // through `find_pane_local`, finds the
+                            // same tmux session by cwd, and re-attaches
+                            // (one PTY respawn against the same tmux
+                            // session — content is preserved
+                            // server-side).
+                            let synthetic_id =
+                                SessionId(format!("agent-mux-spawn:{}", path.display()));
+                            self.install_embedded(&spec, synthetic_id);
                         }
                         Err(e) => {
                             self.status = Some(format!(

@@ -485,13 +485,14 @@ fn find_pane_remote(host: &dyn Host, project_dir: &Path) -> Result<String, Attac
 
 /// Embedded-PTY `AttachmentDriver`. Same dispatch shape as
 /// [`TmuxDriver`], but emits [`AttachOutcome::EmbedPty`] for `attach`
-/// so the dashboard hosts the active session inside a PTY widget
-/// instead of handing the terminal off.
+/// and `spawn_session` so the dashboard hosts both existing and
+/// newly-spawned sessions inside the PTY widget instead of handing the
+/// terminal off.
 ///
-/// `spawn_terminal` and `spawn_session` deliberately delegate to
-/// `TmuxDriver` — those are out-of-band actions (open-shell, new-
-/// session-creation flow) that don't fit the "embed the active
-/// attach" model. Phase 6 may revisit if dogfooding asks for it.
+/// `spawn_terminal` and `spawn_tool` still delegate to `TmuxDriver` —
+/// those are sidebar affordances (open a shell or external tool in the
+/// session's cwd) that the user expects to surface as siblings in their
+/// existing tmux session, not inside the embedded pane.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PtyDriver;
 
@@ -519,8 +520,23 @@ impl AttachmentDriver for PtyDriver {
         TmuxDriver.spawn_terminal(session, host)
     }
 
+    /// Spawn `claude` into a detached tmux session, then return an
+    /// `EmbedPty` that attaches the dashboard's embedded pane to it.
+    /// Split into two tmux calls so the user sees claude paint into the
+    /// embedded pane immediately rather than getting a fullscreen
+    /// handoff (which is what delegating to `TmuxDriver` produced
+    /// pre-2026-05-19). tmux assigns the session name via `-P -F
+    /// '#{session_name}'` so collisions are impossible and the embed
+    /// can attach by that exact name. The dashboard later discovers
+    /// the session normally through the transcript watcher; re-attach
+    /// via Enter goes through `find_pane_local`, finds this tmux
+    /// session by cwd, and embeds against the same target.
     fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
-        TmuxDriver.spawn_session(cwd, host)
+        if host.id().is_local() {
+            Self::spawn_session_local(cwd)
+        } else {
+            Self::spawn_session_remote(cwd, host)
+        }
     }
 
     fn spawn_tool(
@@ -563,6 +579,63 @@ impl PtyDriver {
             cwd: None,
             label: embed_label(session),
         })
+    }
+
+    /// Spawn a fresh `claude` into a detached local tmux session and
+    /// build the embedded-attach spec for it. Two tmux calls:
+    /// (1) `tmux new-session -d -P -F '#{session_name}' -c <cwd> claude`
+    /// creates the detached session and prints the assigned name on
+    /// stdout — letting tmux pick the name guarantees no collision
+    /// with the user's existing sessions; (2) the embed spec attaches
+    /// to that exact name.
+    fn spawn_session_local(cwd: &Path) -> Result<AttachOutcome, AttachError> {
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let spawn_argv = tmux_new_detached_argv(&cwd_str);
+        let (program, rest) = spawn_argv.split_first().expect("non-empty argv");
+        let stdout = run_for_stdout(Command::new(program).args(rest))?;
+        let session_name = stdout.trim().to_string();
+        if session_name.is_empty() {
+            return Err(AttachError::TmuxCommandFailed(
+                "tmux new-session returned empty session name".into(),
+            ));
+        }
+        Ok(AttachOutcome::EmbedPty(EmbedSpec {
+            argv: tmux_attach_argv(&session_name),
+            cwd: None,
+            label: spawn_session_label(cwd),
+        }))
+    }
+
+    /// Remote analogue of [`spawn_session_local`]. One ssh round-trip
+    /// to create the detached remote tmux session and capture its
+    /// assigned name; the embed spec then wraps `tmux attach -t <name>`
+    /// in `Host::ssh_argv(true, …)` so the embedded pane drives the
+    /// remote attach over the same `ControlMaster`.
+    fn spawn_session_remote(cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let spawn_remote_cmd = tmux_new_detached_argv(&cwd_str);
+        let spawn_refs: Vec<&str> = spawn_remote_cmd.iter().map(String::as_str).collect();
+        let spawn_argv = host
+            .ssh_argv(false, &spawn_refs)
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        let (program, rest) = spawn_argv.split_first().expect("non-empty ssh argv");
+        let stdout = run_for_stdout(Command::new(program).args(rest))?;
+        let session_name = stdout.trim().to_string();
+        if session_name.is_empty() {
+            return Err(AttachError::TmuxCommandFailed(
+                "remote tmux new-session returned empty session name".into(),
+            ));
+        }
+        let attach_remote_cmd = tmux_attach_argv(&session_name);
+        let attach_refs: Vec<&str> = attach_remote_cmd.iter().map(String::as_str).collect();
+        let argv = host
+            .ssh_argv(true, &attach_refs)
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        Ok(AttachOutcome::EmbedPty(EmbedSpec {
+            argv,
+            cwd: None,
+            label: spawn_session_label(cwd),
+        }))
     }
 
     /// Remote attach in embedded mode. Same try-pane-then-resume shape
@@ -613,6 +686,58 @@ fn embed_label(session: &Session) -> String {
 #[must_use]
 fn tmux_attach_argv(target: &str) -> Vec<String> {
     vec!["tmux".into(), "attach".into(), "-t".into(), target.into()]
+}
+
+/// The tmux command for "create a detached session running `claude` in
+/// `cwd` and print the assigned session name." Used by
+/// [`PtyDriver::spawn_session_local`] and `_remote` to spawn the
+/// new-session target the embedded pane will then attach to. `-d`
+/// keeps the spawning client detached (the embed becomes the only
+/// attached client); `-P -F '#{session_name}'` prints the tmux-assigned
+/// name on stdout, so callers don't need to invent a unique name and
+/// risk collisions with the user's existing sessions.
+#[must_use]
+fn tmux_new_detached_argv(cwd: &str) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "new-session".into(),
+        "-d".into(),
+        "-P".into(),
+        "-F".into(),
+        "#{session_name}".into(),
+        "-c".into(),
+        cwd.into(),
+        "claude".into(),
+    ]
+}
+
+/// Run `cmd` and return its stdout, mapping non-zero exit and io
+/// failures into [`AttachError::TmuxCommandFailed`] with the stderr (or
+/// io error) as the message. Used by the spawn-session paths to read
+/// back the tmux-assigned session name.
+fn run_for_stdout(cmd: &mut Command) -> Result<String, AttachError> {
+    let output = cmd
+        .output()
+        .map_err(|e| AttachError::TmuxCommandFailed(e.to_string()))?;
+    if !output.status.success() {
+        return Err(AttachError::TmuxCommandFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Human-readable label for the embedded pane that hosts a freshly-
+/// spawned session. The pane title shows the worktree's basename
+/// (e.g. `agent-mux-fix-bug`) so the user can correlate the embed
+/// with the worktree they just created. Falls back to a generic
+/// label when `cwd` has no `file_name` (shouldn't happen for real
+/// worktree paths, but the `Path` API allows it).
+fn spawn_session_label(cwd: &Path) -> String {
+    cwd.file_name().map_or_else(
+        || "new session".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    )
 }
 
 /// The `remote_cmd` for "no live pane — spin up a fresh tmux session
@@ -748,6 +873,68 @@ mod tests {
              b:1.0 /home/u/proj\n";
         let got = parse_pane_match(out, Path::new("/home/u/proj"));
         assert_eq!(got, Some("a:0.0".to_string()));
+    }
+
+    #[test]
+    fn tmux_new_detached_argv_has_session_name_capture_and_claude_command() {
+        // The shape is load-bearing: `-d` keeps the spawning client
+        // detached (the embed becomes the only attached client), `-P
+        // -F '#{session_name}'` makes tmux print the assigned name on
+        // stdout, `-c <cwd>` sets the working directory, and the final
+        // argument is the command tmux runs in the new session.
+        let got = tmux_new_detached_argv("/work/agent-mux-fix-bug");
+        assert_eq!(
+            got,
+            vec![
+                "tmux".to_string(),
+                "new-session".to_string(),
+                "-d".to_string(),
+                "-P".to_string(),
+                "-F".to_string(),
+                "#{session_name}".to_string(),
+                "-c".to_string(),
+                "/work/agent-mux-fix-bug".to_string(),
+                "claude".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spawn_session_label_returns_cwd_basename() {
+        assert_eq!(
+            spawn_session_label(Path::new("/work/agent-mux-fix-bug")),
+            "agent-mux-fix-bug"
+        );
+        // Trailing slash: file_name strips it.
+        assert_eq!(spawn_session_label(Path::new("/work/proj/")), "proj");
+    }
+
+    #[test]
+    fn pty_driver_spawn_session_remote_invokes_ssh_with_detached_new_session() {
+        // The remote spawn must hand `tmux new-session -d -P -F
+        // '#{session_name}' -c <cwd> claude` to ssh_argv(false, …) —
+        // no tty needed because we're only reading back the session
+        // name. The ssh process spawned from the fake host's argv will
+        // fail to connect; we don't care, we just want to observe the
+        // first ssh_argv call.
+        let host = FakeRemoteHost::new();
+        let _ = PtyDriver::spawn_session_remote(Path::new("/srv/work/proj"), &host);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(!tty, "spawn capture does not need a tty");
+        assert_eq!(
+            remote_cmd,
+            vec![
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}",
+                "-c",
+                "/srv/work/proj",
+                "claude",
+            ]
+        );
     }
 
     #[test]

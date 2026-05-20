@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::host::{Host, shell_join_quoted};
+use crate::host::{Host, shell_join_quoted, shell_single_quote};
 use crate::session::Session;
 
 #[derive(Debug)]
@@ -342,18 +342,34 @@ impl TmuxDriver {
         Self::run_remote_interactive(host, &argv_refs)
     }
 
+    /// Remote terminal launch: open a local tmux window (or, outside
+    /// tmux, `SuspendAndRun`) that ssh's into the remote and exec's the
+    /// user's `$SHELL` at the session's cwd. Mirrors the local in-tmux
+    /// equivalent (`tmux new-window -c <cwd>` drops the user into a
+    /// shell at <cwd>) — the user gets a window they can use until
+    /// they exit, then it closes.
+    ///
+    /// Pre-2026-05-20 this fired `ssh target tmux new-window -c <cwd>`,
+    /// which made the *remote* tmux create a window in whatever session
+    /// happened to be "current" on the remote server (not necessarily
+    /// the one the user was attached to) while the local wrapper window
+    /// died immediately. Dogfooding surfaced both halves of that
+    /// failure mode at once.
     fn spawn_terminal_remote(
         session: &Session,
         host: &dyn Host,
     ) -> Result<AttachOutcome, AttachError> {
         let cwd = session.project_dir.to_string_lossy().into_owned();
-        Self::run_remote_interactive(host, &["tmux", "new-window", "-c", &cwd])
+        let recipe = format!("cd {} && exec \"$SHELL\"", shell_single_quote(&cwd));
+        Self::run_remote_interactive(host, &["sh", "-c", &recipe])
     }
 
-    /// Remote tool launch. Same dispatch shape as `spawn_terminal_remote`,
-    /// just with the user's shell-joined command appended to the
-    /// `tmux new-window` invocation. The remote tmux runs the command
-    /// via `sh -c`, so spaces / globs / shell metacharacters survive.
+    /// Remote tool launch: same shape as [`spawn_terminal_remote`], with
+    /// the user's command (`{cwd}`/`{host}` already substituted) in
+    /// place of `$SHELL`. The cwd is single-quoted into the `sh -c`
+    /// recipe so paths with spaces survive both quoting layers (ours
+    /// here, plus the one [`SshHost::ssh_argv`] applies before sending
+    /// to the remote).
     fn spawn_tool_remote(
         session: &Session,
         host: &dyn Host,
@@ -361,7 +377,8 @@ impl TmuxDriver {
     ) -> Result<AttachOutcome, AttachError> {
         let cwd = session.project_dir.to_string_lossy().into_owned();
         let joined = shell_join_quoted(command.iter().map(String::as_str));
-        Self::run_remote_interactive(host, &["tmux", "new-window", "-c", &cwd, &joined])
+        let recipe = format!("cd {} && exec {}", shell_single_quote(&cwd), joined);
+        Self::run_remote_interactive(host, &["sh", "-c", &recipe])
     }
 
     /// Hand the user a fully-interactive subprocess that runs
@@ -1108,11 +1125,13 @@ mod tests {
     }
 
     #[test]
-    fn spawn_tool_remote_appends_shell_joined_command_to_new_window() {
-        // Remote tool launch must shell-quote the user's command into
-        // one token that the remote `tmux new-window` execs via sh -c.
-        // Otherwise multi-arg commands like `nvim .` would be split
-        // by SSH/the remote shell in surprising ways.
+    fn spawn_tool_remote_sends_sh_recipe_with_cd_and_exec() {
+        // Post-2026-05-20 fix: rather than asking the *remote* tmux to
+        // create a window (which lands in some session the user isn't
+        // necessarily attached to, while leaving a dead local wrapper),
+        // remote tool launch ssh's into the host and exec's the
+        // command at the session's cwd. The local wrapper window stays
+        // alive until the tool exits — same shape as local-in-tmux.
         let host = FakeRemoteHost::new();
         let session = make_session(HostId("remote".into()), "/work/proj");
         let cmd = vec!["nvim".to_string(), ".".to_string()];
@@ -1121,7 +1140,42 @@ mod tests {
         assert!(tty, "spawn_tool needs -t for interactive tools");
         assert_eq!(
             remote_cmd,
-            vec!["tmux", "new-window", "-c", "/work/proj", "'nvim' '.'"]
+            vec!["sh", "-c", "cd '/work/proj' && exec 'nvim' '.'"]
+        );
+    }
+
+    #[test]
+    fn spawn_terminal_remote_sends_sh_recipe_with_cd_and_exec_shell() {
+        // The terminal binding (`t`) must drop the user into their
+        // remote `$SHELL` at the session's cwd. Pinned because the
+        // pre-2026-05-20 shape (`tmux new-window -c <cwd>` on the
+        // remote) was the source of the dogfood-discovered bug:
+        // remote tmux created a window in some session the user
+        // couldn't necessarily see, and the local wrapper exited
+        // immediately.
+        let host = FakeRemoteHost::new();
+        let session = make_session(HostId("remote".into()), "/work/proj");
+        let _ = TmuxDriver::spawn_terminal_remote(&session, &host);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(tty, "spawn_terminal needs -t for interactive shell");
+        assert_eq!(
+            remote_cmd,
+            vec!["sh", "-c", "cd '/work/proj' && exec \"$SHELL\""]
+        );
+    }
+
+    #[test]
+    fn spawn_terminal_remote_quotes_cwd_with_spaces() {
+        // Paths with spaces survive both quoting layers: ours here
+        // (single-quote the cwd inside the sh recipe) and ssh_argv's
+        // (single-quote the whole recipe as one final argv element).
+        let host = FakeRemoteHost::new();
+        let session = make_session(HostId("remote".into()), "/work/my proj");
+        let _ = TmuxDriver::spawn_terminal_remote(&session, &host);
+        let (_, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert_eq!(
+            remote_cmd,
+            vec!["sh", "-c", "cd '/work/my proj' && exec \"$SHELL\""]
         );
     }
 

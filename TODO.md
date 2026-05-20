@@ -45,6 +45,7 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 ### Embedded PTY
 
 - embedded-PTY polish (post-Phase-6): F5+ key codes, ScrollLeft/ScrollRight mouse forwarding, terminal-focus-detection so a click into the sidebar implicitly transitions focus, a config knob for the leader chord (so users who already use `Ctrl-a` for tmux can rebind), highlight-on-hover for sidebar rows when mouse is over. Defer until dogfooding surfaces the actual pain points. `#embedded-pty #dogfood`
+- mouse-wheel scrollback in the embedded pane. Dogfooding 2026-05-20: scrolling the wheel over the embedded terminal pane doesn't move the scrollback, which makes it impractical to go back through a long Claude conversation without detaching to a real tmux client. This is a real-blocker for using the embedded pane as the primary attach surface — readback is a core verb. Likely shape: intercept `MouseEventKind::ScrollUp`/`ScrollDown` while focus is in the pane, translate to scrollback offset moves against the embedded terminal's history buffer (the underlying VTE/`alacritty_terminal` already maintains one), and render with the offset applied; reset offset to 0 on any keypress so typing returns to the live cursor. Open: how many lines of history to retain (config knob vs sane default like 10k), and whether the line should be visually marked when not at the bottom of scrollback. `#embedded-pty #ux`
 
 ### Custom tools
 

@@ -1491,24 +1491,29 @@ impl App {
             let session = self.selected_session()?;
             let host = self.hosts.get(&session.host)?.clone();
             let cwd = session.project_dir.clone();
-            (self.driver.spawn_terminal(session, host.as_ref()), cwd)
+            let id = session.id.clone();
+            (self.driver.spawn_terminal(session, host.as_ref()), cwd, id)
         };
         match result {
-            (Ok(AttachOutcome::Done), cwd) => {
+            (Ok(AttachOutcome::Done), cwd, _) => {
                 self.status = Some(format!("opened terminal in {}", cwd.display()));
                 None
             }
-            (Ok(AttachOutcome::SuspendAndRun(cmd)), _) => {
+            (Ok(AttachOutcome::SuspendAndRun(cmd)), _, _) => {
                 self.status = None;
                 Some(cmd)
             }
-            (Ok(AttachOutcome::EmbedPty(_)), _) => {
-                // Defensive — `PtyDriver::spawn_terminal` delegates to
-                // `TmuxDriver`, so this arm shouldn't fire today.
-                self.status = Some("embedded terminal not yet wired (Phase 3)".to_string());
+            (Ok(AttachOutcome::EmbedPty(spec)), _, id) => {
+                // Embed the shell in the dashboard pane. Synthetic
+                // SessionId prefixed `agent-mux-terminal:` so re-press
+                // refocuses (same id), but Enter on the source session
+                // row swaps cleanly back to the claude attach (different
+                // id → install_embedded drops + respawns).
+                let synthetic_id = SessionId(format!("agent-mux-terminal:{}", id.0));
+                self.install_embedded(&spec, synthetic_id);
                 None
             }
-            (Err(e), _) => {
+            (Err(e), _, _) => {
                 self.status = Some(format!("terminal: {e}"));
                 None
             }
@@ -1523,10 +1528,11 @@ impl App {
     /// when nothing to suspend (`Done`, `EmbedPty`, errors).
     fn launch_tool(&mut self, idx: usize) -> Option<SuspendCommand> {
         let tool = self.config.tools.get(idx)?.clone();
-        let (outcome, label, cwd) = {
+        let (outcome, label, cwd, session_id) = {
             let session = self.selected_session()?;
             let host = self.hosts.get(&session.host)?.clone();
             let cwd = session.project_dir.clone();
+            let id = session.id.clone();
             let host_str = session.host.as_str().to_string();
             let cmd = tool.substitute(&cwd, &host_str);
             (
@@ -1542,6 +1548,7 @@ impl App {
                         .unwrap_or_else(|| format!("tool {idx}"))
                 }),
                 cwd,
+                id,
             )
         };
         match outcome {
@@ -1553,11 +1560,15 @@ impl App {
                 self.status = None;
                 Some(cmd)
             }
-            Ok(AttachOutcome::EmbedPty(_)) => {
-                // Defensive — neither driver currently emits EmbedPty
-                // for spawn_tool. If a future driver does, surface
-                // the gap instead of panicking the binary.
-                self.status = Some(format!("tool {label}: embedded launch not yet wired"));
+            Ok(AttachOutcome::EmbedPty(spec)) => {
+                // Embed the tool in the dashboard pane. Synthetic
+                // SessionId includes the tool index so the same
+                // session can host distinct tools without collision —
+                // pressing `g` then `v` swaps between lazygit and
+                // nvim cleanly, while pressing `g` twice refocuses
+                // the existing lazygit.
+                let synthetic_id = SessionId(format!("agent-mux-tool:{idx}:{}", session_id.0));
+                self.install_embedded(&spec, synthetic_id);
                 None
             }
             Err(e) => {

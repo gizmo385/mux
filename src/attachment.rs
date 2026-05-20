@@ -502,14 +502,20 @@ fn find_pane_remote(host: &dyn Host, project_dir: &Path) -> Result<String, Attac
 
 /// Embedded-PTY `AttachmentDriver`. Same dispatch shape as
 /// [`TmuxDriver`], but emits [`AttachOutcome::EmbedPty`] for `attach`
-/// and `spawn_session` so the dashboard hosts both existing and
-/// newly-spawned sessions inside the PTY widget instead of handing the
-/// terminal off.
+/// and `spawn_session`, `spawn_terminal`, and `spawn_tool` so the
+/// dashboard hosts every "doing stuff" action inside the PTY widget
+/// instead of handing the terminal off. Sidebar stays visible
+/// throughout; pressing Enter on a session row re-attaches to the
+/// underlying claude session (the embed re-installs against a
+/// different `SessionId`, dropping the terminal/tool view).
 ///
-/// `spawn_terminal` and `spawn_tool` still delegate to `TmuxDriver` —
-/// those are sidebar affordances (open a shell or external tool in the
-/// session's cwd) that the user expects to surface as siblings in their
-/// existing tmux session, not inside the embedded pane.
+/// 2026-05-20 design shift: `spawn_terminal` and `spawn_tool` used to
+/// delegate to `TmuxDriver` (sibling local tmux window). Dogfooding
+/// surfaced that this was effectively a fullscreen handoff — tmux
+/// switched the local terminal to the new window and the dashboard
+/// view disappeared. Routing through the embedded pane instead keeps
+/// the sidebar visible and matches what `Enter` and `n`/`N` already
+/// do.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PtyDriver;
 
@@ -529,12 +535,23 @@ impl AttachmentDriver for PtyDriver {
         }
     }
 
+    /// Open a shell at the session's cwd, hosted inside the embedded
+    /// PTY pane. Local: spawn `$SHELL` directly with `cwd` set on the
+    /// `EmbedSpec`. Remote: ssh-wrap a `sh -c 'cd <cwd> && exec
+    /// "$SHELL"'` recipe and embed the ssh argv. Either way, the
+    /// sidebar stays visible while the user works in the shell;
+    /// pressing Enter on a session row swaps the embed back to the
+    /// session attach.
     fn spawn_terminal(
         &self,
         session: &Session,
         host: &dyn Host,
     ) -> Result<AttachOutcome, AttachError> {
-        TmuxDriver.spawn_terminal(session, host)
+        if session.host.is_local() {
+            Ok(Self::spawn_terminal_local(session))
+        } else {
+            Self::spawn_terminal_remote_embed(session, host)
+        }
     }
 
     /// Spawn `claude` into a detached tmux session, then return an
@@ -556,18 +573,22 @@ impl AttachmentDriver for PtyDriver {
         }
     }
 
+    /// Launch a `[[tools]]` keybind's command at the session's cwd,
+    /// hosted inside the embedded PTY pane. Same dispatch shape as
+    /// `spawn_terminal` — local: spawn argv directly with cwd; remote:
+    /// ssh-wrap a `sh -c 'cd <cwd> && exec <cmd>'` recipe and embed
+    /// the ssh argv.
     fn spawn_tool(
         &self,
         session: &Session,
         host: &dyn Host,
         command: &[String],
     ) -> Result<AttachOutcome, AttachError> {
-        // Out-of-band action — same reasoning as `spawn_terminal`'s
-        // delegate-to-TmuxDriver shape: opening lazygit in a tmux
-        // window isn't part of "embed the active attach," it's a
-        // sibling tmux affordance. Pivot here only if dogfooding
-        // surfaces demand for an embedded-launch variant.
-        TmuxDriver.spawn_tool(session, host, command)
+        if session.host.is_local() {
+            Ok(Self::spawn_tool_local_embed(session, command))
+        } else {
+            Self::spawn_tool_remote_embed(session, host, command)
+        }
     }
 }
 
@@ -596,6 +617,87 @@ impl PtyDriver {
             cwd: None,
             label: embed_label(session),
         })
+    }
+
+    /// Local terminal launch: run `$SHELL` directly in the embedded
+    /// PTY with cwd set to the session's `project_dir`. No tmux wrap
+    /// — the dashboard *is* the host for the new shell, sibling to
+    /// the sidebar.
+    fn spawn_terminal_local(session: &Session) -> AttachOutcome {
+        AttachOutcome::EmbedPty(EmbedSpec {
+            argv: vec![user_shell()],
+            cwd: Some(session.project_dir.clone()),
+            label: format!("terminal · {}", spawn_session_label(&session.project_dir)),
+        })
+    }
+
+    /// Remote terminal in embedded mode. Same `sh -c 'cd … && exec
+    /// "$SHELL"'` recipe `TmuxDriver::spawn_terminal_remote` uses,
+    /// wrapped in `Host::ssh_argv(tty=true, …)` and emitted as
+    /// `EmbedPty` so the result lands in the dashboard pane.
+    fn spawn_terminal_remote_embed(
+        session: &Session,
+        host: &dyn Host,
+    ) -> Result<AttachOutcome, AttachError> {
+        let cwd = session.project_dir.to_string_lossy().into_owned();
+        let recipe = format!("cd {} && exec \"$SHELL\"", shell_single_quote(&cwd));
+        let argv = host
+            .ssh_argv(true, &["sh", "-c", &recipe])
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        Ok(AttachOutcome::EmbedPty(EmbedSpec {
+            argv,
+            cwd: None,
+            label: format!("terminal · {}", spawn_session_label(&session.project_dir)),
+        }))
+    }
+
+    /// Local tool launch in embedded mode. The command is already
+    /// `{cwd}`/`{host}`-substituted by the caller; we just spawn it
+    /// directly with the session's cwd. Defensive empty-command
+    /// fallback to `sh` — config-load validation already rejects
+    /// empty commands, but the trait surface accepts a slice so guard
+    /// against a future caller bypass.
+    fn spawn_tool_local_embed(session: &Session, command: &[String]) -> AttachOutcome {
+        let argv: Vec<String> = if command.is_empty() {
+            vec!["sh".to_string()]
+        } else {
+            command.to_vec()
+        };
+        AttachOutcome::EmbedPty(EmbedSpec {
+            argv,
+            cwd: Some(session.project_dir.clone()),
+            label: format!(
+                "{} · {}",
+                tool_label_token(command),
+                spawn_session_label(&session.project_dir)
+            ),
+        })
+    }
+
+    /// Remote tool launch in embedded mode. Mirrors
+    /// [`TmuxDriver::spawn_tool_remote`] (post-2026-05-20 fix) but
+    /// emits the ssh argv as `EmbedPty` rather than wrapping in
+    /// `tmux new-window` / `SuspendAndRun`.
+    fn spawn_tool_remote_embed(
+        session: &Session,
+        host: &dyn Host,
+        command: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        let cwd = session.project_dir.to_string_lossy().into_owned();
+        let joined = shell_join_quoted(command.iter().map(String::as_str));
+        let recipe = format!("cd {} && exec {}", shell_single_quote(&cwd), joined);
+        let argv = host
+            .ssh_argv(true, &["sh", "-c", &recipe])
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        Ok(AttachOutcome::EmbedPty(EmbedSpec {
+            argv,
+            cwd: None,
+            label: format!(
+                "{} · {}",
+                tool_label_token(command),
+                spawn_session_label(&session.project_dir)
+            ),
+        }))
     }
 
     /// Spawn a fresh `claude` into a detached local tmux session and
@@ -755,6 +857,18 @@ fn spawn_session_label(cwd: &Path) -> String {
         || "new session".to_string(),
         |s| s.to_string_lossy().into_owned(),
     )
+}
+
+/// Pick a short label for the embedded-pane title from a tool's argv.
+/// First token is the program; everything else is treated as arg
+/// noise. Defensive empty-slice fallback to "tool" so a bad caller
+/// can't blank the title — config-load already rejects empty
+/// commands.
+fn tool_label_token(command: &[String]) -> String {
+    command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "tool".to_string())
 }
 
 /// The `remote_cmd` for "no live pane — spin up a fresh tmux session
@@ -1396,5 +1510,82 @@ mod tests {
             panic!("expected EmbedPty");
         };
         assert_eq!(spec.label, "hello-world");
+    }
+
+    #[test]
+    fn pty_driver_spawn_terminal_local_embeds_user_shell_with_cwd() {
+        // Local `t` in embedded mode runs $SHELL directly in the
+        // dashboard pane with the session's cwd as the process working
+        // directory. No tmux wrap — the embed *is* the host.
+        let session = make_session(HostId::local(), "/work/proj");
+        let outcome = PtyDriver::new()
+            .spawn_terminal(&session, &LocalHost::new())
+            .expect("local spawn_terminal");
+        let AttachOutcome::EmbedPty(spec) = outcome else {
+            panic!("expected EmbedPty, got {outcome:?}");
+        };
+        assert_eq!(spec.argv, vec![user_shell()]);
+        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/work/proj")));
+        assert!(
+            spec.label.contains("terminal"),
+            "label should flag terminal kind: {}",
+            spec.label
+        );
+        assert!(spec.label.contains("proj"), "got: {}", spec.label);
+    }
+
+    #[test]
+    fn pty_driver_spawn_terminal_remote_embeds_ssh_recipe() {
+        // Remote `t` ssh's into the host with the same
+        // `sh -c 'cd … && exec "$SHELL"'` recipe `TmuxDriver` uses,
+        // but emits the ssh argv as `EmbedPty` so the result lands in
+        // the dashboard pane rather than a sibling local tmux window.
+        let host = FakeRemoteHost::new();
+        let session = make_session(HostId("remote".into()), "/work/proj");
+        let _ = PtyDriver::spawn_terminal_remote_embed(&session, &host);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(tty, "interactive shell needs a tty");
+        assert_eq!(
+            remote_cmd,
+            vec!["sh", "-c", "cd '/work/proj' && exec \"$SHELL\""]
+        );
+    }
+
+    #[test]
+    fn pty_driver_spawn_tool_local_embeds_command_with_cwd() {
+        // Local `[[tools]]` keybind in embedded mode spawns the
+        // user's argv directly with the session's cwd. The label
+        // includes the first command token so the pane title
+        // distinguishes lazygit vs nvim vs whatever else.
+        let session = make_session(HostId::local(), "/work/proj");
+        let cmd = vec!["lazygit".to_string()];
+        let outcome = PtyDriver::new()
+            .spawn_tool(&session, &LocalHost::new(), &cmd)
+            .expect("local spawn_tool");
+        let AttachOutcome::EmbedPty(spec) = outcome else {
+            panic!("expected EmbedPty, got {outcome:?}");
+        };
+        assert_eq!(spec.argv, vec!["lazygit"]);
+        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/work/proj")));
+        assert!(spec.label.contains("lazygit"), "got: {}", spec.label);
+        assert!(spec.label.contains("proj"), "got: {}", spec.label);
+    }
+
+    #[test]
+    fn pty_driver_spawn_tool_remote_embeds_ssh_with_command_recipe() {
+        // Remote `[[tools]]` ssh's into the host with the user's
+        // command in place of `$SHELL`. Same wire shape as
+        // `TmuxDriver::spawn_tool_remote` (post-2026-05-20 fix), just
+        // emitted as `EmbedPty`.
+        let host = FakeRemoteHost::new();
+        let session = make_session(HostId("remote".into()), "/work/proj");
+        let cmd = vec!["nvim".to_string(), ".".to_string()];
+        let _ = PtyDriver::spawn_tool_remote_embed(&session, &host, &cmd);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(tty, "interactive tool needs a tty");
+        assert_eq!(
+            remote_cmd,
+            vec!["sh", "-c", "cd '/work/proj' && exec 'nvim' '.'"]
+        );
     }
 }

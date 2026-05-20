@@ -42,7 +42,7 @@ use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
 };
 use agent_mux::host::{Host, LocalHost, SshHost};
-use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal};
+use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
 use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
 use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
@@ -811,9 +811,24 @@ impl App {
         // `App.hosts` are eligible for selection; others render
         // dimmed in the picker until their `Connected` event lands.
         let ready_hosts: HashSet<HostId> = self.hosts.keys().cloned().collect();
+        // Seed the picker from the cursor's current session so `n`
+        // from a focused row pre-positions over the same repo (or at
+        // least the same host). Worktree-backed sessions match against
+        // their `parent_repo`; everything else falls back to
+        // `project_dir`, which equals the repo root for non-worktree
+        // checkouts.
+        let seed = self.selected_session().map(|s| NewSessionSeed {
+            host: s.host.clone(),
+            repo_path: Some(
+                s.parent_repo
+                    .clone()
+                    .unwrap_or_else(|| s.project_dir.clone()),
+            ),
+        });
         self.modal = Some(NewSessionModal::new(
             self.registry.repos().to_vec(),
             ready_hosts,
+            seed,
         ));
         self.status = None;
     }

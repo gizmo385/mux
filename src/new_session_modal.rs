@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -11,6 +12,19 @@ use crate::host::LocalHost;
 use crate::repo::Repo;
 use crate::session::HostId;
 use crate::worktree;
+
+/// Initial cursor hint for the picker — derived from the dashboard's
+/// currently-selected session. When the user presses `n` from a focused
+/// row, the dominant intent is "another session in this same
+/// neighbourhood," so the picker pre-positions over the matching repo.
+/// `repo_path` matches against `Repo.path` (a session's `parent_repo`
+/// when it's worktree-backed, else its `project_dir`); a host-only
+/// match falls back to the first repo on that host.
+#[derive(Debug, Clone)]
+pub struct NewSessionSeed {
+    pub host: HostId,
+    pub repo_path: Option<PathBuf>,
+}
 
 pub enum NewSessionModal {
     PickingRepo {
@@ -54,11 +68,19 @@ impl NewSessionModal {
     /// non-empty list of repos and the set of hosts whose `Arc<dyn Host>`
     /// is currently live in `App.hosts`. Repos belonging to other
     /// hosts are visible-but-inert (rendered dim, ignored on Enter).
+    /// `seed` biases the initial cursor toward the dashboard's
+    /// currently-selected session's repo (see [`NewSessionSeed`]); pass
+    /// `None` to open at index 0.
     #[must_use]
-    pub fn new(repos: Vec<Repo>, ready_hosts: HashSet<HostId>) -> Self {
+    pub fn new(
+        repos: Vec<Repo>,
+        ready_hosts: HashSet<HostId>,
+        seed: Option<NewSessionSeed>,
+    ) -> Self {
         debug_assert!(!repos.is_empty(), "modal opened with no repos");
+        let initial = seed.and_then(|s| seeded_index(&repos, &s)).unwrap_or(0);
         let mut state = ListState::default();
-        state.select(Some(0));
+        state.select(Some(initial));
         Self::PickingRepo {
             repos,
             ready_hosts,
@@ -225,6 +247,20 @@ fn handle_filling(
         }
         _ => KeyOutcome::Handled,
     }
+}
+
+/// Pick the picker's initial cursor position from a seed. Prefer an
+/// exact host + path match; fall back to the first repo on the seeded
+/// host; return `None` to let the caller default to index 0.
+fn seeded_index(repos: &[Repo], seed: &NewSessionSeed) -> Option<usize> {
+    if let Some(path) = seed.repo_path.as_ref()
+        && let Some(idx) = repos
+            .iter()
+            .position(|r| r.host == seed.host && &r.path == path)
+    {
+        return Some(idx);
+    }
+    repos.iter().position(|r| r.host == seed.host)
 }
 
 fn select_next(state: &mut ListState, len: usize) {
@@ -433,7 +469,8 @@ mod tests {
 
     #[test]
     fn new_starts_in_picker_with_first_selected() {
-        let modal = NewSessionModal::new(vec![local_repo("a"), local_repo("b")], ready_local());
+        let modal =
+            NewSessionModal::new(vec![local_repo("a"), local_repo("b")], ready_local(), None);
         match modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 assert_eq!(state.selected(), Some(0));
@@ -444,7 +481,7 @@ mod tests {
 
     #[test]
     fn esc_returns_cancel_from_any_state() {
-        let mut modal = NewSessionModal::new(vec![local_repo("a")], ready_local());
+        let mut modal = NewSessionModal::new(vec![local_repo("a")], ready_local(), None);
         assert!(matches!(
             modal.handle_key(key(KeyCode::Esc)),
             KeyOutcome::Cancel
@@ -467,6 +504,7 @@ mod tests {
         let mut modal = NewSessionModal::new(
             vec![local_repo("a"), local_repo("b"), local_repo("c")],
             ready_local(),
+            None,
         );
         modal.handle_key(key(KeyCode::Up));
         match &modal {
@@ -486,7 +524,8 @@ mod tests {
 
     #[test]
     fn picker_enter_transitions_to_filling_with_selected_repo() {
-        let mut modal = NewSessionModal::new(vec![local_repo("a"), local_repo("b")], ready_local());
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a"), local_repo("b")], ready_local(), None);
         modal.handle_key(key(KeyCode::Down));
         let outcome = modal.handle_key(key(KeyCode::Enter));
         assert!(matches!(outcome, KeyOutcome::Handled));
@@ -512,6 +551,7 @@ mod tests {
         let mut modal = NewSessionModal::new(
             vec![local_repo("here"), remote_repo("gizmo", "there")],
             ready,
+            None,
         );
         // Move to the remote repo.
         modal.handle_key(key(KeyCode::Down));
@@ -530,7 +570,7 @@ mod tests {
         // remote repos pre-fill the same way.
         let mut ready = HashSet::new();
         ready.insert(HostId("gizmo".into()));
-        let mut modal = NewSessionModal::new(vec![remote_repo("gizmo", "alpha")], ready);
+        let mut modal = NewSessionModal::new(vec![remote_repo("gizmo", "alpha")], ready, None);
         let _ = modal.handle_key(key(KeyCode::Enter));
         match &modal {
             NewSessionModal::Filling { repo, branch, .. } => {
@@ -541,6 +581,75 @@ mod tests {
                 );
             }
             NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+        }
+    }
+
+    #[test]
+    fn seed_with_exact_host_and_path_lands_on_that_repo() {
+        // Worktree-backed sessions match against their parent repo's
+        // path; the picker should put the cursor on the matching row
+        // so the user can hit Enter and stay in-context.
+        let repos = vec![
+            local_repo("alpha"),
+            remote_repo("gizmo", "beta"),
+            local_repo("gamma"),
+        ];
+        let seed = NewSessionSeed {
+            host: HostId::local(),
+            repo_path: Some(PathBuf::from("/tmp/gamma")),
+        };
+        let modal = NewSessionModal::new(repos, ready_local(), Some(seed));
+        match modal {
+            NewSessionModal::PickingRepo { state, .. } => {
+                assert_eq!(state.selected(), Some(2));
+            }
+            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+        }
+    }
+
+    #[test]
+    fn seed_with_host_match_only_falls_back_to_first_repo_on_that_host() {
+        // No exact path match (the seed points at a repo the registry
+        // doesn't know) — pre-position on the first repo for the seed's
+        // host so the user is at least in the right neighbourhood.
+        let mut ready = HashSet::new();
+        ready.insert(HostId::local());
+        ready.insert(HostId("gizmo".into()));
+        let repos = vec![
+            local_repo("alpha"),
+            remote_repo("gizmo", "beta"),
+            remote_repo("gizmo", "delta"),
+        ];
+        let seed = NewSessionSeed {
+            host: HostId("gizmo".into()),
+            repo_path: Some(PathBuf::from("/srv/missing")),
+        };
+        let modal = NewSessionModal::new(repos, ready, Some(seed));
+        match modal {
+            NewSessionModal::PickingRepo { state, .. } => {
+                // First gizmo repo is at index 1.
+                assert_eq!(state.selected(), Some(1));
+            }
+            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+        }
+    }
+
+    #[test]
+    fn seed_with_no_matches_falls_back_to_index_zero() {
+        // Seed references a host that doesn't have any repos in the
+        // registry — defaults to the existing index-0 behaviour rather
+        // than failing or showing nothing selected.
+        let repos = vec![local_repo("alpha"), local_repo("beta")];
+        let seed = NewSessionSeed {
+            host: HostId("unknown".into()),
+            repo_path: None,
+        };
+        let modal = NewSessionModal::new(repos, ready_local(), Some(seed));
+        match modal {
+            NewSessionModal::PickingRepo { state, .. } => {
+                assert_eq!(state.selected(), Some(0));
+            }
+            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
         }
     }
 

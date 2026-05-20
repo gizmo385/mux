@@ -315,11 +315,8 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "workspace_folders = []  # depth-1 scanned for git repos at startup;"
-    )?;
-    writeln!(
-        out,
-        "                        # tilde-expanded. Env-var expansion is post-M5."
+        "workspace_folders = []  # absolute paths only (depth-1 scan); top-level tildes rejected — \
+         use per-host workspace_folders for tilde-relative paths."
     )?;
     writeln!(out)?;
     writeln!(

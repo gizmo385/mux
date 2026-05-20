@@ -44,7 +44,12 @@ Border style reflects focus: bold border = the embedded pane has the keyboard; d
 Optional `~/.config/agent-mux/config.toml`:
 
 ```toml
-workspace_folders = ["~/workspace", "~/code"]
+# Top-level workspace_folders must be absolute paths — they're fed to
+# every host's scan (local + remotes that inherit), and a tilde here
+# would bake in the local user's home for everyone. Tilde at the top
+# level errors loudly at load. Use a per-host block (below) for
+# tilde-relative paths.
+workspace_folders = ["/home/gizmo/workspace", "/home/gizmo/code"]
 
 # Remote hosts. Each table is one SSH-reachable machine whose Claude
 # Code sessions show up alongside your local ones at startup. Per-host
@@ -52,8 +57,8 @@ workspace_folders = ["~/workspace", "~/code"]
 # to inherit the top-level list.
 [hosts.alpenglow]
 ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
-# transcript_root = "~/.claude/projects"  # default; tilde-expanded
-# workspace_folders = ["~/work"]          # inherits top-level if omitted
+# transcript_root = "~/.claude/projects"  # default; tilde survives, remote shell expands
+# workspace_folders = ["~/workspace"]     # per-host tildes preserved; remote shell expands
 
 # Notification behaviour. Every field has a default; the whole section
 # is optional. Quiet-hours and per-event sound customization are not
@@ -86,7 +91,7 @@ preset = "bright"
 needs_input = "#ff5555"    # override one field on top of the preset
 ```
 
-The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan; tilde expansion only, env vars not yet supported).
+The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan). Top-level paths must be absolute; per-host `workspace_folders` accept tildes (the remote shell expands them against the remote user's home). Env-var expansion is not supported.
 
 ### Remote sessions
 

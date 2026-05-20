@@ -58,7 +58,7 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 - extend `[theme]` schema beyond foreground colours: background colours, per-element modifier overrides (currently bold/dim/reversed are hardcoded), and richer keys (e.g. `[theme.header]` bold = true, fg = "..."). Today's flat per-element fg-only schema covers the common dogfood case; the more expressive shape waits until a real user-pain signal asks for it. `#config #theme`
 - design TOML schema for keybinds (action name → key combo) for the built-in dashboard actions. The `[[tools]]` array shipped 2026-05-19 covers user-added bindings that launch external commands; the still-open piece is letting users rebind the built-in actions themselves (e.g. swap `t` and `n`). `#config`
 - reload-on-edit (watch config file, re-apply). `#config`
-- env-var expansion in `workspace_folders` (e.g. `$HOME/work`, `$WORK_DIR/repos`). Tilde expansion ships today; env vars deferred. `#config`
+- env-var expansion in `workspace_folders` (e.g. `$HOME/work`, `$WORK_DIR/repos`). Top-level entries must be absolute paths today (tildes rejected at load per the 2026-05-19 fix); per-host entries pass through to the remote shell which handles env vars natively. Env-var support at the top level would mean replicating shell-style `$VAR` expansion against the local environment — feasible, but the use case is narrow (single-machine convenience). `#config`
 - expose previously-hardcoded thresholds: idle threshold (`IDLE_THRESHOLD` in `main.rs`, default 1h), remote poll interval (`REMOTE_POLL_INTERVAL` in `watcher.rs`, default 3s), and discovery max-age (`DISCOVERY_MAX_AGE` in `discovery.rs`, default 30d — added 2026-05-18 with the recency filter). All flagged in code comments. `#config`
 
 ### UI polish

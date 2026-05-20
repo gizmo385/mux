@@ -41,6 +41,15 @@ pub enum ConfigError {
     /// the available preset names so the user can correct without
     /// hunting through docs.
     UnknownThemePreset(String),
+    /// A top-level `workspace_folders` entry begins with `~`. Top-level
+    /// folders are scanned by every host (local + remotes inheriting
+    /// via fallback), so a tilde can't be expanded once at load time
+    /// without baking in the local user's home for every host. Errored
+    /// at load with a directive to either use an absolute path or move
+    /// the entry under a `[hosts.<name>].workspace_folders` block —
+    /// per-host paths preserve tildes and the remote shell expands
+    /// them against the remote user's home.
+    TildeInTopLevelWorkspaceFolder(PathBuf),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -79,6 +88,16 @@ impl std::fmt::Display for ConfigError {
                     f,
                     "theme.preset: {name:?} is not a recognised preset (available: {})",
                     Theme::preset_names().join(", ")
+                )
+            }
+            Self::TildeInTopLevelWorkspaceFolder(p) => {
+                write!(
+                    f,
+                    "workspace_folders entry {:?} starts with `~`. Top-level folders feed every host's scan, \
+                     so a tilde can't be expanded here without baking in the local user's home. \
+                     Use an absolute path, or move it under [hosts.<name>].workspace_folders \
+                     (per-host paths keep the tilde and the remote shell expands it).",
+                    p.display()
                 )
             }
         }
@@ -623,7 +642,11 @@ impl Config {
             Err(e) => return Err(ConfigError::Io(e)),
         };
         let mut cfg: Self = toml::from_str(&raw).map_err(ConfigError::Parse)?;
-        cfg.workspace_folders = cfg.workspace_folders.iter().map(|p| expand(p)).collect();
+        for folder in &cfg.workspace_folders {
+            if starts_with_tilde(folder) {
+                return Err(ConfigError::TildeInTopLevelWorkspaceFolder(folder.clone()));
+            }
+        }
         for (name, host) in &mut cfg.hosts {
             if name.eq_ignore_ascii_case(LOCAL_HOST_NAME) {
                 return Err(ConfigError::ReservedHostName(name.clone()));
@@ -710,17 +733,15 @@ fn default_config_path() -> Option<PathBuf> {
         .or_else(|| candidates.into_iter().next())
 }
 
-fn expand(p: &Path) -> PathBuf {
+/// Detect a leading tilde so [`Config::load_from`] can reject it
+/// loudly in `workspace_folders`. Matches `~`, `~/anything`, and
+/// `~user/anything` (the last is uncommon but worth catching for the
+/// same reason). Per-host `workspace_folders` deliberately allow
+/// tildes — the remote shell expands them — so this check lives at
+/// the top-level boundary only.
+fn starts_with_tilde(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    if s == "~" {
-        return dirs::home_dir().unwrap_or_else(|| p.to_path_buf());
-    }
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    p.to_path_buf()
+    s == "~" || s.starts_with("~/") || s.starts_with('~')
 }
 
 #[cfg(test)]
@@ -729,28 +750,13 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn expand_keeps_absolute_path() {
-        assert_eq!(
-            expand(Path::new("/work/repos")),
-            PathBuf::from("/work/repos")
-        );
-    }
-
-    #[test]
-    fn expand_keeps_relative_path() {
-        assert_eq!(expand(Path::new("work/repos")), PathBuf::from("work/repos"));
-    }
-
-    #[test]
-    fn expand_handles_tilde_prefix() {
-        let home = dirs::home_dir().expect("test runner has $HOME");
-        assert_eq!(expand(Path::new("~/work")), home.join("work"));
-    }
-
-    #[test]
-    fn expand_handles_bare_tilde() {
-        let home = dirs::home_dir().expect("test runner has $HOME");
-        assert_eq!(expand(Path::new("~")), home);
+    fn starts_with_tilde_recognises_tilde_forms() {
+        assert!(starts_with_tilde(Path::new("~")));
+        assert!(starts_with_tilde(Path::new("~/work")));
+        assert!(starts_with_tilde(Path::new("~chris/work")));
+        assert!(!starts_with_tilde(Path::new("/work/repos")));
+        assert!(!starts_with_tilde(Path::new("work/repos")));
+        assert!(!starts_with_tilde(Path::new("")));
     }
 
     #[test]
@@ -790,13 +796,40 @@ mod tests {
     }
 
     #[test]
-    fn load_from_expands_tilde_in_workspace_folders() {
+    fn load_from_rejects_tilde_in_top_level_workspace_folders() {
+        // Top-level `workspace_folders` feed every host's scan, so a
+        // tilde can't be eagerly expanded once at load time without
+        // baking in the local user's home for every host (the dogfood
+        // bug 2026-05-19: `~/workspace` got expanded to
+        // `/home/gizmo/workspace` and shipped to a remote host where
+        // the user is `chris`). Reject loudly with a directive to
+        // either use an absolute path or move the entry under a
+        // per-host block (where tildes deliberately survive load and
+        // the remote shell expands them).
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("config.toml");
         fs::write(&path, r#"workspace_folders = ["~/work"]"#).expect("write");
-        let cfg = Config::load_from(&path).expect("parse");
-        let home = dirs::home_dir().expect("home");
-        assert_eq!(cfg.workspace_folders, vec![home.join("work")]);
+        let err = Config::load_from(&path).expect_err("should reject");
+        match err {
+            ConfigError::TildeInTopLevelWorkspaceFolder(p) => {
+                assert_eq!(p, PathBuf::from("~/work"));
+            }
+            other => panic!("expected TildeInTopLevelWorkspaceFolder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_rejects_bare_tilde_in_workspace_folders() {
+        // Bare `~` would otherwise resolve to local home and silently
+        // ship that absolute path to remotes. Same fix as the
+        // `~/work` case — caught by the same predicate.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, r#"workspace_folders = ["~"]"#).expect("write");
+        assert!(matches!(
+            Config::load_from(&path).expect_err("should reject"),
+            ConfigError::TildeInTopLevelWorkspaceFolder(_)
+        ));
     }
 
     #[test]
@@ -945,7 +978,7 @@ transcript_root = "~/scratch/claude"
         fs::write(
             &path,
             r#"
-workspace_folders = ["~/work"]
+workspace_folders = ["/work"]
 
 [hosts.devbox]
 ssh = "devbox"

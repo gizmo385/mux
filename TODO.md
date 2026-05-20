@@ -45,6 +45,10 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 
 - embedded-PTY polish (post-Phase-6): F5+ key codes, ScrollLeft/ScrollRight mouse forwarding, terminal-focus-detection so a click into the sidebar implicitly transitions focus, a config knob for the leader chord (so users who already use `Ctrl-a` for tmux can rebind), highlight-on-hover for sidebar rows when mouse is over. Defer until dogfooding surfaces the actual pain points. `#embedded-pty #dogfood`
 
+### Custom tools
+
+- track active custom-tool tmux sessions so the user can re-attach. Encountered 2026-05-20: launched a `[[tools]]`-configured terminal tool, switched the active pane to something else, and had no way back to the still-running tool pane from the dashboard. Today the tmux session keeps running invisibly until the user `tmux ls`'s and attaches by name. Likely shape: maintain a mapping of running tool launches (tool name + launch time + tmux target) in the catalog or a sibling registry, surface them in the sidebar or via a picker, and add a keybind to re-attach. Open design questions: (a) lifecycle — poll for dead tmux sessions vs prune on attach failure; (b) scope — host-aware from day one (a remote tool launches a remote tmux session and re-attach has to go back through SSH) or local-only first; (c) UX — separate "running tools" section in the sidebar vs interleave with sessions vs modal picker. `#tools #attachment #ui`
+
 ### Worktrees & session workflow
 
 - add `WorktreeManager::list` once a caller materializes (discard/merge workflow, or earlier if discovery needs to reconcile worktree-spawned sessions). `remove` shipped 2026-05-19; `list` still deferred to avoid speculative surface area. `#worktree`

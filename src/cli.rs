@@ -411,10 +411,6 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(out)?;
     print_config_reference(out)?;
     writeln!(out)?;
-    writeln!(
-        out,
-        "See SPEC.md / ARCHITECTURE.md / PROCESS.md for the canonical project docs."
-    )?;
     Ok(())
 }
 

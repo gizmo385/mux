@@ -43,27 +43,50 @@ const ANSI_RESET: &str = "\x1b[0m";
 /// `Theme::preset()` doesn't accept — that invariant is enforced by a
 /// dedicated test so a panic here would indicate a code-review miss.
 pub fn print_themes<W: Write>(out: &mut W, color: bool) -> io::Result<()> {
-    writeln!(
-        out,
-        "Available theme presets ({}):",
-        Theme::preset_names().len()
-    )?;
+    let presets: Vec<(&'static str, Theme)> = Theme::preset_names()
+        .iter()
+        .map(|name| {
+            (
+                *name,
+                Theme::preset(name).expect("preset_names() out of sync with preset()"),
+            )
+        })
+        .collect();
+
+    let preset_col = std::cmp::max(
+        "preset".chars().count(),
+        presets
+            .iter()
+            .map(|(n, _)| n.chars().count())
+            .max()
+            .unwrap_or(0),
+    );
+    // For each element column, take the wider of "<glyph> <label>"
+    // (the header) and the longest cell value across every preset.
+    // Computed at render time rather than hard-coded so a future
+    // preset with a longer colour string doesn't silently truncate.
+    let col_widths: Vec<usize> = THEME_TABLE_COLUMNS
+        .iter()
+        .map(|(glyph, label)| {
+            let header_w = format!("{glyph} {label}").chars().count();
+            let max_value_w = presets
+                .iter()
+                .map(|(_, t)| theme_cell_text(theme_field(t, label)).chars().count())
+                .max()
+                .unwrap_or(0);
+            std::cmp::max(header_w, max_value_w)
+        })
+        .collect();
+
+    writeln!(out, "Available theme presets ({}):", presets.len())?;
     writeln!(out)?;
-    for name in Theme::preset_names() {
-        // .unwrap() is safe: every name in `preset_names()` is matched
-        // in `preset()` (and the matching is enforced by a test).
-        let theme = Theme::preset(name).expect("preset_names() out of sync with preset()");
-        writeln!(out, "  {name}")?;
-        print_theme_row(out, color, "●", "needs_input    ", theme.needs_input)?;
-        print_theme_row(out, color, "◐", "working        ", theme.working)?;
-        print_theme_row(out, color, "○", "idle           ", theme.idle)?;
-        print_theme_row(out, color, "·", "unknown        ", theme.unknown)?;
-        print_theme_row(out, color, "⚒", "tool_use       ", theme.tool_use)?;
-        print_theme_row(out, color, "↳", "tool_result_ok ", theme.tool_result_ok)?;
-        print_theme_row(out, color, "↳", "tool_result_err", theme.tool_result_err)?;
-        writeln!(out)?;
+    write_table_header(out, preset_col, &col_widths)?;
+    write_table_divider(out, preset_col, &col_widths)?;
+    for (name, theme) in &presets {
+        write_table_row(out, color, name, theme, preset_col, &col_widths)?;
     }
-    writeln!(out, "Set in ~/.config/agent-mux/config.toml:")?;
+    writeln!(out)?;
+    writeln!(out, "Configure in ~/.config/agent-mux/config.toml:")?;
     writeln!(out)?;
     writeln!(out, "  [theme]")?;
     writeln!(out, "  preset = \"<name>\"        # one of the names above")?;
@@ -76,37 +99,98 @@ pub fn print_themes<W: Write>(out: &mut W, color: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn print_theme_row<W: Write>(
+/// Single source of truth for the table's element columns: the glyph
+/// that appears in the dashboard for each attention/preview element,
+/// plus the config field name. [`theme_field`] dispatches on the label
+/// so adding a column is a one-line change here once a new theme field
+/// lands.
+const THEME_TABLE_COLUMNS: &[(&str, &str)] = &[
+    ("●", "needs_input"),
+    ("◐", "working"),
+    ("○", "idle"),
+    ("·", "unknown"),
+    ("⚒", "tool_use"),
+    ("↳", "tool_result_ok"),
+    ("↳", "tool_result_err"),
+];
+
+fn theme_field(t: &Theme, label: &str) -> Option<Color> {
+    match label {
+        "needs_input" => t.needs_input,
+        "working" => t.working,
+        "idle" => t.idle,
+        "unknown" => t.unknown,
+        "tool_use" => t.tool_use,
+        "tool_result_ok" => t.tool_result_ok,
+        "tool_result_err" => t.tool_result_err,
+        _ => None,
+    }
+}
+
+/// Render a colour into the textual form a user would write in
+/// `config.toml`. `None` becomes an em-dash so unset overrides read as
+/// "no value here, falling through to the terminal default" without
+/// occupying the full "(terminal default)" phrase the per-element
+/// renderer used to emit — cells need to stay narrow.
+fn theme_cell_text(c: Option<Color>) -> String {
+    match c {
+        Some(c) => colour_label(c),
+        None => "—".to_string(),
+    }
+}
+
+fn write_table_header<W: Write>(
+    out: &mut W,
+    preset_col: usize,
+    col_widths: &[usize],
+) -> io::Result<()> {
+    write!(out, "{:<preset_col$}", "preset")?;
+    for ((glyph, label), w) in THEME_TABLE_COLUMNS.iter().zip(col_widths.iter()) {
+        let header = format!("{glyph} {label}");
+        write!(out, "  {header:<w$}")?;
+    }
+    writeln!(out)
+}
+
+fn write_table_divider<W: Write>(
+    out: &mut W,
+    preset_col: usize,
+    col_widths: &[usize],
+) -> io::Result<()> {
+    write!(out, "{}", "─".repeat(preset_col))?;
+    for w in col_widths {
+        write!(out, "  {}", "─".repeat(*w))?;
+    }
+    writeln!(out)
+}
+
+fn write_table_row<W: Write>(
     out: &mut W,
     color: bool,
-    glyph: &str,
     name: &str,
-    c: Option<Color>,
+    theme: &Theme,
+    preset_col: usize,
+    col_widths: &[usize],
 ) -> io::Result<()> {
-    write!(out, "    ")?;
-    match c {
-        Some(c) => {
-            // Glyph in the preset's colour, label also in the colour so
-            // the user can read "this is what tool_result_ok looks like
-            // on my terminal" with one glance.
-            if color {
-                write_ansi_fg(out, c)?;
+    write!(out, "{name:<preset_col$}")?;
+    for ((_, label), w) in THEME_TABLE_COLUMNS.iter().zip(col_widths.iter()) {
+        let c = theme_field(theme, label);
+        let txt = theme_cell_text(c);
+        write!(out, "  ")?;
+        // Colour is opt-in (TTY-only); when on, wrap the cell value —
+        // not the padding — in the colour escape so terminals that
+        // honour background highlighting don't bleed colour across the
+        // padded gap.
+        if color && let Some(c) = c {
+            write_ansi_fg(out, c)?;
+            write!(out, "{txt}")?;
+            write!(out, "{ANSI_RESET}")?;
+            let pad = w.saturating_sub(txt.chars().count());
+            for _ in 0..pad {
+                write!(out, " ")?;
             }
-            write!(out, "{glyph}")?;
-            if color {
-                write!(out, "{ANSI_RESET}")?;
-            }
-            write!(out, "  {name}  ")?;
-            if color {
-                write_ansi_fg(out, c)?;
-            }
-            write!(out, "{}", colour_label(c))?;
-            if color {
-                write!(out, "{ANSI_RESET}")?;
-            }
-        }
-        None => {
-            write!(out, "{glyph}  {name}  (terminal default)")?;
+        } else {
+            write!(out, "{txt:<w$}")?;
         }
     }
     writeln!(out)
@@ -488,14 +572,17 @@ mod tests {
     }
 
     #[test]
-    fn themes_labels_uncoloured_elements_as_terminal_default() {
+    fn themes_marks_uncoloured_cells_with_em_dash() {
         // The `default` preset leaves needs_input/working/idle/unknown
-        // uncoloured. The browser should make that visible rather than
-        // silently omitting the row.
+        // uncoloured. The table should make that visible — the
+        // user-facing meaning is "no override, terminal foreground
+        // applies" — rather than silently leaving the cells empty.
+        // Em-dash keeps the column narrow while still flagging the
+        // absence.
         let out = run(|w| print_themes(w, false));
         assert!(
-            out.contains("terminal default"),
-            "expected an explicit 'terminal default' marker:\n{out}"
+            out.contains("—"),
+            "expected an em-dash marker for unset cells:\n{out}"
         );
     }
 

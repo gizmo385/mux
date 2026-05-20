@@ -14,7 +14,7 @@ pub const LOCAL_HOST_NAME: &str = "local";
 /// so the user gets a clear error rather than silently-shadowed
 /// behaviour. **Keep in sync with `action_for` in `main.rs`** — if you
 /// add a new built-in key there, add it here too.
-pub const RESERVED_KEY_CHARS: &[char] = &['q', 'j', 'k', 'J', 'K', 't', 'n', '/', 'p', 'd'];
+pub const RESERVED_KEY_CHARS: &[char] = &['q', 'j', 'k', 'J', 'K', 't', 'n', 'N', '/', 'p', 'd'];
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -1484,6 +1484,31 @@ command = ["whatever"]
         let err = Config::load_from(&path).expect_err("should reject");
         assert!(
             matches!(err, ConfigError::ToolKeyCollidesWithBuiltin('n')),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_tool_key_colliding_with_capital_n() {
+        // `N` is the no-worktree new-session binding (raised by
+        // dogfooding 2026-05-19). Without this in RESERVED_KEY_CHARS a
+        // user could bind a tool to `N` and silently shadow the
+        // no-worktree flow. Pin the collision check so a future edit
+        // that drops `N` from the reserved list fails loudly here.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "N"
+command = ["whatever"]
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::ToolKeyCollidesWithBuiltin('N')),
             "got: {err:?}"
         );
     }

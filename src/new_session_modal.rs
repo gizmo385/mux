@@ -35,6 +35,11 @@ pub enum NewSessionModal {
         /// cached rows are visible-but-inert until their host is up.
         ready_hosts: HashSet<HostId>,
         state: ListState,
+        /// `Worktree` runs the standard pick → Filling → create flow.
+        /// `NoWorktree` short-circuits to `SubmitNoWorktree` on Enter
+        /// — claude launches in the repo root, no `git worktree add`,
+        /// no task metadata.
+        mode: ModalMode,
     },
     Filling {
         repo: Repo,
@@ -42,6 +47,16 @@ pub enum NewSessionModal {
         branch: String,
         focus: FillFocus,
     },
+}
+
+/// Distinguishes the worktree-creating flow (default, bound to `n`) from
+/// the open-in-repo-root flow (bound to `N`, raised by dogfooding 2026-
+/// 05-19). The mode lives on `PickingRepo` so the same picker UI serves
+/// both — only the title and the on-Enter dispatch differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalMode {
+    Worktree,
+    NoWorktree,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +70,18 @@ pub enum KeyOutcome {
     Handled,
     /// User pressed Esc. Caller drops the modal.
     Cancel,
-    /// User submitted a valid form. Caller dispatches the action.
+    /// User submitted a valid form in the worktree-creating flow.
+    /// Caller runs `git worktree add` + spawns claude in the new
+    /// worktree.
     Submit {
         repo: Repo,
         task: String,
         base_branch: String,
     },
+    /// User picked a repo in [`ModalMode::NoWorktree`]. Caller spawns
+    /// claude directly in the repo's root — no worktree, no task
+    /// metadata, no base branch.
+    SubmitNoWorktree { repo: Repo },
 }
 
 impl NewSessionModal {
@@ -70,12 +91,34 @@ impl NewSessionModal {
     /// hosts are visible-but-inert (rendered dim, ignored on Enter).
     /// `seed` biases the initial cursor toward the dashboard's
     /// currently-selected session's repo (see [`NewSessionSeed`]); pass
-    /// `None` to open at index 0.
+    /// `None` to open at index 0. Opens in [`ModalMode::Worktree`] —
+    /// the standard pick → Filling → create flow.
     #[must_use]
     pub fn new(
         repos: Vec<Repo>,
         ready_hosts: HashSet<HostId>,
         seed: Option<NewSessionSeed>,
+    ) -> Self {
+        Self::with_mode(repos, ready_hosts, seed, ModalMode::Worktree)
+    }
+
+    /// Open a new modal in [`ModalMode::NoWorktree`] — Enter on a
+    /// repo emits [`KeyOutcome::SubmitNoWorktree`] and the modal closes
+    /// without a Filling stage. The picker UI is otherwise identical.
+    #[must_use]
+    pub fn new_no_worktree(
+        repos: Vec<Repo>,
+        ready_hosts: HashSet<HostId>,
+        seed: Option<NewSessionSeed>,
+    ) -> Self {
+        Self::with_mode(repos, ready_hosts, seed, ModalMode::NoWorktree)
+    }
+
+    fn with_mode(
+        repos: Vec<Repo>,
+        ready_hosts: HashSet<HostId>,
+        seed: Option<NewSessionSeed>,
+        mode: ModalMode,
     ) -> Self {
         debug_assert!(!repos.is_empty(), "modal opened with no repos");
         let initial = seed.and_then(|s| seeded_index(&repos, &s)).unwrap_or(0);
@@ -85,6 +128,7 @@ impl NewSessionModal {
             repos,
             ready_hosts,
             state,
+            mode,
         }
     }
 
@@ -99,9 +143,10 @@ impl NewSessionModal {
             repos,
             ready_hosts,
             state,
+            mode,
         } = self
         {
-            let (outcome, next) = handle_picking(repos, ready_hosts, state, key);
+            let (outcome, next) = handle_picking(repos, ready_hosts, state, *mode, key);
             if let Some(next) = next {
                 *self = next;
             }
@@ -127,7 +172,8 @@ impl NewSessionModal {
                 repos,
                 ready_hosts,
                 state,
-            } => draw_picking(frame, area, repos, ready_hosts, state),
+                mode,
+            } => draw_picking(frame, area, repos, ready_hosts, state, *mode),
             Self::Filling {
                 repo,
                 task,
@@ -142,6 +188,7 @@ fn handle_picking(
     repos: &mut [Repo],
     ready_hosts: &HashSet<HostId>,
     state: &mut ListState,
+    mode: ModalMode,
     key: KeyEvent,
 ) -> (KeyOutcome, Option<NewSessionModal>) {
     match key.code {
@@ -161,18 +208,23 @@ fn handle_picking(
                 return (KeyOutcome::Handled, None);
             };
             // A repo whose host hasn't reached `Connected` yet is
-            // inert — we can't run `git worktree add` on it, so the
-            // picker silently no-ops rather than transitioning into
-            // a form the user can't submit. Once the host connects,
-            // the row un-dims and Enter works.
+            // inert — we can't run `git worktree add` (or spawn
+            // anything via `Host::run`) on it, so the picker silently
+            // no-ops rather than transitioning into a state the user
+            // can't progress from. Once the host connects, the row
+            // un-dims and Enter works.
             if !ready_hosts.contains(&repo.host) {
                 return (KeyOutcome::Handled, None);
             }
+            if mode == ModalMode::NoWorktree {
+                // Skip Filling entirely — there's no worktree to name
+                // and no base branch to resolve. The caller spawns
+                // claude directly in the repo root.
+                return (KeyOutcome::SubmitNoWorktree { repo }, None);
+            }
             // Default-branch resolution is a local-only fast path
             // today; for remote repos we leave the field blank and
-            // let the user type it. Step 3 routes this through
-            // `Host::run` so remote default-branch resolution works
-            // too.
+            // let the user type it.
             let branch = if repo.host.is_local() {
                 // Synchronous local git call; fast. Remote default-
                 // branch resolution would require an SSH round-trip
@@ -301,6 +353,7 @@ fn draw_picking(
     repos: &[Repo],
     ready_hosts: &HashSet<HostId>,
     state: &mut ListState,
+    mode: ModalMode,
 ) {
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let dim = Style::new().add_modifier(Modifier::DIM);
@@ -325,12 +378,15 @@ fn draw_picking(
             ListItem::new(line)
         })
         .collect();
+    // Surface the mode in the title so the user can tell at a glance
+    // whether they pressed `n` (worktree) or `N` (no worktree) — both
+    // open the same picker UI and otherwise look identical.
+    let title = match mode {
+        ModalMode::Worktree => " new session: pick a repo ",
+        ModalMode::NoWorktree => " new session (no worktree): pick a repo ",
+    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" new session: pick a repo "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, layout[0], state);
@@ -416,6 +472,10 @@ impl std::fmt::Debug for KeyOutcome {
                 .field("repo", &repo.name)
                 .field("task", task)
                 .field("base_branch", base_branch)
+                .finish(),
+            Self::SubmitNoWorktree { repo } => f
+                .debug_struct("SubmitNoWorktree")
+                .field("repo", &repo.name)
                 .finish(),
         }
     }
@@ -632,6 +692,46 @@ mod tests {
             }
             NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
         }
+    }
+
+    #[test]
+    fn no_worktree_mode_emits_submit_no_worktree_on_enter_without_filling_stage() {
+        // The defining behaviour of `ModalMode::NoWorktree`: Enter on a
+        // ready repo skips Filling entirely and emits SubmitNoWorktree
+        // carrying the picked repo. Pin this so a future refactor of
+        // the dispatch can't accidentally route this case through the
+        // task/branch form.
+        let mut modal = NewSessionModal::new_no_worktree(
+            vec![local_repo("alpha"), local_repo("beta")],
+            ready_local(),
+            None,
+        );
+        modal.handle_key(key(KeyCode::Down));
+        match modal.handle_key(key(KeyCode::Enter)) {
+            KeyOutcome::SubmitNoWorktree { repo } => {
+                assert_eq!(repo.name, "beta");
+            }
+            other => panic!("expected SubmitNoWorktree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_worktree_mode_still_no_ops_on_non_ready_host() {
+        // Same visible-but-inert behaviour as the worktree flow — a
+        // host that hasn't reached `Connected` yet can't spawn anything
+        // through `Host::run`, so Enter is silently dropped instead of
+        // surfacing as a no-op submit the caller couldn't fulfil.
+        let mut ready = HashSet::new();
+        ready.insert(HostId::local());
+        let mut modal = NewSessionModal::new_no_worktree(
+            vec![local_repo("here"), remote_repo("gizmo", "there")],
+            ready,
+            None,
+        );
+        modal.handle_key(key(KeyCode::Down));
+        let outcome = modal.handle_key(key(KeyCode::Enter));
+        assert!(matches!(outcome, KeyOutcome::Handled));
+        assert!(matches!(modal, NewSessionModal::PickingRepo { .. }));
     }
 
     #[test]

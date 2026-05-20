@@ -798,6 +798,18 @@ impl App {
     }
 
     fn open_new_session(&mut self) {
+        self.open_picker(ModalOpenMode::Worktree);
+    }
+
+    /// Open the picker in no-worktree mode (bound to `N`). Same picker
+    /// UI as [`open_new_session`]; the only difference is the modal
+    /// constructor — `new_no_worktree` short-circuits Filling and emits
+    /// `SubmitNoWorktree` so claude launches in the repo root.
+    fn open_new_session_no_worktree(&mut self) {
+        self.open_picker(ModalOpenMode::NoWorktree);
+    }
+
+    fn open_picker(&mut self, mode: ModalOpenMode) {
         self.registry
             .refresh_if_stale(&self.config, REPO_REFRESH_TTL);
         if self.registry.is_empty() {
@@ -811,7 +823,7 @@ impl App {
         // `App.hosts` are eligible for selection; others render
         // dimmed in the picker until their `Connected` event lands.
         let ready_hosts: HashSet<HostId> = self.hosts.keys().cloned().collect();
-        // Seed the picker from the cursor's current session so `n`
+        // Seed the picker from the cursor's current session so `n`/`N`
         // from a focused row pre-positions over the same repo (or at
         // least the same host). Worktree-backed sessions match against
         // their `parent_repo`; everything else falls back to
@@ -825,11 +837,12 @@ impl App {
                     .unwrap_or_else(|| s.project_dir.clone()),
             ),
         });
-        self.modal = Some(NewSessionModal::new(
-            self.registry.repos().to_vec(),
-            ready_hosts,
-            seed,
-        ));
+        let repos = self.registry.repos().to_vec();
+        let modal = match mode {
+            ModalOpenMode::Worktree => NewSessionModal::new(repos, ready_hosts, seed),
+            ModalOpenMode::NoWorktree => NewSessionModal::new_no_worktree(repos, ready_hosts, seed),
+        };
+        self.modal = Some(modal);
         self.status = None;
     }
 
@@ -845,7 +858,30 @@ impl App {
                 task,
                 base_branch,
             } => self.start_creating(repo, task, base_branch),
+            KeyOutcome::SubmitNoWorktree { repo } => self.start_no_worktree_session(repo),
         }
+    }
+
+    /// Skip `git worktree add` and spawn claude directly in the picked
+    /// repo's root. Reuses the create-channel pipeline so `drain_creates`
+    /// handles the spawn the same way it does for worktree-backed
+    /// sessions — the only difference is that no background work runs
+    /// (no `self.creating` indicator), and the synthetic `Created`
+    /// carries the repo root path rather than a freshly-`git worktree
+    /// add`ed path.
+    fn start_no_worktree_session(&mut self, repo: Repo) {
+        if !self.hosts.contains_key(&repo.host) {
+            self.status = Some(format!(
+                "host {} not connected yet — wait and try again",
+                repo.host.as_str()
+            ));
+            return;
+        }
+        let _ = self.create_tx.send(NewSessionResult::Created {
+            host_id: repo.host,
+            path: repo.path,
+        });
+        self.status = None;
     }
 
     /// Dispatch a worktree creation on a background thread. The "switching
@@ -1773,6 +1809,10 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.open_new_session();
             ActionOutcome::Continue
         }
+        Action::NewSessionNoWorktree => {
+            app.open_new_session_no_worktree();
+            ActionOutcome::Continue
+        }
         Action::OpenSearch => {
             app.open_search();
             ActionOutcome::Continue
@@ -1792,6 +1832,16 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
     }
 }
 
+/// Which constructor `open_picker` hands to the modal. `Worktree` runs
+/// the standard pick → fill task/branch → `git worktree add` → spawn
+/// flow; `NoWorktree` skips the fill stage and spawns claude in the
+/// repo root.
+#[derive(Debug, Clone, Copy)]
+enum ModalOpenMode {
+    Worktree,
+    NoWorktree,
+}
+
 enum Action {
     Quit,
     Next,
@@ -1803,6 +1853,8 @@ enum Action {
     Attach,
     SpawnTerminal,
     NewSession,
+    /// `N` — pick a repo, spawn claude in its root, no worktree.
+    NewSessionNoWorktree,
     OpenSearch,
     TogglePreview,
     DeleteWorktree,
@@ -1835,6 +1887,7 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
         KeyCode::Enter => Some(Action::Attach),
         KeyCode::Char('t') => Some(Action::SpawnTerminal),
         KeyCode::Char('n') => Some(Action::NewSession),
+        KeyCode::Char('N') => Some(Action::NewSessionNoWorktree),
         KeyCode::Char('/') => Some(Action::OpenSearch),
         KeyCode::Char('p') => Some(Action::TogglePreview),
         KeyCode::Char('d') => Some(Action::DeleteWorktree),
@@ -2058,9 +2111,9 @@ fn compose_footer(
     }
     if catalog_empty {
         if pending_hosts > 0 {
-            return format!(" connecting to {pending_hosts} host(s)… · n: new · q: quit ");
+            return format!(" connecting to {pending_hosts} host(s)… · n/N: new · q: quit ");
         }
-        return " no sessions discovered · n: new · q: quit ".to_string();
+        return " no sessions discovered · n/N: new · q: quit ".to_string();
     }
     let return_hint = if in_tmux { "prefix+s" } else { "prefix+d" };
     let suffix = if pending_hosts > 0 {
@@ -2081,7 +2134,7 @@ fn compose_footer(
         format!(" · {}", entries.join(" · "))
     };
     format!(
-        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
+        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new (N: no worktree) · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
     )
 }
 
@@ -2374,6 +2427,41 @@ mod tests {
     fn action_for_returns_none_for_unbound_key() {
         let tools = vec![tool('g', &["lazygit"])];
         assert!(action_for(plain_key('x'), &tools).is_none());
+    }
+
+    #[test]
+    fn action_for_dispatches_capital_n_to_new_session_no_worktree() {
+        // `n` opens the worktree-creating flow; `N` opens the same
+        // picker in no-worktree mode (raised by dogfooding 2026-05-19).
+        // Crossterm reports shifted letters as the uppercase glyph, so
+        // we match on the literal 'N' rather than 'n' + SHIFT.
+        let tools: Vec<ToolBinding> = vec![];
+        assert!(matches!(
+            action_for(plain_key('n'), &tools),
+            Some(Action::NewSession)
+        ));
+        assert!(matches!(
+            action_for(plain_key('N'), &tools),
+            Some(Action::NewSessionNoWorktree)
+        ));
+    }
+
+    #[test]
+    fn footer_keybind_line_advertises_no_worktree_variant() {
+        // The user needs to know `N` exists — without a hint they'd
+        // never discover it. Inline next to `n: new` so the relationship
+        // between the two is visible at a glance.
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("N: no worktree"), "got: {s}");
     }
 
     #[test]

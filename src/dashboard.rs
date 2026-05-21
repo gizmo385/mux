@@ -26,6 +26,13 @@ pub enum DisplayRow {
     HostHeader(HostId),
     ProjectHeader(PathBuf),
     SessionRow(usize),
+    /// Header for the "Tools" group surfaced at the top of the
+    /// sidebar when one or more `[[tools]]` launches are currently
+    /// running. Omitted when `ToolLaunchRegistry::is_empty()`.
+    ToolsHeader,
+    /// Index into `ToolLaunchRegistry::launches()`. Enter on a tool
+    /// row re-attaches the embedded pane to that tool's tmux session.
+    ToolRow(usize),
 }
 
 /// Group `sessions` by host (local first, SSH hosts alphabetical),
@@ -304,16 +311,26 @@ fn walk_session_index(current: Option<usize>, rows: &[DisplayRow], step: isize) 
         let i = (start + offset * step).rem_euclid(n_i);
         #[allow(clippy::cast_sign_loss)]
         let idx = i as usize;
-        if matches!(rows[idx], DisplayRow::SessionRow(_)) {
+        if is_selectable(&rows[idx]) {
             return Some(idx);
         }
     }
     None
 }
 
+/// Whether `row` accepts selection / Enter dispatch. Today: sessions
+/// and tool launches. Headers (host, project, tools) are skipped by
+/// j/k navigation so the cursor never lands on a non-actionable line.
+#[must_use]
+fn is_selectable(row: &DisplayRow) -> bool {
+    matches!(row, DisplayRow::SessionRow(_) | DisplayRow::ToolRow(_))
+}
+
 /// First `SessionRow` index in `rows`, or `None` if there are no
 /// sessions. Used to seed selection when the catalog goes from empty
-/// to non-empty.
+/// to non-empty. Tool rows are not eligible — the dashboard's
+/// default selection should land on real work, not on a transient
+/// `[[tools]]` launch.
 #[must_use]
 pub fn first_session_index(rows: &[DisplayRow]) -> Option<usize> {
     rows.iter()
@@ -633,6 +650,8 @@ mod tests {
                 DisplayRow::HostHeader(host) => format!("H:{host}"),
                 DisplayRow::ProjectHeader(path) => format!("P:{}", path.display()),
                 DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
+                DisplayRow::ToolsHeader => "TH:tools".to_string(),
+                DisplayRow::ToolRow(i) => format!("T:{i}"),
             })
             .collect()
     }
@@ -992,6 +1011,8 @@ mod tests {
                 DisplayRow::HostHeader(host) => format!("H:{host}"),
                 DisplayRow::ProjectHeader(path) => format!("P:{}", path.display()),
                 DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
+                DisplayRow::ToolsHeader => "TH:tools".to_string(),
+                DisplayRow::ToolRow(i) => format!("T:{i}"),
             })
             .collect()
     }

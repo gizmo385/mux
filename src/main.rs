@@ -47,6 +47,7 @@ use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
 use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
+use agent_mux::tool_launches::{ToolLaunch, ToolLaunchRegistry};
 use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent};
 use agent_mux::worktree::WorktreeManager;
 
@@ -343,6 +344,13 @@ struct App {
     /// and gates the corresponding input routing in the main loop.
     /// Static for the life of the run (no in-app toggle).
     embedded_mode: bool,
+    /// Running `[[tools]]` launches surfaced in the sidebar's "Tools"
+    /// group. Each entry holds the tmux session name agent-mux
+    /// assigned at spawn time; Enter on a tool row re-attaches the
+    /// embedded pane to that tmux session. Pruned on attach failure
+    /// (no background poller — failure surfaces at the next user
+    /// interaction).
+    tool_launches: ToolLaunchRegistry,
 }
 
 /// Owns the embedded pseudoterminal and remembers which session it's
@@ -364,6 +372,12 @@ struct Embedded {
     session_id: SessionId,
     last_size: (u16, u16),
     last_inner: Option<ratatui::layout::Rect>,
+    /// Set when this PTY hosts a tool launch (the tool wraps its
+    /// command in a detached tmux session via
+    /// `spawn_tool_*_embed`). On PTY exit the dashboard uses this to
+    /// prune the corresponding `ToolLaunchRegistry` entry so the
+    /// sidebar row vanishes.
+    tool_tmux_session: Option<String>,
 }
 
 /// Lives in `App.creating` while a worktree-create is in flight, so the
@@ -601,6 +615,7 @@ impl App {
             embedded: None,
             focus: Focus::default(),
             embedded_mode,
+            tool_launches: ToolLaunchRegistry::new(),
         })
     }
 
@@ -610,14 +625,29 @@ impl App {
     /// selection resolution) sees the same set of rows; otherwise a
     /// j/k stroke could walk a list shape the user can't actually see.
     fn current_rows(&self) -> Vec<DisplayRow> {
-        match self.search.as_ref() {
+        let session_rows = match self.search.as_ref() {
             Some(s) if !s.query.is_empty() => {
                 let q = s.query.to_lowercase();
                 let sessions = self.catalog.sessions();
                 build_display_rows_filtered(sessions, |i| matches_query(&sessions[i], &q))
             }
             _ => build_display_rows(self.catalog.sessions()),
+        };
+        // Surface the Tools group above sessions when one or more
+        // launches are running. Search filtering doesn't affect this
+        // group — tool launches don't carry transcripts and the user
+        // expects them to remain visible while narrowing the session
+        // list.
+        if self.tool_launches.is_empty() {
+            return session_rows;
         }
+        let mut rows = Vec::with_capacity(session_rows.len() + self.tool_launches.len() + 1);
+        rows.push(DisplayRow::ToolsHeader);
+        for i in 0..self.tool_launches.len() {
+            rows.push(DisplayRow::ToolRow(i));
+        }
+        rows.extend(session_rows);
+        rows
     }
 
     /// Open the search bar in Editing mode. If a filter is already
@@ -1384,6 +1414,7 @@ impl App {
                     session_id,
                     last_size: (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
                     last_inner: None,
+                    tool_tmux_session: spec.tmux_session.clone(),
                 });
                 self.focus = Focus::Terminal {
                     leader_armed: false,
@@ -1520,8 +1551,15 @@ impl App {
             }
         }
         if exited {
+            // Capture the tool's tmux session name before dropping
+            // the Embedded — pruning the registry afterwards is what
+            // makes the sidebar row vanish.
+            let tool_session = embedded.tool_tmux_session.clone();
             self.embedded = None;
             self.focus = Focus::Sidebar;
+            if let Some(tmux_session) = tool_session {
+                self.forget_tool_launch(&tmux_session);
+            }
         }
     }
 
@@ -1567,11 +1605,12 @@ impl App {
     /// when nothing to suspend (`Done`, `EmbedPty`, errors).
     fn launch_tool(&mut self, idx: usize) -> Option<SuspendCommand> {
         let tool = self.config.tools.get(idx)?.clone();
-        let (outcome, label, cwd, session_id) = {
+        let (outcome, label, cwd, session_id, host_id) = {
             let session = self.selected_session()?;
             let host = self.hosts.get(&session.host)?.clone();
             let cwd = session.project_dir.clone();
             let id = session.id.clone();
+            let host_id = session.host.clone();
             let host_str = session.host.as_str().to_string();
             let cmd = tool.substitute(&cwd, &host_str);
             (
@@ -1588,6 +1627,7 @@ impl App {
                 }),
                 cwd,
                 id,
+                host_id,
             )
         };
         match outcome {
@@ -1600,6 +1640,20 @@ impl App {
                 Some(cmd)
             }
             Ok(AttachOutcome::EmbedPty(spec)) => {
+                // Register the launch in the tools registry so the
+                // dashboard's "Tools" sidebar group can re-attach
+                // after the user swaps focus away. `tmux_session` is
+                // populated by `PtyDriver::spawn_tool_*_embed` (the
+                // tool runs in a detached tmux session so its state
+                // survives a PTY swap).
+                if let Some(tmux_session) = spec.tmux_session.clone() {
+                    self.tool_launches.push(ToolLaunch {
+                        name: label.clone(),
+                        host: host_id,
+                        tmux_session,
+                        launched_at: SystemTime::now(),
+                    });
+                }
                 // Embed the tool in the dashboard pane. Synthetic
                 // SessionId includes the tool index so the same
                 // session can host distinct tools without collision —
@@ -1614,6 +1668,52 @@ impl App {
                 self.status = Some(format!("tool {label}: {e}"));
                 None
             }
+        }
+    }
+
+    /// Re-attach the embedded pane to the tool launch at
+    /// `tool_index`. Builds the `EmbedSpec` from the registry entry
+    /// directly — the same shape `spawn_tool_*_embed` would have
+    /// produced at original launch time — and feeds it to
+    /// `install_embedded`. On spawn failure the launch is pruned from
+    /// the registry (its tmux session has been killed; the row should
+    /// vanish from the sidebar).
+    fn attach_tool(&mut self, tool_index: usize) -> Option<SuspendCommand> {
+        let launch = self.tool_launches.launches().get(tool_index)?.clone();
+        let host = self.hosts.get(&launch.host)?.clone();
+        let attach: Vec<String> = vec![
+            "tmux".into(),
+            "attach".into(),
+            "-t".into(),
+            launch.tmux_session.clone(),
+        ];
+        let argv = if launch.host.is_local() {
+            // Local: argv runs directly via portable-pty.
+            attach
+        } else {
+            // Remote: wrap in ssh -tt; same shape spawn_tool_remote
+            // would have produced.
+            let refs: Vec<&str> = attach.iter().map(String::as_str).collect();
+            host.ssh_argv(true, &refs)?
+        };
+        let spec = EmbedSpec {
+            argv,
+            cwd: None,
+            label: format!("⚒ {} · [{}]", launch.name, launch.host),
+            tmux_session: Some(launch.tmux_session.clone()),
+        };
+        let synthetic_id = SessionId(format!("agent-mux-tool-attach:{}", launch.tmux_session));
+        self.install_embedded(&spec, synthetic_id);
+        None
+    }
+
+    /// Drop a tool launch by its tmux session name. Called from the
+    /// embedded PTY's `Exited` handler when the tool process dies on
+    /// its own (user typed `exit` in lazygit, ran the command to
+    /// completion, etc.).
+    fn forget_tool_launch(&mut self, tmux_session: &str) {
+        if let Some(idx) = self.tool_launches.position_by_tmux_session(tmux_session) {
+            self.tool_launches.remove(idx);
         }
     }
 
@@ -1671,6 +1771,19 @@ impl App {
             return None;
         };
         self.catalog.sessions().get(*session_idx)
+    }
+
+    /// Returns the tool-launch index when the selected row is a
+    /// `DisplayRow::ToolRow`. Used by the Enter dispatcher to route
+    /// to `attach_tool` instead of `attach_selected`.
+    fn selected_tool_index(&self) -> Option<usize> {
+        let idx = self.list_state.selected()?;
+        let rows = self.current_rows();
+        if let Some(DisplayRow::ToolRow(i)) = rows.get(idx) {
+            Some(*i)
+        } else {
+            None
+        }
     }
 }
 
@@ -1874,10 +1987,23 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.prev_host();
             ActionOutcome::Continue
         }
-        Action::Attach => match app.attach_selected() {
-            Some(cmd) => ActionOutcome::Suspend(cmd),
-            None => ActionOutcome::Continue,
-        },
+        Action::Attach => {
+            // Enter on a tool row re-attaches the embedded pane to
+            // that tool's tmux session instead of routing through the
+            // session-attach path (the catalog has no Session for a
+            // tool launch).
+            if let Some(tool_idx) = app.selected_tool_index() {
+                match app.attach_tool(tool_idx) {
+                    Some(cmd) => ActionOutcome::Suspend(cmd),
+                    None => ActionOutcome::Continue,
+                }
+            } else {
+                match app.attach_selected() {
+                    Some(cmd) => ActionOutcome::Suspend(cmd),
+                    None => ActionOutcome::Continue,
+                }
+            }
+        }
         Action::SpawnTerminal => match app.spawn_terminal_selected() {
             Some(cmd) => ActionOutcome::Suspend(cmd),
             None => ActionOutcome::Continue,
@@ -2052,6 +2178,30 @@ enum LeaderChordTransition {
     EncodeAndForward,
 }
 
+/// Build the sidebar's `ListItem`s from the current row layout. Lifted
+/// out of `draw` so the host/project/session/tools match doesn't bloat
+/// the top-level draw function past the lint cap. Takes individual
+/// fields (rather than `&App`) so the returned items don't tie up a
+/// borrow of the whole `App`, which would conflict with the
+/// subsequent `&mut app.list_state` render call.
+fn build_sidebar_items(
+    rows: &[DisplayRow],
+    sessions: &[Session],
+    home: Option<&Path>,
+    theme: &Theme,
+    tool_launches: &[ToolLaunch],
+) -> Vec<ListItem<'static>> {
+    rows.iter()
+        .map(|row| match row {
+            DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
+            DisplayRow::ProjectHeader(path) => ListItem::new(format_project_header(path, home)),
+            DisplayRow::SessionRow(i) => ListItem::new(format_session_row(&sessions[*i], theme)),
+            DisplayRow::ToolsHeader => ListItem::new(format_tools_header()),
+            DisplayRow::ToolRow(i) => ListItem::new(format_tool_row(&tool_launches[*i])),
+        })
+        .collect()
+}
+
 /// Style for the sidebar's outer border. In embed mode the sidebar
 /// competes with the terminal pane for keystrokes, so the border picks
 /// up a focus cue; outside embed mode there's nothing to disambiguate
@@ -2101,19 +2251,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         format!(" sessions ({}) ", app.catalog.len())
     };
-    let sessions_slice = app.catalog.sessions();
-    let items: Vec<ListItem<'_>> = rows
-        .iter()
-        .map(|row| match row {
-            DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
-            DisplayRow::ProjectHeader(path) => {
-                ListItem::new(format_project_header(path, app.home.as_deref()))
-            }
-            DisplayRow::SessionRow(i) => {
-                ListItem::new(format_session_row(&sessions_slice[*i], &app.theme))
-            }
-        })
-        .collect();
+    let items = build_sidebar_items(
+        &rows,
+        app.catalog.sessions(),
+        app.home.as_deref(),
+        &app.theme,
+        app.tool_launches.launches(),
+    );
     let sidebar_block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -2442,6 +2586,34 @@ fn preview_pane_title(session: &Session) -> String {
         str::to_string,
     );
     format!(" preview: {label} ")
+}
+
+/// Header line for the sidebar's "Tools" group. Same bold treatment
+/// as host headers — the group is structurally a sibling of "local",
+/// "alpenglow", etc.
+fn format_tools_header() -> Line<'static> {
+    Line::from(Span::styled(
+        "── tools ──".to_string(),
+        Style::new().add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Row for one running tool launch. Indented one level under the
+/// Tools header (matching project rows under host headers). Shows the
+/// tool name plus its host label so a user running the same tool on
+/// both local and a remote box can tell them apart.
+fn format_tool_row(launch: &ToolLaunch) -> Line<'static> {
+    let age = humanize_elapsed(launch.launched_at);
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("⚒ ", dim),
+        Span::raw(launch.name.clone()),
+        Span::raw("  "),
+        Span::styled(format!("[{}]", launch.host), dim),
+        Span::raw("  "),
+        Span::styled(age, dim),
+    ])
 }
 
 fn format_host_header(host: &HostId) -> Line<'static> {

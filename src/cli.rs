@@ -431,11 +431,15 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "    sound_file = \"~/sound.mp3\"   path to an audio file; plays via afplay (macOS)"
+        "    sound_file = \"/abs/path\"     audio file (absolute path; tildes rejected);"
     )?;
     writeln!(
         out,
-        "                                 or ffplay/paplay (Linux); overrides sound=true."
+        "                                 plays via afplay (macOS) or ffplay/paplay (Linux);"
+    )?;
+    writeln!(
+        out,
+        "                                 overrides sound=true so the file plays alone."
     )?;
     writeln!(out, "  [theme]")?;
     writeln!(

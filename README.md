@@ -72,10 +72,11 @@ ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 enabled = true          # master on/off
 sound = false           # play the OS "default" notification sound
 disabled_hosts = []     # host labels to silence entirely
-# sound_file = "~/Library/Sounds/Tink.aiff"
+# sound_file = "/System/Library/Sounds/Tink.aiff"
                         # path to an audio file to play instead of the
-                        # OS default. Tilde expands against your *local*
-                        # home (sounds always play on the local machine).
+                        # OS default. Must be an absolute path — tildes
+                        # are rejected at load (consistent with the
+                        # top-level `workspace_folders` rule).
                         # macOS uses `afplay` (handles mp3/wav/aiff/m4a);
                         # Linux tries ffplay then paplay. When set, takes
                         # precedence over sound=true and the OS

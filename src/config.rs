@@ -51,6 +51,14 @@ pub enum ConfigError {
     /// per-host paths preserve tildes and the remote shell expands
     /// them against the remote user's home.
     TildeInTopLevelWorkspaceFolder(PathBuf),
+    /// `[notifications] sound_file` begins with `~`. We deliberately
+    /// don't expand tildes in config paths — the convention across
+    /// the schema is "absolute path or pass through to a context that
+    /// expands it." `sound_file` is unambiguously local (the player
+    /// always runs on the local machine) but the player binary itself
+    /// doesn't expand tildes, so a loud rejection at load time beats a
+    /// silent failure at the first notification.
+    TildeInSoundFile(PathBuf),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -98,6 +106,14 @@ impl std::fmt::Display for ConfigError {
                      so a tilde can't be expanded here without baking in the local user's home. \
                      Use an absolute path, or move it under [hosts.<name>].workspace_folders \
                      (per-host paths keep the tilde and the remote shell expands it).",
+                    p.display()
+                )
+            }
+            Self::TildeInSoundFile(p) => {
+                write!(
+                    f,
+                    "notifications.sound_file {:?} starts with `~`. agent-mux does not expand \
+                     tildes in config paths — use an absolute path (e.g. /Users/you/sounds/ping.mp3).",
                     p.display()
                 )
             }
@@ -608,11 +624,11 @@ pub struct NotificationsConfig {
     /// *silently* and spawns a side-process audio player against this
     /// file — the macOS default sound being aggressive enough that the
     /// 2026-05-21 user keeps `sound = true` off altogether was the
-    /// dogfooding signal. Tilde is eagerly expanded against the *local*
-    /// home at load time (the file is always played on the local
-    /// machine, regardless of which host the session lives on).
-    /// `sound_file` takes precedence over `sound`: when both are set,
-    /// only the file plays (no double-up against the OS default).
+    /// dogfooding signal. Must be an absolute path: tildes are rejected
+    /// at load time ([`ConfigError::TildeInSoundFile`]) for consistency
+    /// with the top-level `workspace_folders` rule. `sound_file` takes
+    /// precedence over `sound`: when both are set, only the file plays
+    /// (no double-up against the OS default).
     pub sound_file: Option<PathBuf>,
 }
 
@@ -705,31 +721,13 @@ impl Config {
             // the tilde through to the remote shell via `shell_quote_path`.
         }
         validate_tool_keys(&cfg.tools)?;
-        if let Some(path) = cfg.notifications.sound_file.take() {
-            cfg.notifications.sound_file = Some(expand_local_tilde(&path));
+        if let Some(path) = &cfg.notifications.sound_file
+            && starts_with_tilde(path)
+        {
+            return Err(ConfigError::TildeInSoundFile(path.clone()));
         }
         Ok(cfg)
     }
-}
-
-/// Expand a leading `~` or `~/` against the local user's home. Used by
-/// notification `sound_file` paths — those are always played on the
-/// local machine regardless of which host's session triggered the
-/// notification, so local-home expansion is the correct semantic.
-/// Non-tilde paths pass through unchanged; an unresolved `$HOME` leaves
-/// the tilde in place so the eventual file-open errors loudly rather
-/// than silently picking the wrong file.
-fn expand_local_tilde(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    if s == "~" {
-        return dirs::home_dir().unwrap_or_else(|| p.to_path_buf());
-    }
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    p.to_path_buf()
 }
 
 /// Cross-entry validation: every tool must have a unique key and must
@@ -1138,30 +1136,6 @@ disabled_hosts = ["alpenglow", "gpu-1"]
     }
 
     #[test]
-    fn load_from_parses_sound_file_and_expands_local_tilde() {
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("config.toml");
-        fs::write(
-            &path,
-            r#"
-[notifications]
-sound_file = "~/Library/Sounds/Tink.aiff"
-"#,
-        )
-        .expect("write");
-        let cfg = Config::load_from(&path).expect("parse");
-        // The tilde should be expanded against the *local* home — the
-        // sound plays on the local machine regardless of which host's
-        // session triggered the notification.
-        let expanded = cfg
-            .notifications
-            .sound_file
-            .expect("sound_file should parse");
-        let home = dirs::home_dir().expect("home for test");
-        assert_eq!(expanded, home.join("Library/Sounds/Tink.aiff"));
-    }
-
-    #[test]
     fn load_from_parses_absolute_sound_file_unchanged() {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("config.toml");
@@ -1190,19 +1164,46 @@ sound_file = "/System/Library/Sounds/Glass.aiff"
     }
 
     #[test]
-    fn expand_local_tilde_handles_bare_tilde_and_unexpanded_paths() {
-        let home = dirs::home_dir().expect("home for test");
-        assert_eq!(expand_local_tilde(Path::new("~")), home);
-        assert_eq!(
-            expand_local_tilde(Path::new("/abs/path")),
-            PathBuf::from("/abs/path")
-        );
-        // Username-form tildes (~user) deliberately do not expand —
-        // out of scope and surface less often than ~/ for sound files.
-        assert_eq!(
-            expand_local_tilde(Path::new("~someone/file")),
-            PathBuf::from("~someone/file")
-        );
+    fn load_from_rejects_tilde_in_sound_file() {
+        // Consistency with the top-level workspace_folders rule:
+        // tildes in config paths are not expanded; a loud rejection
+        // beats a silent failure at the first notification (the
+        // player binaries don't expand tildes themselves).
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[notifications]
+sound_file = "~/sounds/ping.mp3"
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        match err {
+            ConfigError::TildeInSoundFile(p) => {
+                assert_eq!(p, PathBuf::from("~/sounds/ping.mp3"));
+            }
+            other => panic!("expected TildeInSoundFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_rejects_bare_tilde_in_sound_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[notifications]
+sound_file = "~"
+"#,
+        )
+        .expect("write");
+        assert!(matches!(
+            Config::load_from(&path).expect_err("should reject"),
+            ConfigError::TildeInSoundFile(_)
+        ));
     }
 
     #[test]

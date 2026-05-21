@@ -1942,6 +1942,37 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
     }
 }
 
+/// Border style for a pane based on whether it currently owns the
+/// keyboard. Focused → cyan + BOLD so the cue is visible at a glance
+/// and also survives terminals with poor colour discrimination via the
+/// weight fallback. Unfocused → DIM so the rival pane recedes without
+/// disappearing.
+///
+/// Colour is hardcoded rather than themed for now; a `[theme.focus_border]`
+/// extension is filed in TODO under "extend [theme] schema beyond
+/// foreground colours".
+fn focus_border_style(focused: bool) -> Style {
+    if focused {
+        Style::new()
+            .fg(ratatui::style::Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::DIM)
+    }
+}
+
+/// Style for the sidebar's outer border. In embed mode the sidebar
+/// competes with the terminal pane for keystrokes, so the border picks
+/// up a focus cue; outside embed mode there's nothing to disambiguate
+/// against and the border stays plain.
+fn sidebar_border_style(app: &App) -> Style {
+    if app.embedded.is_some() {
+        focus_border_style(matches!(app.focus, Focus::Sidebar))
+    } else {
+        Style::new()
+    }
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     // When search is active we add a dedicated 1-line bar between
     // the list and the footer. Keeping the footer separately means
@@ -1992,8 +2023,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             }
         })
         .collect();
+    let sidebar_block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(sidebar_border_style(app));
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(sidebar_block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌ ");
 
@@ -2253,11 +2288,7 @@ fn draw_embedded(
     let term_block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {label} "))
-        .border_style(if term_focus {
-            Style::new().add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().add_modifier(Modifier::DIM)
-        });
+        .border_style(focus_border_style(term_focus));
     let inner = term_block.inner(split[1]);
 
     // Resize cascade: best-effort on each frame, only firing when the
@@ -2466,6 +2497,22 @@ mod tests {
 
     fn plain_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn focus_border_style_focused_is_bold_cyan() {
+        let s = focus_border_style(true);
+        assert_eq!(s.fg, Some(ratatui::style::Color::Cyan));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+        assert!(!s.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn focus_border_style_unfocused_is_dim_no_colour() {
+        let s = focus_border_style(false);
+        assert_eq!(s.fg, None);
+        assert!(s.add_modifier.contains(Modifier::DIM));
+        assert!(!s.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

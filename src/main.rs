@@ -2705,6 +2705,67 @@ mod tests {
         );
     }
 
+    fn idle_session(elapsed: Duration, attention: Attention) -> Session {
+        Session {
+            id: SessionId("audit".into()),
+            host: HostId::local(),
+            project_dir: PathBuf::from("/proj"),
+            transcript_path: PathBuf::from("/t/x.jsonl"),
+            last_activity: SystemTime::now()
+                .checked_sub(elapsed)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+            attention,
+            title: None,
+            parent_repo: None,
+            has_live_pane: None,
+        }
+    }
+
+    #[test]
+    fn effective_attention_preserves_active_state_under_idle_threshold() {
+        // A session with recent activity keeps its current attention
+        // state regardless of value — the idle promotion only kicks
+        // in at the 1h boundary.
+        for attn in [
+            Attention::NeedsInput,
+            Attention::Working,
+            Attention::Idle,
+            Attention::Unknown,
+        ] {
+            let s = idle_session(Duration::from_secs(60), attn);
+            assert_eq!(
+                effective_attention(&s),
+                attn,
+                "recent activity should preserve {attn:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn effective_attention_promotes_to_idle_past_threshold() {
+        // Past IDLE_THRESHOLD any non-Idle state collapses to Idle —
+        // the row reads as "this hasn't moved in a while". Pins the
+        // documented 1h boundary in `main.rs:IDLE_THRESHOLD`.
+        let beyond = IDLE_THRESHOLD + Duration::from_secs(60);
+        for attn in [Attention::NeedsInput, Attention::Working] {
+            let s = idle_session(beyond, attn);
+            assert_eq!(effective_attention(&s), Attention::Idle);
+        }
+    }
+
+    #[test]
+    fn effective_attention_just_under_threshold_keeps_active_state() {
+        // The threshold is strict greater-than; activity within the
+        // 1h window stays active. Tested an absolute second under so
+        // the elapsed-since-`now()` clock drift in the harness doesn't
+        // race the boundary.
+        let just_under = IDLE_THRESHOLD
+            .checked_sub(Duration::from_secs(1))
+            .expect("IDLE_THRESHOLD > 1s");
+        let s = idle_session(just_under, Attention::Working);
+        assert_eq!(effective_attention(&s), Attention::Working);
+    }
+
     #[test]
     fn focus_border_style_focused_is_bold_cyan() {
         let s = focus_border_style(true);

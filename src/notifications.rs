@@ -82,6 +82,28 @@ pub trait Dispatcher: Send + Sync {
     /// notifier treats failure as "did not fire" — suppression state
     /// is not armed, so the next attempt can try again.
     fn dispatch(&self, payload: Payload) -> Result<(), String>;
+
+    /// Synchronous dispatch for one-shot CLI use (`notify-test`). The
+    /// CLI process exits as soon as the subcommand returns, so the
+    /// default `dispatch` — which spawns the subprocess work onto a
+    /// detached thread — loses a race: the parent dies before the
+    /// thread reaches `fork+exec`, and no notification ever fires.
+    ///
+    /// Real backends override this to run the subprocess invocation in
+    /// the caller's thread (for the notification daemon shell-out) and
+    /// to use `Command::spawn` instead of `Command::status` for any
+    /// audio player (so the child is fully forked before this returns
+    /// but the CLI doesn't block for the full playback duration).
+    ///
+    /// The default implementation falls through to `dispatch`, which is
+    /// correct for synchronous test recorders.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as `dispatch`.
+    fn dispatch_blocking(&self, payload: Payload) -> Result<(), String> {
+        self.dispatch(payload)
+    }
 }
 
 /// Production dispatcher backed by `notify-rust`. Spawns a one-shot
@@ -107,6 +129,22 @@ impl Dispatcher for LibNotifyDispatcher {
         });
         if let Some(path) = sound_file {
             play_sound_file(path);
+        }
+        Ok(())
+    }
+
+    fn dispatch_blocking(&self, payload: Payload) -> Result<(), String> {
+        let request_default_sound = should_play_os_default(&payload);
+        let mut n = notify_rust::Notification::new();
+        n.summary(&payload.title)
+            .body(&payload.body)
+            .appname("agent-mux");
+        if request_default_sound {
+            n.sound_name("default");
+        }
+        let _ = n.show();
+        if let Some(path) = payload.sound_file {
+            play_sound_file_blocking(&path);
         }
         Ok(())
     }
@@ -145,6 +183,33 @@ pub fn play_sound_file(path: PathBuf) {
             }
         }
     });
+}
+
+/// Blocking-CLI counterpart to [`play_sound_file`]. Forks the player via
+/// `Command::spawn` (which returns once the child has `fork+exec`'d) and
+/// drops the `Child` handle so playback continues independently after
+/// the parent CLI process exits. Used by `Dispatcher::dispatch_blocking`
+/// from the `notify-test` subcommand, where the detached-thread strategy
+/// of [`play_sound_file`] would lose a race against the parent's exit
+/// and the user would never hear the sound.
+///
+/// Returns once the first player on `$PATH` has been successfully
+/// spawned; later candidates are not tried. If none can be spawned the
+/// function returns having played nothing — matching `play_sound_file`'s
+/// best-effort contract.
+pub fn play_sound_file_blocking(path: &Path) {
+    for (program, args) in candidate_players(path) {
+        if Command::new(program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 /// Per-platform list of player commands to try, in order. Each tuple is
@@ -207,6 +272,21 @@ impl Dispatcher for OsascriptDispatcher {
         }
         Ok(())
     }
+
+    fn dispatch_blocking(&self, payload: Payload) -> Result<(), String> {
+        let script = build_osascript(&payload);
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Some(path) = payload.sound_file {
+            play_sound_file_blocking(&path);
+        }
+        Ok(())
+    }
 }
 
 /// Compose the `AppleScript` source for one `display notification` call.
@@ -255,6 +335,21 @@ impl Dispatcher for WslToastDispatcher {
         });
         if let Some(path) = sound_file {
             play_sound_file(path);
+        }
+        Ok(())
+    }
+
+    fn dispatch_blocking(&self, payload: Payload) -> Result<(), String> {
+        let _ = Command::new("wsl-notify-send.exe")
+            .arg("--category")
+            .arg(&payload.title)
+            .arg(&payload.body)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Some(path) = payload.sound_file {
+            play_sound_file_blocking(&path);
         }
         Ok(())
     }
@@ -431,11 +526,21 @@ impl Notifier {
     /// the test fire to *actually* fire even if a real notification
     /// just landed for the same dummy session.
     ///
+    /// Calls `dispatch_blocking` rather than `dispatch` because the
+    /// `notify-test` process exits as soon as this returns. The
+    /// default `dispatch` spawns the OS-notification and audio-player
+    /// invocations onto detached threads, which lose a race against
+    /// the parent exit and never fire. The blocking variant runs the
+    /// `osascript`/`wsl-notify-send`/`notify-rust` call in the
+    /// caller's thread and uses `Command::spawn` for the audio player
+    /// (returns once the child has fork+exec'd, so playback survives
+    /// the CLI exit without blocking on its full duration).
+    ///
     /// # Errors
     ///
     /// Propagates the dispatcher's error string verbatim.
     pub fn dispatch_test(&self, payload: Payload) -> Result<(), String> {
-        self.dispatcher.dispatch(payload)
+        self.dispatcher.dispatch_blocking(payload)
     }
 }
 
@@ -1238,6 +1343,81 @@ mod tests {
             vec!["ffplay", "paplay"],
             "Linux player order must keep ffplay primary (broadest codec coverage)"
         );
+    }
+
+    /// Recorder that distinguishes `dispatch` vs `dispatch_blocking`.
+    /// Pins the invariant that `Notifier::dispatch_test` (CLI path) routes
+    /// through the blocking variant — a regression to `dispatch` would
+    /// reintroduce the race where the CLI process exits before the
+    /// detached thread can `fork+exec` and the notification never fires.
+    #[derive(Default)]
+    struct RouteRecorder {
+        async_calls: Mutex<usize>,
+        sync_calls: Mutex<usize>,
+    }
+
+    impl Dispatcher for RouteRecorder {
+        fn dispatch(&self, _: Payload) -> Result<(), String> {
+            *self.async_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn dispatch_blocking(&self, _: Payload) -> Result<(), String> {
+            *self.sync_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    struct SharedRouteRecorder(std::sync::Arc<RouteRecorder>);
+    impl Dispatcher for SharedRouteRecorder {
+        fn dispatch(&self, p: Payload) -> Result<(), String> {
+            self.0.dispatch(p)
+        }
+        fn dispatch_blocking(&self, p: Payload) -> Result<(), String> {
+            self.0.dispatch_blocking(p)
+        }
+    }
+
+    #[test]
+    fn dispatch_test_routes_through_dispatch_blocking_not_dispatch() {
+        let rec = std::sync::Arc::new(RouteRecorder::default());
+        let notifier = Notifier::new(
+            Box::new(SharedRouteRecorder(std::sync::Arc::clone(&rec))),
+            NotificationsConfig::default(),
+        );
+        let payload = notifier.test_payload("x", "h", Path::new("/p"));
+        notifier.dispatch_test(payload).unwrap();
+        assert_eq!(
+            *rec.sync_calls.lock().unwrap(),
+            1,
+            "dispatch_test must use the blocking variant",
+        );
+        assert_eq!(
+            *rec.async_calls.lock().unwrap(),
+            0,
+            "dispatch_test must not use the fire-and-forget variant",
+        );
+    }
+
+    #[test]
+    fn default_dispatch_blocking_falls_through_to_dispatch() {
+        // Synchronous test dispatchers should not need to override
+        // dispatch_blocking; the default routes back to dispatch.
+        struct OnlyDispatch(Mutex<usize>);
+        impl Dispatcher for OnlyDispatch {
+            fn dispatch(&self, _: Payload) -> Result<(), String> {
+                *self.0.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        let d = OnlyDispatch(Mutex::new(0));
+        d.dispatch_blocking(Payload {
+            title: "x".into(),
+            body: "y".into(),
+            sound: false,
+            sound_file: None,
+        })
+        .unwrap();
+        assert_eq!(*d.0.lock().unwrap(), 1);
     }
 
     #[test]

@@ -136,6 +136,12 @@ fn main() -> io::Result<()> {
             };
             cli::print_config(&mut stdout, &searched, loaded_from.as_deref(), &result)
         }
+        Some("notify-test") => {
+            let cfg = Config::load().unwrap_or_default();
+            let (dispatcher, backend_label) = pick_dispatcher(cfg.notifications.backend);
+            let notifier = Notifier::new(dispatcher, cfg.notifications);
+            cli::print_notify_test(&mut stdout, &notifier, backend_label)
+        }
         Some("help" | "--help" | "-h") => cli::print_help(&mut stdout),
         Some(other) => {
             let mut stderr = io::stderr();

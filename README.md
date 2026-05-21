@@ -72,6 +72,15 @@ ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 enabled = true          # master on/off
 sound = false           # play the OS "default" notification sound
 disabled_hosts = []     # host labels to silence entirely
+# sound_file = "~/Library/Sounds/Tink.aiff"
+                        # path to an audio file to play instead of the
+                        # OS default. Tilde expands against your *local*
+                        # home (sounds always play on the local machine).
+                        # macOS uses `afplay` (handles mp3/wav/aiff/m4a);
+                        # Linux tries ffplay then paplay. When set, takes
+                        # precedence over sound=true and the OS
+                        # notification itself stays silent so the file
+                        # plays alone. Test it via `agent-mux notify-test`.
 # backend = "auto"      # one of: auto, dbus, osascript, wsl-toast.
                         # auto picks per-OS at startup; explicit values
                         # override the probe. The picked backend is
@@ -137,6 +146,7 @@ After cloning, run `scripts/install-hooks.sh` once to install the pre-commit hoo
 
 - `agent-mux themes` — coloured browser of every built-in theme preset, each element rendered in its actual colour so you can pick a palette by eye before editing the config.
 - `agent-mux config` — prints the current resolved config (which path was loaded, parsed `workspace_folders` / `hosts` / `notifications` / theme). Diagnostic-only — answers "is my config actually being read?" without log-spelunking.
+- `agent-mux notify-test` — fires one test notification using the current config (backend + sound choices), useful for verifying your `sound_file` plays without provoking a real session transition.
 - `agent-mux help` / `--help` — subcommand overview plus a one-screen reference of every config key, default, and accepted value.
 
 Flags for the dashboard:

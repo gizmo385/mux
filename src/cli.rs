@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use ratatui::style::Color;
 
 use crate::config::{Config, ConfigError, Theme};
+use crate::notifications::{Notifier, Payload};
 
 /// ANSI reset escape. After every coloured glyph or label we restore the
 /// terminal's default so nothing bleeds into the next line — important
@@ -335,9 +336,13 @@ fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
     }
     writeln!(
         out,
-        "  notifications: enabled={}, sound={}, backend={:?}, disabled_hosts={:?}",
+        "  notifications: enabled={}, sound={}, sound_file={}, backend={:?}, disabled_hosts={:?}",
         cfg.notifications.enabled,
         cfg.notifications.sound,
+        cfg.notifications
+            .sound_file
+            .as_ref()
+            .map_or("none".to_string(), |p| p.display().to_string()),
         cfg.notifications.backend,
         cfg.notifications.disabled_hosts,
     )?;
@@ -418,11 +423,19 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  [notifications]                enabled, sound, backend, disabled_hosts — all optional"
+        "  [notifications]                enabled, sound, sound_file, backend, disabled_hosts — all optional"
     )?;
     writeln!(
         out,
         "    backend = \"auto\"             one of: auto, dbus, osascript, wsl-toast"
+    )?;
+    writeln!(
+        out,
+        "    sound_file = \"~/sound.mp3\"   path to an audio file; plays via afplay (macOS)"
+    )?;
+    writeln!(
+        out,
+        "                                 or ffplay/paplay (Linux); overrides sound=true."
     )?;
     writeln!(out, "  [theme]")?;
     writeln!(
@@ -458,6 +471,63 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     Ok(())
 }
 
+/// Fire one test notification using the current notifier config and
+/// print a one-line confirmation describing what was sent. Lets a user
+/// verify the full pipeline (backend pick, dispatcher reachability,
+/// `sound_file` playback) end-to-end without provoking a real session
+/// transition.
+///
+/// The synthetic payload uses a fixed title ("test notification"), the
+/// literal host label `local`, and a placeholder project path so the
+/// result is recognisable on the user's notification surface. The
+/// backend label is included in the confirmation line so a misfiring
+/// auto-probe is immediately visible.
+///
+/// # Errors
+///
+/// Propagates any `io::Error` from `out`, or a non-empty error string
+/// from the dispatcher (which lands as an `io::Error::Other`).
+pub fn print_notify_test<W: Write>(
+    out: &mut W,
+    notifier: &Notifier,
+    backend_label: &str,
+) -> io::Result<()> {
+    let payload = notifier.test_payload(
+        "test notification",
+        "local",
+        Path::new("/agent-mux/notify-test"),
+    );
+    write_notify_test_confirmation(out, &payload, backend_label)?;
+    notifier
+        .dispatch_test(payload)
+        .map_err(|e| io::Error::other(format!("dispatcher: {e}")))?;
+    Ok(())
+}
+
+/// Write the one-line confirmation describing the payload the
+/// subcommand is about to dispatch. Lifted out so the formatting is
+/// unit-testable against an in-memory buffer without actually firing.
+fn write_notify_test_confirmation<W: Write>(
+    out: &mut W,
+    payload: &Payload,
+    backend_label: &str,
+) -> io::Result<()> {
+    let sound = if let Some(path) = &payload.sound_file {
+        format!("file {}", path.display())
+    } else if payload.sound {
+        "OS default".to_string()
+    } else {
+        "silent".to_string()
+    };
+    writeln!(
+        out,
+        "Firing test notification via backend={backend_label}, sound={sound}"
+    )?;
+    writeln!(out, "  title: {}", payload.title)?;
+    writeln!(out, "  body:  {}", payload.body)?;
+    Ok(())
+}
+
 /// One-screen overview of the available subcommands. Printed for `help`,
 /// `--help`, `-h`, and (to stderr) for any unrecognised invocation.
 ///
@@ -479,6 +549,10 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(
         out,
         "  agent-mux config         Print the live-parsed config (which file was loaded, parsed values)."
+    )?;
+    writeln!(
+        out,
+        "  agent-mux notify-test    Fire one test notification using the current config."
     )?;
     writeln!(out, "  agent-mux help           Show this help.")?;
     writeln!(out)?;
@@ -747,9 +821,73 @@ mod tests {
     #[test]
     fn help_lists_every_subcommand() {
         let out = run(print_help);
-        for cmd in ["themes", "config", "help"] {
+        for cmd in ["themes", "config", "notify-test", "help"] {
             assert!(out.contains(cmd), "missing subcommand {cmd:?}:\n{out}");
         }
+    }
+
+    #[test]
+    fn config_reference_documents_sound_file_field() {
+        let out = run(print_config_reference);
+        assert!(
+            out.contains("sound_file"),
+            "notifications.sound_file not documented:\n{out}"
+        );
+    }
+
+    #[test]
+    fn notify_test_confirmation_describes_sound_file_when_set() {
+        let payload = Payload {
+            title: "agent-mux: x".into(),
+            body: "local · /p".into(),
+            sound: false,
+            sound_file: Some(PathBuf::from("/abs/ping.mp3")),
+        };
+        let out = run(|w| write_notify_test_confirmation(w, &payload, "osascript"));
+        assert!(out.contains("backend=osascript"), "missing backend:\n{out}");
+        assert!(out.contains("file /abs/ping.mp3"), "missing path:\n{out}");
+        assert!(out.contains("title: agent-mux: x"), "missing title:\n{out}");
+        assert!(out.contains("body:  local · /p"), "missing body:\n{out}");
+    }
+
+    #[test]
+    fn notify_test_confirmation_reports_os_default_when_sound_true_and_no_file() {
+        let payload = Payload {
+            title: "x".into(),
+            body: "y".into(),
+            sound: true,
+            sound_file: None,
+        };
+        let out = run(|w| write_notify_test_confirmation(w, &payload, "osascript"));
+        assert!(
+            out.contains("sound=OS default"),
+            "expected OS-default:\n{out}"
+        );
+    }
+
+    #[test]
+    fn notify_test_confirmation_reports_silent_when_no_audio_at_all() {
+        let payload = Payload {
+            title: "x".into(),
+            body: "y".into(),
+            sound: false,
+            sound_file: None,
+        };
+        let out = run(|w| write_notify_test_confirmation(w, &payload, "osascript"));
+        assert!(out.contains("sound=silent"), "expected silent:\n{out}");
+    }
+
+    #[test]
+    fn parsed_config_status_surfaces_sound_file_path() {
+        let mut cfg = Config::default();
+        cfg.notifications.sound_file = Some(PathBuf::from("/abs/Tink.aiff"));
+        let path = PathBuf::from("/h/.config/agent-mux/config.toml");
+        let out =
+            run(|w| print_config_status(w, std::slice::from_ref(&path), Some(&path), &Ok(cfg)));
+        assert!(
+            out.contains("sound_file=/abs/Tink.aiff"),
+            "missing sound_file in parsed config:\n{out}"
+        );
     }
 
     #[test]

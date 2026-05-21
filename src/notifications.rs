@@ -26,7 +26,7 @@
 //! the notifier needs to recognise an actual transition.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
@@ -53,7 +53,20 @@ pub struct Payload {
     /// system. Plumbed through the payload so the dispatcher can stay
     /// stateless — config decisions live with the [`Notifier`], not
     /// the backend.
+    ///
+    /// Ignored when `sound_file` is set — that path plays its file via
+    /// a side-process player and silences the OS notification sound
+    /// instead to avoid a double-up.
     pub sound: bool,
+    /// Optional explicit audio file to play alongside a silent OS
+    /// notification. When present, the dispatcher spawns a platform-
+    /// appropriate player (`afplay` on macOS, `ffplay`/`paplay` on
+    /// Linux) against this path and asks the OS notification not to
+    /// play its own sound. Filed 2026-05-21 after dogfooding surfaced
+    /// the macOS default sound as aggressive enough that the user kept
+    /// `sound = true` off altogether — `sound_file` is the
+    /// vocabulary-free alternative.
+    pub sound_file: Option<PathBuf>,
 }
 
 /// Pluggable notification backend. Tests use a recorder to capture
@@ -80,20 +93,90 @@ pub struct LibNotifyDispatcher;
 
 impl Dispatcher for LibNotifyDispatcher {
     fn dispatch(&self, payload: Payload) -> Result<(), String> {
+        let sound_file = payload.sound_file.clone();
+        let request_default_sound = should_play_os_default(&payload);
         std::thread::spawn(move || {
             let mut n = notify_rust::Notification::new();
             n.summary(&payload.title)
                 .body(&payload.body)
                 .appname("agent-mux");
-            if payload.sound {
-                // Freedesktop "default" sound on Linux; AppleScript
-                // honours the same name string on macOS. Picking a
-                // specific named sound is a post-M5 follow-up.
+            if request_default_sound {
                 n.sound_name("default");
             }
             let _ = n.show();
         });
+        if let Some(path) = sound_file {
+            play_sound_file(path);
+        }
         Ok(())
+    }
+}
+
+/// Whether the OS notification API should request its built-in default
+/// sound. When the payload carries an explicit `sound_file`, we play
+/// that file ourselves and ask the OS for silence; otherwise we honour
+/// the `sound` toggle.
+fn should_play_os_default(payload: &Payload) -> bool {
+    payload.sound_file.is_none() && payload.sound
+}
+
+/// Spawn an OS-native audio player as a one-shot background thread to
+/// play `path`. Used when a notification's payload carries an explicit
+/// sound file — the file plays alongside a silent OS notification, so
+/// the OS-notification-sound double-up is avoided.
+///
+/// Per-platform mechanics — see [`candidate_players`]. Errors are
+/// swallowed inside the spawned thread; a missing player or unplayable
+/// file is dogfood feedback, not a crash condition. The thread blocks
+/// for the duration of playback (a few seconds at most for a typical
+/// notification chime), but it's detached, so dispatcher latency stays
+/// off the UI thread the same way the OS-notification spawn does.
+pub fn play_sound_file(path: PathBuf) {
+    std::thread::spawn(move || {
+        for (program, args) in candidate_players(&path) {
+            let status = Command::new(program)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                return;
+            }
+        }
+    });
+}
+
+/// Per-platform list of player commands to try, in order. Each tuple is
+/// `(program, argv)`; the first program found on `$PATH` that returns a
+/// successful exit status wins.
+///
+/// macOS gets `afplay` (handles mp3/wav/aiff/m4a/caf out of the box,
+/// ships with the OS). Linux/WSL tries `ffplay` first (most universal —
+/// any ffmpeg install gets it) then `paplay` (`PulseAudio`, decodes
+/// wav/ogg/flac without extra codecs). Other platforms return an empty
+/// list, so [`play_sound_file`] is a no-op there.
+#[must_use]
+pub fn candidate_players(path: &Path) -> Vec<(&'static str, Vec<std::ffi::OsString>)> {
+    let p = path.as_os_str().to_owned();
+    if cfg!(target_os = "macos") {
+        vec![("afplay", vec![p])]
+    } else if cfg!(target_os = "linux") {
+        vec![
+            (
+                "ffplay",
+                vec![
+                    "-nodisp".into(),
+                    "-autoexit".into(),
+                    "-loglevel".into(),
+                    "quiet".into(),
+                    p.clone(),
+                ],
+            ),
+            ("paplay", vec![p]),
+        ]
+    } else {
+        vec![]
     }
 }
 
@@ -108,6 +191,7 @@ pub struct OsascriptDispatcher;
 
 impl Dispatcher for OsascriptDispatcher {
     fn dispatch(&self, payload: Payload) -> Result<(), String> {
+        let sound_file = payload.sound_file.clone();
         let script = build_osascript(&payload);
         std::thread::spawn(move || {
             let _ = Command::new("osascript")
@@ -118,6 +202,9 @@ impl Dispatcher for OsascriptDispatcher {
                 .stderr(Stdio::null())
                 .status();
         });
+        if let Some(path) = sound_file {
+            play_sound_file(path);
+        }
         Ok(())
     }
 }
@@ -127,12 +214,16 @@ impl Dispatcher for OsascriptDispatcher {
 /// title/body escape contract is unit-testable without mocking the
 /// `osascript` subprocess. Literal double-quotes in either field are
 /// escaped so they can't break the surrounding string literal.
+///
+/// When `payload.sound_file` is set, the script omits the `sound name`
+/// clause — the file plays via the side-process player path and the OS
+/// notification stays silent to avoid a double-up.
 #[must_use]
 fn build_osascript(payload: &Payload) -> String {
     let title = payload.title.replace('"', "\\\"");
     let body = payload.body.replace('"', "\\\"");
     let mut script = format!("display notification \"{body}\" with title \"{title}\"");
-    if payload.sound {
+    if should_play_os_default(payload) {
         script.push_str(" sound name \"default\"");
     }
     script
@@ -147,6 +238,7 @@ pub struct WslToastDispatcher;
 
 impl Dispatcher for WslToastDispatcher {
     fn dispatch(&self, payload: Payload) -> Result<(), String> {
+        let sound_file = payload.sound_file.clone();
         std::thread::spawn(move || {
             // `wsl-notify-send.exe` flags: `--category` is the title;
             // the positional is the body. Older versions accept the
@@ -161,6 +253,9 @@ impl Dispatcher for WslToastDispatcher {
                 .stderr(Stdio::null())
                 .status();
         });
+        if let Some(path) = sound_file {
+            play_sound_file(path);
+        }
         Ok(())
     }
 }
@@ -306,11 +401,41 @@ impl Notifier {
             title: format!("agent-mux: {}", t.title),
             body: format!("{} · {}", t.host, t.project.display()),
             sound: self.config.sound,
+            sound_file: self.config.sound_file.clone(),
         };
         if self.dispatcher.dispatch(payload).is_ok() {
             entry.last_fired = Some(now);
             entry.fired_for_current_episode = true;
         }
+    }
+
+    /// Build the payload the notifier would dispatch for a synthetic
+    /// transition. Used by the `notify-test` subcommand to render and
+    /// fire a one-off notification matching the user's current config
+    /// without provoking a real session transition. Pulled out of the
+    /// dispatch path so the test subcommand can introspect the payload
+    /// (e.g. log what it sent) before handing it to the dispatcher.
+    #[must_use]
+    pub fn test_payload(&self, title: &str, host: &str, project: &Path) -> Payload {
+        Payload {
+            title: format!("agent-mux: {title}"),
+            body: format!("{host} · {}", project.display()),
+            sound: self.config.sound,
+            sound_file: self.config.sound_file.clone(),
+        }
+    }
+
+    /// Hand a payload directly to the dispatcher, bypassing the
+    /// per-session suppression bookkeeping. Used by the `notify-test`
+    /// subcommand for the end-to-end verification path: the user wants
+    /// the test fire to *actually* fire even if a real notification
+    /// just landed for the same dummy session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the dispatcher's error string verbatim.
+    pub fn dispatch_test(&self, payload: Payload) -> Result<(), String> {
+        self.dispatcher.dispatch(payload)
     }
 }
 
@@ -350,15 +475,24 @@ mod tests {
         assert_eq!(label, "wsl-toast");
     }
 
+    fn payload(title: &str, body: &str, sound: bool) -> Payload {
+        Payload {
+            title: title.into(),
+            body: body.into(),
+            sound,
+            sound_file: None,
+        }
+    }
+
     #[test]
     fn build_osascript_escapes_embedded_double_quotes_in_title_and_body() {
         // A session title with a literal `"` would otherwise close the
         // surrounding string in the script source, breaking syntax.
-        let payload = Payload {
-            title: r#"refactor "preview""#.into(),
-            body: r#"local · /tmp/dir "with quotes""#.into(),
-            sound: false,
-        };
+        let payload = payload(
+            r#"refactor "preview""#,
+            r#"local · /tmp/dir "with quotes""#,
+            false,
+        );
         let script = build_osascript(&payload);
         assert!(
             script.contains(r#"\"preview\""#),
@@ -372,11 +506,7 @@ mod tests {
 
     #[test]
     fn build_osascript_appends_sound_name_when_sound_requested() {
-        let payload = Payload {
-            title: "x".into(),
-            body: "y".into(),
-            sound: true,
-        };
+        let payload = payload("x", "y", true);
         assert!(
             build_osascript(&payload).contains("sound name \"default\""),
             "sound clause missing",
@@ -384,12 +514,22 @@ mod tests {
     }
 
     #[test]
+    fn build_osascript_omits_sound_name_when_sound_file_takes_over() {
+        // sound_file owns the audio cue when set — the OS notification
+        // must stay silent so the user doesn't hear the file plus the
+        // default chime on top of each other.
+        let mut p = payload("x", "y", true);
+        p.sound_file = Some(PathBuf::from("/System/Library/Sounds/Tink.aiff"));
+        assert!(
+            !build_osascript(&p).contains("sound name"),
+            "sound_file should silence the OS default clause:\n{}",
+            build_osascript(&p),
+        );
+    }
+
+    #[test]
     fn build_osascript_omits_sound_name_when_silent() {
-        let payload = Payload {
-            title: "x".into(),
-            body: "y".into(),
-            sound: false,
-        };
+        let payload = payload("x", "y", false);
         assert!(
             !build_osascript(&payload).contains("sound name"),
             "sound clause should be absent",
@@ -1002,5 +1142,116 @@ mod tests {
             at(1),
         );
         assert_eq!(rec.log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn payload_propagates_sound_file_from_config() {
+        let cfg = NotificationsConfig {
+            sound_file: Some(PathBuf::from("/abs/path/ping.mp3")),
+            ..NotificationsConfig::default()
+        };
+        let (mut n, rec) = notifier_with_log_and_config(cfg);
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        let log = rec.log.lock().unwrap();
+        assert_eq!(
+            log[0].sound_file.as_deref(),
+            Some(Path::new("/abs/path/ping.mp3"))
+        );
+    }
+
+    #[test]
+    fn payload_sound_file_defaults_to_none() {
+        let (mut n, rec) = notifier_with_log();
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert!(rec.log.lock().unwrap()[0].sound_file.is_none());
+    }
+
+    #[test]
+    fn should_play_os_default_returns_true_only_when_sound_true_and_no_file() {
+        let no_file = Payload {
+            title: "x".into(),
+            body: "y".into(),
+            sound: true,
+            sound_file: None,
+        };
+        assert!(should_play_os_default(&no_file));
+
+        let with_file = Payload {
+            sound_file: Some(PathBuf::from("/tmp/x.mp3")),
+            ..no_file.clone()
+        };
+        assert!(
+            !should_play_os_default(&with_file),
+            "sound_file presence must silence the OS default"
+        );
+
+        let silent = Payload {
+            sound: false,
+            sound_file: None,
+            ..no_file
+        };
+        assert!(!should_play_os_default(&silent));
+    }
+
+    #[test]
+    fn candidate_players_on_macos_uses_afplay() {
+        // Pinned per-platform so a future edit to the player list (e.g.
+        // adding a fallback) preserves the headline tool the rest of
+        // the design assumes is present on every Mac.
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let players = candidate_players(Path::new("/abs/sound.aiff"));
+        assert!(
+            players.iter().any(|(p, _)| *p == "afplay"),
+            "macos missing afplay in {players:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_players_on_linux_tries_ffplay_first_then_paplay() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let players = candidate_players(Path::new("/abs/sound.ogg"));
+        let names: Vec<&str> = players.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            names,
+            vec!["ffplay", "paplay"],
+            "Linux player order must keep ffplay primary (broadest codec coverage)"
+        );
+    }
+
+    #[test]
+    fn test_payload_uses_current_config_sound_and_file() {
+        let cfg = NotificationsConfig {
+            sound: true,
+            sound_file: Some(PathBuf::from("/abs/ding.mp3")),
+            ..NotificationsConfig::default()
+        };
+        let (n, _) = notifier_with_log_and_config(cfg);
+        let p = n.test_payload("preview", "alpenglow", Path::new("/work/mux"));
+        assert_eq!(p.title, "agent-mux: preview");
+        assert_eq!(p.body, "alpenglow · /work/mux");
+        assert!(p.sound);
+        assert_eq!(p.sound_file.as_deref(), Some(Path::new("/abs/ding.mp3")));
     }
 }

@@ -27,6 +27,15 @@ pub const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub struct AttentionUpdate {
     pub id: SessionId,
     pub attention: Attention,
+    /// Transcript mtime captured at the moment the event was produced.
+    /// `None` when the producer couldn't stat the file (filesystem
+    /// hiccup, file vanished between event and stat) or when it ships
+    /// the initial-prime event whose mtime is the same as discovery's
+    /// — touching `last_activity` to the same value would be a no-op.
+    /// `Some(mtime)` flows when a fresh write was observed; the catalog
+    /// uses it to keep the "last activity" cell live across the lifetime
+    /// of an actively-running conversation.
+    pub mtime: Option<SystemTime>,
 }
 
 /// Events emitted by the watcher. `Attention` flows from filesystem events
@@ -129,10 +138,13 @@ impl TranscriptWatcher {
         }
 
         // Prime initial state so the UI shows real attention from frame one.
+        // mtime is `None` because the catalog already holds the
+        // discovery-time mtime — touching it here would be a no-op.
         for (id, path) in &initial {
             let _ = event_tx.send(WatcherEvent::Attention(AttentionUpdate {
                 id: id.clone(),
                 attention: derive_attention(host.as_ref(), path),
+                mtime: None,
             }));
         }
 
@@ -160,9 +172,16 @@ impl TranscriptWatcher {
                         .ok()
                         .and_then(|m| m.get(&path).cloned());
                     let outgoing = if let Some(id) = known_id {
+                        // Stat the file alongside the tail read so the
+                        // dashboard's last-activity cell stays live —
+                        // dropping the mtime on stat failure (file
+                        // vanished, filesystem hiccup) is fine; the
+                        // catalog keeps its existing value.
+                        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
                         WatcherEvent::Attention(AttentionUpdate {
                             id,
                             attention: derive_attention(host_for_thread.as_ref(), &path),
+                            mtime,
                         })
                     } else {
                         // Stat now so the main thread doesn't have to;
@@ -214,12 +233,15 @@ impl TranscriptWatcher {
             self.watcher.watch(&path, RecursiveMode::NonRecursive)?;
         }
         let attention = derive_attention(self.host.as_ref(), &path);
+        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         if let Ok(mut targets) = self.targets.lock() {
             targets.insert(path, id.clone());
         }
-        let _ = self
-            .event_tx
-            .send(WatcherEvent::Attention(AttentionUpdate { id, attention }));
+        let _ = self.event_tx.send(WatcherEvent::Attention(AttentionUpdate {
+            id,
+            attention,
+            mtime,
+        }));
         Ok(())
     }
 
@@ -358,6 +380,7 @@ fn poll_once(
                     .send(WatcherEvent::Attention(AttentionUpdate {
                         id: id.clone(),
                         attention,
+                        mtime: Some(stat.mtime),
                     }))
                     .is_err()
                 {
@@ -386,7 +409,11 @@ fn poll_once(
         // hours that could be a long time. Emit one Attention now.
         let attention = derive_attention(host, &stat.path);
         if tx
-            .send(WatcherEvent::Attention(AttentionUpdate { id, attention }))
+            .send(WatcherEvent::Attention(AttentionUpdate {
+                id,
+                attention,
+                mtime: Some(stat.mtime),
+            }))
             .is_err()
         {
             return false;
@@ -693,6 +720,9 @@ mod tests {
             WatcherEvent::Attention(u) => {
                 assert_eq!(u.id.0, "s");
                 assert_eq!(u.attention, Attention::NeedsInput);
+                // mtime travels with the event so the catalog can keep
+                // the sidebar's "last activity" cell live.
+                assert_eq!(u.mtime, Some(ts(200)));
             }
             other => panic!("expected Attention, got: {other:?}"),
         }

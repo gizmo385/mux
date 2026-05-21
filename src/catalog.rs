@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::session::{Attention, HostId, Session, SessionId};
 
@@ -47,6 +48,30 @@ impl SessionCatalog {
             }
         }
         None
+    }
+
+    /// Bump a session's `last_activity` to `mtime`, but only if the
+    /// new value is newer than what the catalog already holds. Used by
+    /// the main loop to keep the sidebar's "last activity" cell live
+    /// across the lifetime of a running conversation — discovery sets
+    /// `last_activity` once at startup; without this, the cell would
+    /// otherwise sit at the discovery-time mtime forever and an active
+    /// session would slowly appear to go stale. The `mtime > current`
+    /// guard makes the call safe to fire on every Attention event:
+    /// out-of-order events (the rare case where a poll cycle and a
+    /// notify event race against the same write) can't rewind the cell.
+    /// Returns `true` if the value changed.
+    pub fn touch_activity(&mut self, id: &SessionId, mtime: SystemTime) -> bool {
+        for session in &mut self.sessions {
+            if session.id == *id {
+                if mtime > session.last_activity {
+                    session.last_activity = mtime;
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
     }
 
     /// Apply a fresh pane-presence snapshot from the pane poller for
@@ -271,6 +296,44 @@ mod tests {
         c.add(session("a"));
         assert!(c.remove_by_id(&SessionId("nope".into())).is_none());
         assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn touch_activity_advances_to_newer_mtime() {
+        let mut c = SessionCatalog::new();
+        let mut s = session("a");
+        s.last_activity = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        c.add(s);
+
+        let newer = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200);
+        assert!(c.touch_activity(&SessionId("a".into()), newer));
+        assert_eq!(c.sessions()[0].last_activity, newer);
+    }
+
+    #[test]
+    fn touch_activity_refuses_to_rewind_to_older_mtime() {
+        // Out-of-order events (e.g. a poll-tick and a notify event
+        // racing the same write) must not move the cell backward.
+        let mut c = SessionCatalog::new();
+        let mut s = session("a");
+        s.last_activity = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200);
+        c.add(s);
+
+        let older = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        assert!(!c.touch_activity(&SessionId("a".into()), older));
+        // Cell unchanged.
+        assert_eq!(
+            c.sessions()[0].last_activity,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200)
+        );
+    }
+
+    #[test]
+    fn touch_activity_returns_false_for_unknown_id() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        assert!(!c.touch_activity(&SessionId("nope".into()), when));
     }
 
     #[test]

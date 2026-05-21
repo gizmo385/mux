@@ -1152,6 +1152,12 @@ impl App {
             match event {
                 WatcherEvent::Attention(update) => {
                     let prev = self.catalog.update_attention(&update.id, update.attention);
+                    if let Some(mtime) = update.mtime {
+                        // Keeps the sidebar's "last activity" cell live
+                        // across an active conversation; without this it
+                        // would freeze at the discovery-time mtime.
+                        self.catalog.touch_activity(&update.id, mtime);
+                    }
                     // Transcript advanced — drop the cached preview so
                     // the next `ensure_preview_for_selected` refetches.
                     // Stale previews are worse than a brief "loading…"

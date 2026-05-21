@@ -1390,35 +1390,32 @@ impl App {
     }
 
     /// Route a key event while [`Focus::Terminal`] holds the keyboard.
-    ///
-    /// State machine:
-    /// - Not armed, leader chord: arm and consume.
-    /// - Armed, Esc: return focus to sidebar; PTY stays alive.
-    /// - Armed, anything else: forward both the leader bytes and the
-    ///   followup bytes to the PTY (tmux-style passthrough), then disarm.
-    /// - Not armed, anything else: encode and forward to PTY.
+    /// See the free-standing [`leader_chord_transition`] for the
+    /// state machine; this function only carries out the chosen
+    /// transition's side effect (focus mutation and/or PTY write).
     fn handle_terminal_key(&mut self, key: &KeyEvent) {
-        if matches!(self.focus, Focus::Terminal { leader_armed: true }) {
-            if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        match leader_chord_transition(self.focus, key) {
+            LeaderChordTransition::EscapeToSidebar => {
                 self.focus = Focus::Sidebar;
-                return;
             }
-            let leader_event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-            let mut bytes = encode_key_for_pty(&leader_event);
-            bytes.extend_from_slice(&encode_key_for_pty(key));
-            self.write_to_embedded(&bytes);
-            self.focus = Focus::Terminal {
-                leader_armed: false,
-            };
-            return;
-        }
-        if is_pty_leader(key) {
-            self.focus = Focus::Terminal { leader_armed: true };
-            return;
-        }
-        let bytes = encode_key_for_pty(key);
-        if !bytes.is_empty() {
-            self.write_to_embedded(&bytes);
+            LeaderChordTransition::ForwardBothToPty => {
+                let leader_event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+                let mut bytes = encode_key_for_pty(&leader_event);
+                bytes.extend_from_slice(&encode_key_for_pty(key));
+                self.write_to_embedded(&bytes);
+                self.focus = Focus::Terminal {
+                    leader_armed: false,
+                };
+            }
+            LeaderChordTransition::ArmLeader => {
+                self.focus = Focus::Terminal { leader_armed: true };
+            }
+            LeaderChordTransition::EncodeAndForward => {
+                let bytes = encode_key_for_pty(key);
+                if !bytes.is_empty() {
+                    self.write_to_embedded(&bytes);
+                }
+            }
         }
     }
 
@@ -1986,6 +1983,45 @@ fn focus_border_style(focused: bool) -> Style {
     }
 }
 
+/// Pure decision: what `App::handle_terminal_key` should do for `key`
+/// given `focus`. Extracted so the leader-chord state machine is
+/// unit-testable without standing up a full `App` (which owns a real
+/// PTY).
+///
+/// State machine:
+/// - Armed (`Focus::Terminal { leader_armed: true }`) + Esc → leave
+///   the embedded pane, return to sidebar. Modifier bits on Esc are
+///   *ignored* — under Kitty Keyboard Protocol or extended event
+///   modes Esc can arrive with stray modifier bits, and a strict
+///   `is_empty()` check there used to silently leak subsequent keys
+///   (j/k/Enter) into the inner PTY when the user thought they'd
+///   escaped (the 2026-05-20 "stray newline on session swap" bug).
+/// - Armed + anything else → forward `Ctrl-a` + key to the PTY (tmux
+///   passthrough), disarm.
+/// - Unarmed + leader chord (`Ctrl-a`) → arm.
+/// - Unarmed + anything else → encode and forward.
+#[must_use]
+fn leader_chord_transition(focus: Focus, key: &KeyEvent) -> LeaderChordTransition {
+    if matches!(focus, Focus::Terminal { leader_armed: true }) {
+        if key.code == KeyCode::Esc {
+            return LeaderChordTransition::EscapeToSidebar;
+        }
+        return LeaderChordTransition::ForwardBothToPty;
+    }
+    if is_pty_leader(key) {
+        return LeaderChordTransition::ArmLeader;
+    }
+    LeaderChordTransition::EncodeAndForward
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderChordTransition {
+    EscapeToSidebar,
+    ForwardBothToPty,
+    ArmLeader,
+    EncodeAndForward,
+}
+
 /// Style for the sidebar's outer border. In embed mode the sidebar
 /// competes with the terminal pane for keystrokes, so the border picks
 /// up a focus cue; outside embed mode there's nothing to disambiguate
@@ -2522,6 +2558,73 @@ mod tests {
 
     fn plain_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn leader_chord_armed_esc_returns_to_sidebar() {
+        let focus = Focus::Terminal { leader_armed: true };
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            leader_chord_transition(focus, &key),
+            LeaderChordTransition::EscapeToSidebar,
+        );
+    }
+
+    #[test]
+    fn leader_chord_armed_esc_with_stray_modifier_still_returns_to_sidebar() {
+        // Regression for the 2026-05-20 "stray newline on session
+        // swap" bug. Under extended keyboard protocols Esc can arrive
+        // with stray modifier bits; the transition must still fire,
+        // otherwise focus stays in Terminal and the user's subsequent
+        // navigation + Enter keys leak into the inner PTY.
+        for mods in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        ] {
+            let focus = Focus::Terminal { leader_armed: true };
+            let key = KeyEvent::new(KeyCode::Esc, mods);
+            assert_eq!(
+                leader_chord_transition(focus, &key),
+                LeaderChordTransition::EscapeToSidebar,
+                "Esc with modifiers {mods:?} should escape",
+            );
+        }
+    }
+
+    #[test]
+    fn leader_chord_armed_non_esc_forwards_both_to_pty() {
+        let focus = Focus::Terminal { leader_armed: true };
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(
+            leader_chord_transition(focus, &key),
+            LeaderChordTransition::ForwardBothToPty,
+        );
+    }
+
+    #[test]
+    fn leader_chord_unarmed_leader_arms() {
+        let focus = Focus::Terminal {
+            leader_armed: false,
+        };
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(
+            leader_chord_transition(focus, &key),
+            LeaderChordTransition::ArmLeader,
+        );
+    }
+
+    #[test]
+    fn leader_chord_unarmed_non_leader_encodes_and_forwards() {
+        let focus = Focus::Terminal {
+            leader_armed: false,
+        };
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            leader_chord_transition(focus, &key),
+            LeaderChordTransition::EncodeAndForward,
+        );
     }
 
     #[test]

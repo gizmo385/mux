@@ -13,6 +13,7 @@ pub mod notifications;
 pub mod preview;
 pub mod repo;
 pub mod session;
+pub mod session_names;
 pub mod tool_launches;
 pub mod watcher;
 pub mod worktree;

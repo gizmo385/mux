@@ -47,6 +47,7 @@ use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
 use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
+use agent_mux::session_names::{SessionNameStore, default_store_path};
 use agent_mux::tool_launches::{ToolLaunch, ToolLaunchRegistry};
 use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent};
 use agent_mux::worktree::WorktreeManager;
@@ -351,6 +352,30 @@ struct App {
     /// (no background poller — failure surfaces at the next user
     /// interaction).
     tool_launches: ToolLaunchRegistry,
+    /// Persistent user overrides for the sidebar's display title.
+    /// Keyed by `(host, session_id)`; loaded at startup from
+    /// `~/.cache/agent-mux/session_names.json`. The `r` keybind opens
+    /// an inline edit overlay (see [`Self::rename`]) whose result
+    /// flows through this store. Overrides take precedence over the
+    /// transcript's `aiTitle` / `task.toml` title.
+    session_names: SessionNameStore,
+    /// Active rename overlay. `Some` when the user pressed `r` on a
+    /// session row and is editing the new name; `None` otherwise.
+    /// While `Some`, every keystroke routes through
+    /// [`Self::route_rename_key`] rather than the normal action
+    /// dispatch.
+    rename: Option<RenameState>,
+}
+
+/// In-progress session-name rename. The target is captured at `r`
+/// time so the user can navigate (or even let discovery re-sort the
+/// list) without losing the row they meant to rename. The buffer is
+/// what they've typed so far; flushing to disk happens on `Enter`.
+#[derive(Debug, Clone)]
+struct RenameState {
+    host: HostId,
+    session_id: SessionId,
+    buffer: String,
 }
 
 /// Owns the embedded pseudoterminal and remembers which session it's
@@ -567,17 +592,7 @@ impl App {
 
         let (preview_tx, preview_rx) = channel();
 
-        // Extract before the struct literal moves `config` — Rust
-        // evaluates struct fields in source order, so `notifier:` (last)
-        // can't borrow `config` after `config:` (earlier) has taken it.
-        let (dispatcher, backend_label) = pick_dispatcher(config.notifications.backend);
-        // Log to stderr before ratatui takes over so the chosen
-        // backend is visible in the user's shell scrollback after
-        // exit. The 2026-05-20 dogfood signal was "silent failure
-        // defeats the entire attention-flap loop"; making the pick
-        // loud is the first half of fixing that.
-        eprintln!("agent-mux: notifications backend = {backend_label}");
-        let notifier = Notifier::new(dispatcher, config.notifications.clone());
+        let notifier = build_notifier(&config.notifications);
         let theme = Theme::from_config(&config.theme).map_err(io::Error::other)?;
 
         Ok(Self {
@@ -616,7 +631,69 @@ impl App {
             focus: Focus::default(),
             embedded_mode,
             tool_launches: ToolLaunchRegistry::new(),
+            session_names: load_session_names_or_empty(),
+            rename: None,
         })
+    }
+
+    /// Begin a rename for the currently-selected session row.
+    /// No-op when the cursor isn't on a session row (header, tool
+    /// row, or empty list). The initial buffer is the current
+    /// override if one exists, else empty — letting the user either
+    /// tweak their existing rename or start fresh from a session
+    /// whose displayed title is the AI/branch fallback.
+    fn open_rename(&mut self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let initial = self
+            .session_names
+            .get(&session.host, &session.id)
+            .unwrap_or("")
+            .to_string();
+        self.rename = Some(RenameState {
+            host: session.host.clone(),
+            session_id: session.id.clone(),
+            buffer: initial,
+        });
+        self.status = None;
+    }
+
+    /// Route a key while the rename overlay is active. Returns
+    /// `true` when the key was consumed (the run loop should skip
+    /// the normal action dispatch); `false` only for keys the
+    /// overlay doesn't recognise — defensive, the current handler
+    /// matches Enter / Esc / Backspace / Char and nothing else.
+    fn route_rename_key(&mut self, key: KeyEvent) -> bool {
+        let Some(state) = self.rename.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let buf = std::mem::take(&mut state.buffer);
+                let host = state.host.clone();
+                let id = state.session_id.clone();
+                self.rename = None;
+                self.session_names.set(&host, &id, buf);
+                true
+            }
+            KeyCode::Esc => {
+                self.rename = None;
+                true
+            }
+            KeyCode::Backspace => {
+                state.buffer.pop();
+                true
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                state.buffer.push(c);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Display rows for the *current* view — filtered when search is
@@ -1651,6 +1728,7 @@ impl App {
                         name: label.clone(),
                         host: host_id,
                         tmux_session,
+                        project_dir: cwd.clone(),
                         launched_at: SystemTime::now(),
                     });
                 }
@@ -1696,10 +1774,15 @@ impl App {
             let refs: Vec<&str> = attach.iter().map(String::as_str).collect();
             host.ssh_argv(true, &refs)?
         };
+        let project = launch
+            .project_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?");
         let spec = EmbedSpec {
             argv,
             cwd: None,
-            label: format!("⚒ {} · [{}]", launch.name, launch.host),
+            label: format!("⚒ {} · {} · [{}]", launch.name, project, launch.host),
             tmux_session: Some(launch.tmux_session.clone()),
         };
         let synthetic_id = SessionId(format!("agent-mux-tool-attach:{}", launch.tmux_session));
@@ -1848,6 +1931,13 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             }
             if app.delete_modal.is_some() {
                 app.handle_delete_modal_key(key);
+                continue;
+            }
+            // Rename overlay owns the keyboard while open — characters
+            // append to the buffer, Backspace pops, Enter commits, Esc
+            // cancels. Comes before the search routes for the same
+            // reason: a buffer that contains `q` should not fire Quit.
+            if app.route_rename_key(key) {
                 continue;
             }
             // Editing-mode search owns the keyboard — composing the
@@ -2028,6 +2118,10 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.open_delete_worktree();
             ActionOutcome::Continue
         }
+        Action::RenameSession => {
+            app.open_rename();
+            ActionOutcome::Continue
+        }
         Action::LaunchTool(idx) => match app.launch_tool(idx) {
             Some(cmd) => ActionOutcome::Suspend(cmd),
             None => ActionOutcome::Continue,
@@ -2061,6 +2155,8 @@ enum Action {
     OpenSearch,
     TogglePreview,
     DeleteWorktree,
+    /// `r` — open the inline rename overlay for the selected session.
+    RenameSession,
     /// User-configured `[[tools]]` keybind. The index is into
     /// `App.config.tools` — `dispatch_action` reads the binding back
     /// out of the same vec at fire time so a stale index can't
@@ -2094,6 +2190,7 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::OpenSearch),
         KeyCode::Char('p') => Some(Action::TogglePreview),
         KeyCode::Char('d') => Some(Action::DeleteWorktree),
+        KeyCode::Char('r') => Some(Action::RenameSession),
         // Tool keybinds dispatch after built-ins. Config-load
         // validation rejected any tool whose `key` shadows a built-in
         // (RESERVED_KEY_CHARS in config.rs), so the order here is
@@ -2190,12 +2287,17 @@ fn build_sidebar_items(
     home: Option<&Path>,
     theme: &Theme,
     tool_launches: &[ToolLaunch],
+    session_names: &SessionNameStore,
 ) -> Vec<ListItem<'static>> {
     rows.iter()
         .map(|row| match row {
             DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
             DisplayRow::ProjectHeader(path) => ListItem::new(format_project_header(path, home)),
-            DisplayRow::SessionRow(i) => ListItem::new(format_session_row(&sessions[*i], theme)),
+            DisplayRow::SessionRow(i) => {
+                let s = &sessions[*i];
+                let name_override = session_names.get(&s.host, &s.id);
+                ListItem::new(format_session_row(s, theme, name_override))
+            }
             DisplayRow::ToolsHeader => ListItem::new(format_tools_header()),
             DisplayRow::ToolRow(i) => ListItem::new(format_tool_row(&tool_launches[*i])),
         })
@@ -2214,16 +2316,74 @@ fn sidebar_border_style(app: &App) -> Style {
     }
 }
 
+/// Construct the M4 notifier from the resolved `[notifications]`
+/// config. Picks a platform-aware dispatcher via
+/// [`pick_dispatcher`] and logs the chosen backend label to stderr
+/// before ratatui takes over — the 2026-05-20 dogfood signal was
+/// "silent failure defeats the entire attention-flap loop", so the
+/// pick lands in shell scrollback rather than being invisible.
+#[must_use]
+fn build_notifier(cfg: &config::NotificationsConfig) -> Notifier {
+    let (dispatcher, backend_label) = pick_dispatcher(cfg.backend);
+    eprintln!("agent-mux: notifications backend = {backend_label}");
+    Notifier::new(dispatcher, cfg.clone())
+}
+
+/// Load the persistent session-name override store from the default
+/// cache path, degrading silently to an empty store when no cache
+/// path resolves. Lifted out of `App::new` so the field initialiser
+/// stays a one-liner.
+#[must_use]
+fn load_session_names_or_empty() -> SessionNameStore {
+    default_store_path()
+        .map(SessionNameStore::load_or_empty)
+        .unwrap_or_default()
+}
+
+/// Render the search/rename overlay bar at `layout[2]` when either
+/// is active. Returns the index in `layout` where the footer should
+/// land (3 when a bar was rendered, 2 otherwise). Lifted out of
+/// `draw` so the overlay's mutually-exclusive arms don't bloat the
+/// top-level function past the lint cap.
+fn render_overlay_bar(
+    frame: &mut ratatui::Frame<'_>,
+    app: &App,
+    layout: &[ratatui::layout::Rect],
+    visible_sessions: usize,
+) -> usize {
+    let bar_text = if let Some(rename) = app.rename.as_ref() {
+        Some(format!(
+            "rename: {}_  ⏎ save · esc cancel  · empty + ⏎ clears override",
+            rename.buffer,
+        ))
+    } else {
+        app.search
+            .as_ref()
+            .map(|s| compose_search_bar(s, visible_sessions))
+    };
+    if let Some(text) = bar_text {
+        let bar = Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+        frame.render_widget(bar, layout[2]);
+        3
+    } else {
+        2
+    }
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
-    // When search is active we add a dedicated 1-line bar between
-    // the list and the footer. Keeping the footer separately means
-    // the regular keybind line stays visible — search adds context,
-    // it doesn't blot out the navigation hints.
-    let constraints: Vec<Constraint> = if app.search.is_some() {
+    // When search or rename is active we add a dedicated 1-line bar
+    // between the list and the footer. Keeping the footer separately
+    // means the regular keybind line stays visible — search and
+    // rename add context, they don't blot out the navigation hints.
+    let needs_overlay_bar = app.search.is_some() || app.rename.is_some();
+    let constraints: Vec<Constraint> = if needs_overlay_bar {
         vec![
             Constraint::Length(1), // header
             Constraint::Min(0),    // list
-            Constraint::Length(1), // search bar
+            Constraint::Length(1), // overlay bar (search or rename)
             Constraint::Length(1), // footer
         ]
     } else {
@@ -2257,6 +2417,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.home.as_deref(),
         &app.theme,
         app.tool_launches.launches(),
+        &app.session_names,
     );
     let sidebar_block = Block::default()
         .borders(Borders::ALL)
@@ -2301,20 +2462,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         frame.render_stateful_widget(list, layout[1], &mut app.list_state);
     }
 
-    let footer_idx = if let Some(search) = app.search.as_ref() {
-        let bar_text = compose_search_bar(search, visible_sessions);
-        let bar = Paragraph::new(Line::from(Span::styled(
-            bar_text,
-            // The bar is bold (not dim) — when the search owns the
-            // keyboard, it's the foreground UI; dimming it would read
-            // as inactive.
-            Style::new().add_modifier(Modifier::BOLD),
-        )));
-        frame.render_widget(bar, layout[2]);
-        3
-    } else {
-        2
-    };
+    let footer_idx = render_overlay_bar(frame, app, &layout, visible_sessions);
 
     let footer_text = compose_footer(
         app.creating.as_ref(),
@@ -2599,16 +2747,26 @@ fn format_tools_header() -> Line<'static> {
 }
 
 /// Row for one running tool launch. Indented one level under the
-/// Tools header (matching project rows under host headers). Shows the
-/// tool name plus its host label so a user running the same tool on
-/// both local and a remote box can tell them apart.
+/// Tools header (matching project rows under host headers). Shows
+/// tool name + project basename + host label so multiple launches
+/// of the same tool against different projects don't look identical
+/// (2026-05-21 dogfood: `⚒ lazygit · ⚒ lazygit` with no distinction
+/// when both ran in different repos).
 fn format_tool_row(launch: &ToolLaunch) -> Line<'static> {
     let age = humanize_elapsed(launch.launched_at);
     let dim = Style::new().add_modifier(Modifier::DIM);
+    let project = launch
+        .project_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
     Line::from(vec![
         Span::raw("  "),
         Span::styled("⚒ ", dim),
         Span::raw(launch.name.clone()),
+        Span::raw("  "),
+        Span::styled(project, dim),
         Span::raw("  "),
         Span::styled(format!("[{}]", launch.host), dim),
         Span::raw("  "),
@@ -2638,7 +2796,11 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
     ))
 }
 
-fn format_session_row(session: &Session, theme: &Theme) -> Line<'static> {
+fn format_session_row(
+    session: &Session,
+    theme: &Theme,
+    name_override: Option<&str>,
+) -> Line<'static> {
     let attention = effective_attention(session);
     let glyph = attention_glyph(attention);
     let age = humanize_elapsed(session.last_activity);
@@ -2663,7 +2825,13 @@ fn format_session_row(session: &Session, theme: &Theme) -> Line<'static> {
         Span::styled(glyph, glyph_style),
         Span::raw(" "),
     ];
-    if let Some(title) = &session.title {
+    // User overrides take precedence over both `aiTitle` and the
+    // task-toml-derived title (the 2026-05-21 rename feature). A
+    // newly-arriving AI title does *not* clobber the override — once
+    // the user named something, they meant it.
+    if let Some(name) = name_override {
+        spans.push(Span::styled(name.to_string(), title_style));
+    } else if let Some(title) = &session.title {
         spans.push(Span::styled(title.clone(), title_style));
     } else {
         let id = &session.id.0;

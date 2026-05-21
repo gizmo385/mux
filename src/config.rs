@@ -14,7 +14,8 @@ pub const LOCAL_HOST_NAME: &str = "local";
 /// so the user gets a clear error rather than silently-shadowed
 /// behaviour. **Keep in sync with `action_for` in `main.rs`** — if you
 /// add a new built-in key there, add it here too.
-pub const RESERVED_KEY_CHARS: &[char] = &['q', 'j', 'k', 'J', 'K', 't', 'n', 'N', '/', 'p', 'd'];
+pub const RESERVED_KEY_CHARS: &[char] =
+    &['q', 'j', 'k', 'J', 'K', 't', 'n', 'N', '/', 'p', 'd', 'r'];
 
 #[derive(Debug)]
 pub enum ConfigError {

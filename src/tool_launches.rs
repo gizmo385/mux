@@ -13,6 +13,7 @@
 //! There is no background poller — the discipline is "fail loudly at
 //! the next interaction" rather than "discover deaths preemptively."
 
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::session::HostId;
@@ -31,6 +32,12 @@ pub struct ToolLaunch {
     /// process. `tmux attach -t <tmux_session>` is the re-attach
     /// command.
     pub tmux_session: String,
+    /// The source session's `project_dir` (the cwd the tool ran in).
+    /// Rendered in the sidebar row so multiple launches of the same
+    /// tool against different projects don't look identical — the
+    /// 2026-05-21 dogfood signal was `⚒ lazygit · ⚒ lazygit` with no
+    /// way to tell them apart.
+    pub project_dir: PathBuf,
     /// When the user fired the launch. Used to display "Xs ago" in
     /// the sidebar row.
     pub launched_at: SystemTime,
@@ -107,6 +114,7 @@ mod tests {
             name: name.to_string(),
             host: HostId::local(),
             tmux_session: tmux.to_string(),
+            project_dir: PathBuf::from("/work/proj"),
             launched_at: SystemTime::UNIX_EPOCH,
         }
     }

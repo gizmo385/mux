@@ -50,6 +50,75 @@ impl SessionCatalog {
         None
     }
 
+    /// Apply a heuristic-derived attention update that may be
+    /// suppressed by an active Claude Code hook pin. Returns the
+    /// previous attention iff the update was applied (so the caller
+    /// can fire a notifier transition); returns `None` if the session
+    /// is hook-pinned and `event_mtime` is `<=` the pin timestamp,
+    /// meaning the transcript hasn't advanced past the hook signal.
+    ///
+    /// Clears `hook_pinned` when the update *does* apply (and the pin
+    /// was set): the transcript has progressed past the hook event, so
+    /// the heuristic is once again trustworthy for this session. The
+    /// next hook event will repin.
+    ///
+    /// `event_mtime` is `None` for initial-prime events whose mtime
+    /// the watcher couldn't capture; treat those as "no signal about
+    /// transcript progress" and suppress while pinned.
+    pub fn apply_heuristic_attention(
+        &mut self,
+        id: &SessionId,
+        attention: Attention,
+        event_mtime: Option<SystemTime>,
+    ) -> Option<Attention> {
+        for session in &mut self.sessions {
+            if session.id == *id {
+                if let Some(pin) = session.hook_pinned {
+                    match event_mtime {
+                        Some(m) if m > pin => {
+                            // Transcript advanced past the hook event;
+                            // heuristic is authoritative again.
+                            session.hook_pinned = None;
+                        }
+                        _ => return None,
+                    }
+                }
+                let previous = session.attention;
+                session.attention = attention;
+                return Some(previous);
+            }
+        }
+        None
+    }
+
+    /// Apply a Claude Code `Notification` hook event for `id`. Forces
+    /// attention to `NeedsInput` and pins the hook authority at
+    /// `received_at` so subsequent heuristic-derived updates are
+    /// suppressed until transcript mtime advances past it. Returns the
+    /// previous attention iff the session was found, mirroring
+    /// [`SessionCatalog::update_attention`] so the caller can fire a
+    /// notifier transition.
+    ///
+    /// Idempotent across rapid repeat hook events: each call just
+    /// re-pins the timestamp and re-asserts `NeedsInput`; the
+    /// notifier's episodic-flag suppression collapses the duplicate
+    /// pings.
+    pub fn apply_hook_event(
+        &mut self,
+        id: &SessionId,
+        received_at: SystemTime,
+    ) -> Option<Attention> {
+        for session in &mut self.sessions {
+            if session.id == *id {
+                let previous = session.attention;
+                session.attention = Attention::NeedsInput;
+                session.hook_pinned = Some(received_at);
+                return Some(previous);
+            }
+        }
+        None
+    }
+
     /// Bump a session's `last_activity` to `mtime`, but only if the
     /// new value is newer than what the catalog already holds. Used by
     /// the main loop to keep the sidebar's "last activity" cell live
@@ -178,6 +247,7 @@ mod tests {
             title: None,
             parent_repo: None,
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 
@@ -425,5 +495,91 @@ mod tests {
         let s = &c.sessions()[0];
         assert_eq!(s.attention, Attention::NeedsInput);
         assert_eq!(s.title.as_deref(), Some("new title"));
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn apply_hook_event_forces_needs_input_and_pins_timestamp() {
+        let mut c = SessionCatalog::new();
+        let mut s = session("a");
+        s.attention = Attention::Working;
+        c.add(s);
+        let prev = c.apply_hook_event(&SessionId("a".into()), at(100));
+        assert_eq!(prev, Some(Attention::Working));
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::NeedsInput);
+        assert_eq!(s.hook_pinned, Some(at(100)));
+    }
+
+    #[test]
+    fn apply_hook_event_returns_none_for_unknown_session() {
+        let mut c = SessionCatalog::new();
+        assert!(
+            c.apply_hook_event(&SessionId("ghost".into()), at(0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn apply_heuristic_attention_suppressed_when_hook_pinned_and_mtime_not_newer() {
+        // Permission-prompt scenario: hook fires at T=10, heuristic
+        // polls at T=12 with the same (stale) transcript mtime=8
+        // — heuristic says Working from the still-pending tool_use,
+        // but we want to stay in NeedsInput.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), at(10));
+        let prev =
+            c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(8)));
+        assert_eq!(prev, None, "stale heuristic update must be suppressed");
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::NeedsInput);
+        assert_eq!(s.hook_pinned, Some(at(10)));
+    }
+
+    #[test]
+    fn apply_heuristic_attention_clears_pin_when_mtime_advances_past_it() {
+        // User approves the permission prompt at T=15; tool_result
+        // lands in the transcript with a fresh mtime. Heuristic
+        // derives Working; we apply it AND clear the pin so the
+        // heuristic is authoritative again.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), at(10));
+        let prev =
+            c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(20)));
+        assert_eq!(prev, Some(Attention::NeedsInput));
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::Working);
+        assert!(
+            s.hook_pinned.is_none(),
+            "pin must clear once transcript advances"
+        );
+    }
+
+    #[test]
+    fn apply_heuristic_attention_passes_through_when_no_hook_pin_set() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let prev =
+            c.apply_heuristic_attention(&SessionId("a".into()), Attention::NeedsInput, Some(at(5)));
+        assert_eq!(prev, Some(Attention::Unknown));
+        assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
+    }
+
+    #[test]
+    fn apply_heuristic_attention_suppresses_when_pinned_and_event_mtime_is_none() {
+        // Initial-prime events arrive without mtime — they shouldn't
+        // be able to clear a pin (we'd be guessing the transcript has
+        // progressed). Suppress.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), at(10));
+        let prev = c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, None);
+        assert_eq!(prev, None);
+        assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
     }
 }

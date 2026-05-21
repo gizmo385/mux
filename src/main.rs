@@ -142,6 +142,25 @@ fn main() -> io::Result<()> {
             let notifier = Notifier::new(dispatcher, cfg.notifications);
             cli::print_notify_test(&mut stdout, &notifier, backend_label)
         }
+        Some("hook") => {
+            // Producer side of the Claude Code Notification hook
+            // ingress. Reads payload from stdin, writes a marker file
+            // the running dashboard's watcher picks up. Fire-and-forget
+            // — exits as soon as the marker is on disk so Claude Code's
+            // hook pipeline isn't blocked on agent-mux's UI thread.
+            let dir = agent_mux::hook_ingest::default_hook_dir()
+                .ok_or_else(|| io::Error::other("no cache directory resolved on this platform"))?;
+            let path = agent_mux::hook_ingest::receive_hook_from_stdin(
+                &mut io::stdin().lock(),
+                &dir,
+                SystemTime::now(),
+            )?;
+            writeln!(
+                stdout,
+                "agent-mux: hook marker written to {}",
+                path.display()
+            )
+        }
         Some("help" | "--help" | "-h") => cli::print_help(&mut stdout),
         Some(other) => {
             let mut stderr = io::stderr();
@@ -246,6 +265,15 @@ struct App {
     /// so its `Drop` (which runs `ssh -O exit`) fires on app teardown.
     hosts: HashMap<HostId, Arc<dyn Host>>,
     watcher: TranscriptWatcher,
+    /// Background watcher for Claude Code hook marker files (Phase 1
+    /// of the Notification-hook integration). Held only so its
+    /// `notify::RecommendedWatcher` isn't dropped — the watcher feeds
+    /// `WatcherEvent::Hook` into the same channel as the transcript
+    /// watcher, drained by `drain_updates`. `None` when the cache
+    /// directory couldn't be resolved or the notify backend rejected
+    /// the watch; that case leaves agent-mux on the heuristic-only
+    /// attention path with an eprintln at startup.
+    _hook_watcher: Option<notify::RecommendedWatcher>,
     updates: Receiver<WatcherEvent>,
     driver: Box<dyn AttachmentDriver>,
     status: Option<String>,
@@ -503,6 +531,11 @@ enum RemoteDiscoveryResult {
 }
 
 impl App {
+    // App::new is a long but linear constructor — every line wires
+    // one independent piece of startup state and the function exists
+    // to be read top-to-bottom. Further extraction would just hide
+    // statements behind helpers without simplifying.
+    #[allow(clippy::too_many_lines)]
     fn new(driver: Box<dyn AttachmentDriver>, embedded_mode: bool) -> io::Result<Self> {
         // Config drives both the cache-load (which `[hosts.<name>]`
         // do we have snapshots for) and the SSH-discovery spawn loop,
@@ -584,16 +617,10 @@ impl App {
                 );
             });
         }
-        // Drop the original Sender so the channel closes once every
-        // background thread has sent its result and exited. The
-        // per-thread clones above are the only live Senders.
-        drop(remote_tx);
+        drop(remote_tx); // close channel once every thread Sender clone is gone
 
-        // Pane-presence polling for the local host. Remote hosts get
-        // theirs in `drain_remote_discoveries` once each `SshHost`
-        // is connected. The 3s cadence matches the remote-attention
-        // poll — fast enough that a pane killed by `prefix+&` reflects
-        // in the dashboard within one tick.
+        // Local pane-presence polling; remotes get theirs in
+        // `drain_remote_discoveries` once each `SshHost` is connected.
         watcher.start_pane_polling_host(Arc::clone(&local_host), REMOTE_POLL_INTERVAL);
 
         let (preview_tx, preview_rx) = channel();
@@ -606,6 +633,7 @@ impl App {
             list_state,
             home: dirs::home_dir(),
             hosts,
+            _hook_watcher: init_hook_watcher(&watcher.event_sender()),
             watcher,
             updates,
             driver,
@@ -1271,7 +1299,20 @@ impl App {
         while let Ok(event) = self.updates.try_recv() {
             match event {
                 WatcherEvent::Attention(update) => {
-                    let prev = self.catalog.update_attention(&update.id, update.attention);
+                    // Heuristic-derived attention routes through the
+                    // hook-aware catalog method: while a session is
+                    // hook-pinned (NeedsInput forced by a Notification
+                    // hook event), a heuristic update with an mtime
+                    // older than the pin is suppressed so the pinned
+                    // state survives until the transcript actually
+                    // advances. When mtime advances past the pin, the
+                    // pin clears and the heuristic is applied
+                    // normally.
+                    let prev = self.catalog.apply_heuristic_attention(
+                        &update.id,
+                        update.attention,
+                        update.mtime,
+                    );
                     if let Some(mtime) = update.mtime {
                         // Keeps the sidebar's "last activity" cell live
                         // across an active conversation; without this it
@@ -1286,6 +1327,22 @@ impl App {
                     self.preview_cache.remove(&update.id);
                     if let Some(prev) = prev {
                         self.fire_attention_notification(&update.id, prev, update.attention);
+                    }
+                }
+                WatcherEvent::Hook { id, received_at } => {
+                    // A Claude Code Notification hook fired for `id`.
+                    // Force NeedsInput regardless of what the
+                    // heuristic last derived (the typical case is a
+                    // permission prompt during a tool_use that the
+                    // heuristic was reporting as Working). Pinning is
+                    // handled inside apply_hook_event.
+                    let prev = self.catalog.apply_hook_event(&id, received_at);
+                    if let Some(prev) = prev {
+                        self.fire_attention_notification(
+                            &id,
+                            prev,
+                            agent_mux::session::Attention::NeedsInput,
+                        );
                     }
                 }
                 WatcherEvent::NewTranscript { host, path, mtime } => {
@@ -2322,6 +2379,38 @@ fn sidebar_border_style(app: &App) -> Style {
     }
 }
 
+/// Spawn the Claude Code hook-marker watcher into the dashboard's
+/// event channel. `None` returns mean we fall back to heuristic-only
+/// attention with a one-line eprintln explaining why — startup must
+/// not fail because the hook ingress couldn't initialise (the
+/// dashboard works without it; the hook is a *richer* signal, not
+/// the only signal). Lifted out of `App::new` to keep that
+/// constructor under the `too_many_lines` cap.
+#[must_use]
+fn init_hook_watcher(
+    event_tx: &std::sync::mpsc::Sender<WatcherEvent>,
+) -> Option<notify::RecommendedWatcher> {
+    let Some(dir) = agent_mux::hook_ingest::default_hook_dir() else {
+        eprintln!(
+            "agent-mux: hook watcher disabled (no cache directory resolved); \
+             heuristic-only attention path stays in effect"
+        );
+        return None;
+    };
+    match agent_mux::hook_ingest::spawn_hook_watcher(&dir, event_tx) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!(
+                "agent-mux: hook watcher disabled ({} on {}); \
+                 heuristic-only attention path stays in effect",
+                e,
+                dir.display()
+            );
+            None
+        }
+    }
+}
+
 /// Construct the M4 notifier from the resolved `[notifications]`
 /// config. Picks a platform-aware dispatcher via
 /// [`pick_dispatcher`] and logs the chosen backend label to stderr
@@ -3071,6 +3160,7 @@ mod tests {
             title: None,
             parent_repo: None,
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 

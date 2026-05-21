@@ -231,6 +231,7 @@ fn assemble_session(
         title,
         parent_repo,
         has_live_pane: None,
+        hook_pinned: None,
     })
 }
 

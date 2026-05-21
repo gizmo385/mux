@@ -202,6 +202,7 @@ mod tests {
             title: Some("refactor parser".into()),
             parent_repo: Some(PathBuf::from("/work/proj")),
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 

@@ -637,6 +637,7 @@ mod tests {
             title: title.map(str::to_string),
             parent_repo: parent_repo.map(PathBuf::from),
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 

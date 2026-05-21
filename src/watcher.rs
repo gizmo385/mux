@@ -56,6 +56,18 @@ pub enum WatcherEvent {
         path: PathBuf,
         mtime: SystemTime,
     },
+    /// A Claude Code `Notification` hook event arrived for `id` via
+    /// the file-based ingress (`agent-mux hook` subcommand → marker
+    /// file → this watcher → main loop → catalog). Forces the session
+    /// into `NeedsInput`, regardless of what the heuristic would
+    /// otherwise derive. `received_at` is the `SystemTime` at which
+    /// the marker file's filename was minted, used to pin hook
+    /// authority in the catalog (heuristic updates with newer
+    /// transcript mtimes clear the pin).
+    Hook {
+        id: SessionId,
+        received_at: SystemTime,
+    },
     /// Snapshot of every live tmux pane on `host`: `cwds` carries
     /// each pane's `pane_current_path`, `session_names` carries each
     /// pane's owning tmux `session_name`. Indices align: index `i` of
@@ -89,6 +101,16 @@ pub struct TranscriptWatcher {
 }
 
 impl TranscriptWatcher {
+    /// Clone the sender that backs this watcher's event channel.
+    /// Used by sibling subsystems (e.g. the hook-marker watcher in
+    /// `hook_ingest`) that need to feed `WatcherEvent`s into the same
+    /// channel the dashboard's main loop already drains, without
+    /// each one having to plumb its own receiver.
+    #[must_use]
+    pub fn event_sender(&self) -> Sender<WatcherEvent> {
+        self.event_tx.clone()
+    }
+
     /// Start watching for transcript events.
     ///
     /// When `discovery_root` is `Some` and watchable, a single recursive

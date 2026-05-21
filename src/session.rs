@@ -81,4 +81,19 @@ pub struct Session {
     /// event, so it must always be re-derived at runtime from the
     /// pane poller.
     pub has_live_pane: Option<bool>,
+    /// Timestamp of the most recent Claude Code `Notification` hook
+    /// event ingested for this session, or `None` if no hook event
+    /// has arrived (the heuristic path is fully authoritative).
+    ///
+    /// When `Some(t)`, the hook is authoritative: heuristic-derived
+    /// attention updates whose source mtime is `<= t` are dropped (the
+    /// hook event represents a more precise signal that hasn't yet
+    /// been superseded by transcript progress). A heuristic update
+    /// whose mtime is strictly `> t` clears `hook_pinned` and applies
+    /// normally — the transcript has progressed past the hook event,
+    /// so the heuristic is once again trustworthy.
+    ///
+    /// Not serialized into the disk cache: the hook signal is
+    /// ephemeral and the cache only seeds first-frame display.
+    pub hook_pinned: Option<SystemTime>,
 }

@@ -131,6 +131,33 @@ These `agent-mux-<id>` tmux sessions accumulate on the remote over time. Clean t
 
 **Startup cache.** After each successful remote discovery, agent-mux writes a per-host snapshot to `~/.cache/agent-mux/sessions/<host>.json` (the list of remote sessions plus their last-known attention/title). On the next launch, those snapshots seed the dashboard immediately so configured remote hosts paint on first frame instead of popping in over the seconds it takes each `ControlMaster` handshake to complete. The live discovery still runs in the background and overlays fresh state when it finishes — entries that no longer exist on the remote drop out. Safe to delete the cache directory at any time; it'll repopulate.
 
+### Claude Code `Notification` hook (recommended)
+
+agent-mux's attention heuristic derives state from the transcript JSONL, but the transcript alone can't distinguish "the assistant is running a tool" from "the assistant is waiting for you to approve a permission prompt." Wiring up Claude Code's `Notification` hook closes that gap — Claude Code fires the hook exactly when it needs your attention (permission prompts, idle-awaiting-input), and agent-mux uses the hook event as the authoritative signal until the transcript advances.
+
+Setup is one edit to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {"type": "command", "command": "/absolute/path/to/agent-mux hook"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `/absolute/path/to/agent-mux` with the actual path on your machine (`which agent-mux` will give it to you). The hook command writes a marker file under `~/Library/Caches/agent-mux/hooks/` (or `~/.cache/agent-mux/hooks/` on Linux); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification.
+
+To verify your wiring without waiting for a real permission prompt: run `agent-mux notify-test` to confirm the dispatcher fires end-to-end, then trigger any permission prompt in a Claude Code session and watch the dashboard.
+
+Sessions on remote hosts don't pick up hook events yet (the marker file would land on the remote box, out of reach of the local watcher) — they fall back to the heuristic. Remote hook support is a planned follow-up.
+
 ## Setup
 
 The Rust toolchain is pinned via `rust-toolchain.toml` (channel `1.94.0`). If you have rustup, it will auto-fetch this version on first `cargo` invocation; without rustup, any 1.94.x install satisfies the gate (CI uses exactly `1.94.0`).

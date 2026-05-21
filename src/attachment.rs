@@ -1124,6 +1124,7 @@ mod tests {
             title: None,
             parent_repo: None,
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 
@@ -1584,6 +1585,7 @@ mod tests {
             title: None,
             parent_repo: None,
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 

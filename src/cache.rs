@@ -146,6 +146,7 @@ impl CachedSession {
             // will set this on its first tick. Anything cached here
             // would be stale before the user could read it.
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 }
@@ -205,6 +206,7 @@ mod tests {
             title: Some(format!("task {id}")),
             parent_repo: Some(PathBuf::from(format!("/repos/{id}"))),
             has_live_pane: None,
+            hook_pinned: None,
         }
     }
 

@@ -1435,6 +1435,13 @@ impl App {
     /// Translate a terminal-absolute mouse event into PTY-relative
     /// coordinates (1-based) and forward it as an SGR mouse report.
     /// Drops the event when:
+    /// - Shift is held. Per the iTerm2 / kitty / wezterm / Alacritty
+    ///   convention, Shift+mouse bypasses the application's mouse
+    ///   capture and lets the host terminal do native selection.
+    ///   Most of those emulators handle the bypass at the OS level
+    ///   (we never see the event), but a few forward it anyway; this
+    ///   guard makes sure agent-mux never swallows a Shift+drag that
+    ///   was meant for native selection. Filed in TODO 2026-05-20.
     /// - The embedded PTY isn't focused (mouse outside the terminal
     ///   pane is meaningless for the running child).
     /// - The click landed outside the PTY's content area (sidebar,
@@ -1442,6 +1449,9 @@ impl App {
     /// - The event kind isn't supported by `encode_mouse_event` (e.g.
     ///   horizontal scroll).
     fn handle_terminal_mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        if !should_capture_mouse(ev) {
+            return;
+        }
         if !matches!(self.focus, Focus::Terminal { .. }) {
             return;
         }
@@ -1981,6 +1991,19 @@ fn focus_border_style(focused: bool) -> Style {
     } else {
         Style::new().add_modifier(Modifier::DIM)
     }
+}
+
+/// Pure decision: should this mouse event be captured and forwarded
+/// into the embedded PTY at all? Returns `false` when `Shift` is held,
+/// matching the iTerm2 / kitty / wezterm / Alacritty convention that
+/// Shift+mouse bypasses application capture so the host terminal can
+/// do native selection. Most of those emulators already implement the
+/// bypass at the OS level (we never see the event), but a few forward
+/// it anyway — this guarantees we never swallow a Shift+drag that was
+/// meant for native selection.
+#[must_use]
+fn should_capture_mouse(ev: crossterm::event::MouseEvent) -> bool {
+    !ev.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// Pure decision: what `App::handle_terminal_key` should do for `key`
@@ -2558,6 +2581,61 @@ mod tests {
 
     fn plain_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn should_capture_mouse_drops_shift_modified_events() {
+        // Regression: dragging with Shift held used to be swallowed by
+        // mouse capture, suppressing host-terminal native selection.
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let ev = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        assert!(!should_capture_mouse(ev));
+    }
+
+    #[test]
+    fn should_capture_mouse_accepts_unmodified_events() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            let ev = MouseEvent {
+                kind,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(
+                should_capture_mouse(ev),
+                "unmodified {kind:?} should capture"
+            );
+        }
+    }
+
+    #[test]
+    fn should_capture_mouse_passes_ctrl_and_alt_events_through_to_pty() {
+        // Only Shift triggers the bypass — Ctrl- and Alt-mouse are
+        // legitimate input shapes that the inner child may interpret.
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let ev = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: mods,
+            };
+            assert!(
+                should_capture_mouse(ev),
+                "modifier {mods:?} should not bypass"
+            );
+        }
     }
 
     #[test]

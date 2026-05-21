@@ -459,15 +459,26 @@ pub fn derive_attention_from_content(transcript: &str) -> Attention {
         }
     }
     match last {
-        Some(EntryKind::Assistant) => Attention::NeedsInput,
-        Some(EntryKind::UserMessage | EntryKind::ToolResult) => Attention::Working,
+        Some(EntryKind::AssistantAwaiting) => Attention::NeedsInput,
+        Some(EntryKind::AssistantToolUse | EntryKind::UserMessage | EntryKind::ToolResult) => {
+            Attention::Working
+        }
         None => Attention::Unknown,
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
-    Assistant,
+    /// Assistant message whose turn has actually ended — `stop_reason`
+    /// is `end_turn`, `stop_sequence`, `max_tokens`, or missing/unknown
+    /// (the conservative fallback so a partial or unfamiliar entry
+    /// keeps the previous "assistant is the last word" behaviour rather
+    /// than silently demoting to Working).
+    AssistantAwaiting,
+    /// Assistant message that paused only to invoke a tool
+    /// (`stop_reason == "tool_use"`). The assistant is not awaiting
+    /// human input; it's waiting on the tool to return.
+    AssistantToolUse,
     UserMessage,
     ToolResult,
 }
@@ -475,7 +486,7 @@ enum EntryKind {
 fn classify(value: &serde_json::Value) -> Option<EntryKind> {
     let entry_type = value.get("type")?.as_str()?;
     match entry_type {
-        "assistant" => Some(EntryKind::Assistant),
+        "assistant" => Some(classify_assistant(value)),
         "user" => {
             if value.get("toolUseResult").is_some() {
                 Some(EntryKind::ToolResult)
@@ -484,6 +495,31 @@ fn classify(value: &serde_json::Value) -> Option<EntryKind> {
             }
         }
         _ => None,
+    }
+}
+
+/// Decide whether an assistant entry represents an end-of-turn (the
+/// session is now awaiting user input) or a tool-use pause (the
+/// assistant is still working, the tool just hasn't returned yet).
+///
+/// Drives the dominant notification-noise fix: tool-using turns flicker
+/// the last entry through `type: "assistant"` between every `tool_use`
+/// block and its matching `tool_result`, and the prior heuristic
+/// reported every such flicker as `NeedsInput`. Looking at
+/// `message.stop_reason` collapses those into `Working` and reserves
+/// `NeedsInput` for entries the model itself flagged as turn-ending.
+///
+/// `stop_reason` lives at `message.stop_reason` in the Claude Code JSONL
+/// shape. Missing / non-string / unfamiliar values fall back to
+/// `AssistantAwaiting` so a malformed line stays conservative.
+fn classify_assistant(value: &serde_json::Value) -> EntryKind {
+    let stop_reason = value
+        .get("message")
+        .and_then(|m| m.get("stop_reason"))
+        .and_then(|s| s.as_str());
+    match stop_reason {
+        Some("tool_use") => EntryKind::AssistantToolUse,
+        _ => EntryKind::AssistantAwaiting,
     }
 }
 
@@ -561,6 +597,77 @@ mod tests {
     fn nonexistent_file_is_unknown() {
         let path = std::path::PathBuf::from("/nonexistent/path/foo.jsonl");
         assert_eq!(derive_attention(&host(), &path), Attention::Unknown);
+    }
+
+    #[test]
+    fn assistant_with_tool_use_stop_reason_is_working_not_needs_input() {
+        // The dominant notification-noise case: assistant emits a tool_use
+        // block, the entry's stop_reason is "tool_use", and the next event
+        // will be a tool_result. Previously this flickered through
+        // NeedsInput between every tool_use/tool_result pair.
+        let f = write_jsonl(&[
+            r#"{"type":"user","message":"do thing"}"#,
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash"}]}}"#,
+        ]);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
+    }
+
+    #[test]
+    fn assistant_with_end_turn_stop_reason_is_needs_input() {
+        let f = write_jsonl(&[
+            r#"{"type":"user","message":"hi"}"#,
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}"#,
+        ]);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
+    }
+
+    #[test]
+    fn assistant_without_stop_reason_falls_back_to_needs_input() {
+        // The fallback keeps the pre-fix behaviour for entries that don't
+        // carry a parseable stop_reason — malformed entries, partial
+        // writes, or unfamiliar future shapes — so an unknown line
+        // stays loud rather than silently quiet.
+        let f = write_jsonl(&[
+            r#"{"type":"user","message":"hi"}"#,
+            r#"{"type":"assistant","message":"hello"}"#,
+        ]);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
+    }
+
+    #[test]
+    fn assistant_with_unknown_stop_reason_falls_back_to_needs_input() {
+        // E.g. `pause_turn`, `refusal`, or a stop_reason added in a future
+        // Claude Code version. Conservative default: surface to the user.
+        let f = write_jsonl(&[
+            r#"{"type":"assistant","message":{"stop_reason":"pause_turn","content":[]}}"#,
+        ]);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
+    }
+
+    #[test]
+    fn tool_use_followed_by_tool_result_then_end_turn_is_needs_input() {
+        // Full agentic-loop tail: assistant calls a tool, tool result
+        // comes back, assistant ends turn. Only the last entry's
+        // stop_reason should matter for the final attention state.
+        let f = write_jsonl(&[
+            r#"{"type":"user","message":"do thing"}"#,
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}"#,
+            r#"{"type":"user","toolUseResult":{"stdout":"ok"}}"#,
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+        ]);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
+    }
+
+    #[test]
+    fn tool_use_assistant_as_last_entry_is_working_not_needs_input() {
+        // Mirrors the "we observed a tool_use entry but the tool_result
+        // hasn't been written yet" window. Pre-fix this was the loudest
+        // false-positive — every tool call notified.
+        let f = write_jsonl(&[
+            r#"{"type":"user","message":"do thing"}"#,
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read"}]}}"#,
+        ]);
+        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
     }
 
     // ---- poll_once ----

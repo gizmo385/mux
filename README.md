@@ -35,6 +35,8 @@ When you press Enter on a session, agent-mux spawns `tmux attach -t <pane>` (or 
 
 **Selecting text from the embedded pane.** Hold `Shift` while clicking or dragging — agent-mux drops Shift-mouse events so your host terminal (iTerm2, kitty, wezterm, Alacritty, …) can do native selection as if mouse capture weren't on. This is the same convention those terminals already implement at the OS level. For host terminals without that convention, or for selection over SSH where local selection won't reach the local clipboard, an in-app copy mode with OSC52 dispatch is filed in TODO.
 
+**Mouse-wheel scrollback in the embedded pane.** agent-mux forwards SGR wheel events into the inner tmux, but tmux only acts on them when its own mouse mode is enabled. Add `set -g mouse on` to `~/.tmux.conf` (or `tmux set -g mouse on` for the current server) and the wheel will scroll the embedded pane's history naturally — tmux enters copy-mode on scroll-up and exits when you reach the live edge or press `q`/`Enter`. Without that setting, wheel events pass through to the running program (Claude Code), which doesn't have its own scrollback.
+
 `n` (new session) uses the same embedded-pane path: agent-mux spawns claude into a detached tmux session (`tmux new-session -d -P -F '#{session_name}' -c <cwd> claude`), lets tmux pick the session name, then attaches the embedded pane to it. The dashboard later discovers the new session via the transcript watcher and a normal Enter on that row re-attaches by matching the pane's cwd.
 
 Border style reflects focus: bold border = the embedded pane has the keyboard; dim border = the sidebar does. Footer shows the relevant keybinds for current focus.

@@ -335,8 +335,11 @@ fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
     }
     writeln!(
         out,
-        "  notifications: enabled={}, sound={}, disabled_hosts={:?}",
-        cfg.notifications.enabled, cfg.notifications.sound, cfg.notifications.disabled_hosts,
+        "  notifications: enabled={}, sound={}, backend={:?}, disabled_hosts={:?}",
+        cfg.notifications.enabled,
+        cfg.notifications.sound,
+        cfg.notifications.backend,
+        cfg.notifications.disabled_hosts,
     )?;
     let preset = cfg.theme.preset.as_deref().unwrap_or("default");
     let overrides = theme_override_count(&cfg.theme);
@@ -415,7 +418,11 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  [notifications]                enabled, sound, disabled_hosts — all optional"
+        "  [notifications]                enabled, sound, backend, disabled_hosts — all optional"
+    )?;
+    writeln!(
+        out,
+        "    backend = \"auto\"             one of: auto, dbus, osascript, wsl-toast"
     )?;
     writeln!(out, "  [theme]")?;
     writeln!(
@@ -622,7 +629,7 @@ mod tests {
     #[test]
     fn config_documents_every_notifications_field() {
         let out = run(print_config_reference);
-        for field in ["enabled", "sound", "disabled_hosts"] {
+        for field in ["enabled", "sound", "disabled_hosts", "backend"] {
             assert!(
                 out.contains(field),
                 "notifications.{field} not documented:\n{out}"

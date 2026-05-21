@@ -596,6 +596,12 @@ pub struct NotificationsConfig {
     /// `local`). Default empty. Use case: silence chatty CI/dev boxes
     /// while keeping pings for one specific host.
     pub disabled_hosts: Vec<String>,
+    /// Which backend dispatches the actual OS notification. `Auto`
+    /// (default) picks per-OS at startup; explicit values override.
+    /// Filed 2026-05-20 after dogfooding confirmed `notify-rust` was
+    /// unreliable on macOS and WSL — each OS now has a backend that
+    /// doesn't depend on D-Bus / `NSUserNotification` working correctly.
+    pub backend: NotificationsBackend,
 }
 
 impl Default for NotificationsConfig {
@@ -604,8 +610,35 @@ impl Default for NotificationsConfig {
             enabled: true,
             sound: false,
             disabled_hosts: Vec::new(),
+            backend: NotificationsBackend::default(),
         }
     }
+}
+
+/// Which notification dispatcher to use at runtime.
+///
+/// `Auto` picks per-OS at startup:
+/// - macOS → `Osascript`
+/// - WSL (Linux with "Microsoft"/"WSL" in `/proc/sys/kernel/osrelease`) → `WslToast`
+/// - Other Linux → `Dbus` (the M4 path, via `notify-rust`)
+///
+/// Explicit values override the probe — useful for testing or for
+/// users whose detection happens to misfire (e.g. WSL with a working
+/// Linux D-Bus daemon that they'd rather use).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotificationsBackend {
+    #[default]
+    Auto,
+    /// `notify-rust` — libnotify on Linux, `NSUserNotification` on macOS,
+    /// `WinRT` on native Windows. Reliable on standard Linux desktops.
+    Dbus,
+    /// macOS only — shells out to `osascript -e 'display notification …'`.
+    /// No daemon dependency; ships with every Mac.
+    Osascript,
+    /// WSL → Windows side via `wsl-notify-send.exe`. Requires that
+    /// binary on the user's Windows PATH (separately installed).
+    WslToast,
 }
 
 impl Config {

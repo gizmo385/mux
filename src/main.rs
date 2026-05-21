@@ -43,7 +43,7 @@ use agent_mux::embedded_pty::{
 };
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
-use agent_mux::notifications::{LibNotifyDispatcher, Notifier, Transition};
+use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
 use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
@@ -556,7 +556,14 @@ impl App {
         // Extract before the struct literal moves `config` — Rust
         // evaluates struct fields in source order, so `notifier:` (last)
         // can't borrow `config` after `config:` (earlier) has taken it.
-        let notifier = Notifier::new(Box::new(LibNotifyDispatcher), config.notifications.clone());
+        let (dispatcher, backend_label) = pick_dispatcher(config.notifications.backend);
+        // Log to stderr before ratatui takes over so the chosen
+        // backend is visible in the user's shell scrollback after
+        // exit. The 2026-05-20 dogfood signal was "silent failure
+        // defeats the entire attention-flap loop"; making the pick
+        // loud is the first half of fixing that.
+        eprintln!("agent-mux: notifications backend = {backend_label}");
+        let notifier = Notifier::new(dispatcher, config.notifications.clone());
         let theme = Theme::from_config(&config.theme).map_err(io::Error::other)?;
 
         Ok(Self {

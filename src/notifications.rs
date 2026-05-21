@@ -27,9 +27,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
-use crate::config::NotificationsConfig;
+use crate::config::{NotificationsBackend, NotificationsConfig};
 use crate::session::{Attention, HostId, SessionId};
 
 /// Same-session re-fire window. Notifications for the same `SessionId`
@@ -94,6 +95,124 @@ impl Dispatcher for LibNotifyDispatcher {
         });
         Ok(())
     }
+}
+
+/// macOS dispatcher that shells out to `osascript -e 'display
+/// notification …'`. Bypasses the `NSUserNotification` handoff that
+/// `notify-rust` uses, which 2026-05-20 dogfooding confirmed was
+/// unreliable on the user's setup. `osascript` ships with every Mac;
+/// the dispatch is one fork+exec per notification, fire-and-forget on
+/// a background thread so a slow Notification Center reply can't
+/// back-pressure the UI thread.
+pub struct OsascriptDispatcher;
+
+impl Dispatcher for OsascriptDispatcher {
+    fn dispatch(&self, payload: Payload) -> Result<(), String> {
+        let script = build_osascript(&payload);
+        std::thread::spawn(move || {
+            let _ = Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
+        Ok(())
+    }
+}
+
+/// Compose the `AppleScript` source for one `display notification` call.
+/// Lifted out of [`OsascriptDispatcher::dispatch`] so the
+/// title/body escape contract is unit-testable without mocking the
+/// `osascript` subprocess. Literal double-quotes in either field are
+/// escaped so they can't break the surrounding string literal.
+#[must_use]
+fn build_osascript(payload: &Payload) -> String {
+    let title = payload.title.replace('"', "\\\"");
+    let body = payload.body.replace('"', "\\\"");
+    let mut script = format!("display notification \"{body}\" with title \"{title}\"");
+    if payload.sound {
+        script.push_str(" sound name \"default\"");
+    }
+    script
+}
+
+/// WSL dispatcher that shells out to `wsl-notify-send.exe` on the
+/// Windows side. Requires the binary on the user's Windows `PATH`
+/// (installed separately — see <https://github.com/stuartleeks/wsl-notify-send>).
+/// Bypasses Linux D-Bus, which 2026-05-20 dogfooding confirmed is
+/// fragile under `WSLg`.
+pub struct WslToastDispatcher;
+
+impl Dispatcher for WslToastDispatcher {
+    fn dispatch(&self, payload: Payload) -> Result<(), String> {
+        std::thread::spawn(move || {
+            // `wsl-notify-send.exe` flags: `--category` is the title;
+            // the positional is the body. Older versions accept the
+            // same shape; if a user has a different fork, an explicit
+            // backend = "dbus" override gets them off this path.
+            let _ = Command::new("wsl-notify-send.exe")
+                .arg("--category")
+                .arg(&payload.title)
+                .arg(&payload.body)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
+        Ok(())
+    }
+}
+
+/// Resolve a [`NotificationsBackend`] config value to a concrete
+/// [`Dispatcher`] plus a short human label for the startup log. `Auto`
+/// runs the platform probe described on the enum's docs; explicit
+/// variants pass through verbatim.
+///
+/// The label is the value the user would put in `~/.config/agent-mux/config.toml`
+/// (e.g. `"dbus"` for [`NotificationsBackend::Dbus`]) so the startup
+/// banner doubles as a hint for opting out of `Auto` if the probe
+/// misfires.
+#[must_use]
+pub fn pick_dispatcher(backend: NotificationsBackend) -> (Box<dyn Dispatcher>, &'static str) {
+    let resolved = match backend {
+        NotificationsBackend::Auto => detect_default_backend(),
+        other => other,
+    };
+    match resolved {
+        NotificationsBackend::Auto => unreachable!("detect_default_backend never returns Auto"),
+        NotificationsBackend::Dbus => (Box::new(LibNotifyDispatcher), "dbus"),
+        NotificationsBackend::Osascript => (Box::new(OsascriptDispatcher), "osascript"),
+        NotificationsBackend::WslToast => (Box::new(WslToastDispatcher), "wsl-toast"),
+    }
+}
+
+/// Auto-detect rule for `backend = "auto"`. Order matters: macOS check
+/// first (it's the strictest cfg gate), then WSL (which is also Linux
+/// but with a tell in `/proc/sys/kernel/osrelease`), then plain Linux.
+#[must_use]
+fn detect_default_backend() -> NotificationsBackend {
+    if cfg!(target_os = "macos") {
+        return NotificationsBackend::Osascript;
+    }
+    if is_wsl() {
+        return NotificationsBackend::WslToast;
+    }
+    NotificationsBackend::Dbus
+}
+
+/// True when running under Microsoft's WSL (1 or 2). The kernel's
+/// osrelease string carries `Microsoft` (WSL1) or `microsoft-standard-WSL2`
+/// (WSL2); both are detected.
+#[must_use]
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("microsoft") || lower.contains("wsl")
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -212,6 +331,83 @@ pub struct Transition<'a> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn pick_dispatcher_explicit_dbus_returns_dbus_label() {
+        let (_, label) = pick_dispatcher(NotificationsBackend::Dbus);
+        assert_eq!(label, "dbus");
+    }
+
+    #[test]
+    fn pick_dispatcher_explicit_osascript_returns_osascript_label() {
+        let (_, label) = pick_dispatcher(NotificationsBackend::Osascript);
+        assert_eq!(label, "osascript");
+    }
+
+    #[test]
+    fn pick_dispatcher_explicit_wsl_toast_returns_wsl_toast_label() {
+        let (_, label) = pick_dispatcher(NotificationsBackend::WslToast);
+        assert_eq!(label, "wsl-toast");
+    }
+
+    #[test]
+    fn build_osascript_escapes_embedded_double_quotes_in_title_and_body() {
+        // A session title with a literal `"` would otherwise close the
+        // surrounding string in the script source, breaking syntax.
+        let payload = Payload {
+            title: r#"refactor "preview""#.into(),
+            body: r#"local · /tmp/dir "with quotes""#.into(),
+            sound: false,
+        };
+        let script = build_osascript(&payload);
+        assert!(
+            script.contains(r#"\"preview\""#),
+            "title quote not escaped:\n{script}",
+        );
+        assert!(
+            script.contains(r#"\"with quotes\""#),
+            "body quote not escaped:\n{script}",
+        );
+    }
+
+    #[test]
+    fn build_osascript_appends_sound_name_when_sound_requested() {
+        let payload = Payload {
+            title: "x".into(),
+            body: "y".into(),
+            sound: true,
+        };
+        assert!(
+            build_osascript(&payload).contains("sound name \"default\""),
+            "sound clause missing",
+        );
+    }
+
+    #[test]
+    fn build_osascript_omits_sound_name_when_silent() {
+        let payload = Payload {
+            title: "x".into(),
+            body: "y".into(),
+            sound: false,
+        };
+        assert!(
+            !build_osascript(&payload).contains("sound name"),
+            "sound clause should be absent",
+        );
+    }
+
+    #[test]
+    fn pick_dispatcher_auto_returns_one_of_the_real_backends() {
+        // Auto runs the platform probe; on every supported host we
+        // should land on one of the three concrete labels, never on
+        // "auto" (which would imply detect_default_backend leaked the
+        // input variant back out).
+        let (_, label) = pick_dispatcher(NotificationsBackend::Auto);
+        assert!(
+            matches!(label, "dbus" | "osascript" | "wsl-toast"),
+            "got: {label}",
+        );
+    }
 
     /// Test dispatcher that records every payload it receives. Wrapped
     /// in `Arc<Mutex<…>>` so test code can inspect the log after the

@@ -71,6 +71,11 @@ ssh = "alpenglow"  # ~/.ssh/config alias, or "user@host"
 enabled = true          # master on/off
 sound = false           # play the OS "default" notification sound
 disabled_hosts = []     # host labels to silence entirely
+# backend = "auto"      # one of: auto, dbus, osascript, wsl-toast.
+                        # auto picks per-OS at startup; explicit values
+                        # override the probe. The picked backend is
+                        # logged to stderr at startup so silent failures
+                        # become visible in your scrollback.
 
 # Theme overrides. Pick a built-in palette via `preset`, then optionally
 # override individual fields. Each value is a string: named ANSI colour,

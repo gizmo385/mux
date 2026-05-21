@@ -209,7 +209,7 @@ impl AttachmentDriver for TmuxDriver {
 
 impl TmuxDriver {
     fn attach_local(session: &Session) -> Result<AttachOutcome, AttachError> {
-        if let Ok(target) = find_pane_local(&session.project_dir) {
+        if let Ok(target) = find_pane_local(session) {
             return Self::switch_to_live(&target);
         }
         // No live pane (either tmux says NotFound, or there's no tmux server
@@ -321,7 +321,7 @@ impl TmuxDriver {
     /// local tmux window (yes, nested tmux — see README); outside-tmux,
     /// we `SuspendAndRun` the ssh directly.
     fn attach_remote(session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
-        match find_pane_remote(host, &session.project_dir) {
+        match find_pane_remote(host, session) {
             Ok(target) => Self::run_remote_interactive(host, &["tmux", "attach", "-t", &target]),
             Err(AttachError::NotFound) => Self::resume_remote(session, host),
             Err(other) => Err(other),
@@ -413,20 +413,43 @@ impl TmuxDriver {
     }
 }
 
-/// List the `pane_current_path` of every live tmux pane on `host`.
-/// Returns an empty Vec on any failure — no tmux server, ssh hiccup,
-/// non-zero exit, parse error. The dashboard's pane-presence indicator
-/// is strictly advisory (the attach path's `claude --resume` fallback
-/// covers stale state), so failures must not surface as errors.
+/// Snapshot of live tmux panes on `host`: each pane's owning
+/// `session_name` paired with its `pane_current_path`. Used by the
+/// dashboard's per-session "live pane?" indicator and by the
+/// attach-side `find_pane_local` / `find_pane_remote` resolution.
+///
+/// Returning both fields together (rather than two separate
+/// invocations) keeps the poller to one round-trip per tick — same
+/// cost as the pre-2026-05-20 cwd-only call. Session names
+/// disambiguate the "two sessions in the same `project_dir`" collision
+/// that cwd-only matching otherwise resolves arbitrarily.
+#[derive(Debug, Clone, Default)]
+pub struct LivePaneSnapshot {
+    pub cwds: Vec<PathBuf>,
+    pub session_names: Vec<String>,
+}
+
+/// List the live tmux panes on `host` — their owning `session_name`
+/// and `pane_current_path`. Returns an empty snapshot on any failure —
+/// no tmux server, ssh hiccup, non-zero exit, parse error. The
+/// dashboard's pane-presence indicator is strictly advisory (the
+/// attach path's `claude --resume` fallback covers stale state), so
+/// failures must not surface as errors.
 ///
 /// Dispatches by host: local invokes `tmux` directly, remote shells
 /// out via `host.ssh_argv(false, ...)` over the existing
-/// `ControlMaster`. Output format is `#{pane_current_path}` one path
-/// per line — narrower than the attach-side query, since the
-/// indicator only needs the cwd, not a target identifier.
+/// `ControlMaster`. Output format is `#{session_name}\t#{pane_current_path}`
+/// — tab keeps cwds with spaces intact, and tmux's default session
+/// naming rules disallow tabs in names so the parser doesn't have to
+/// guess the split.
 #[must_use]
-pub fn list_live_pane_cwds(host: &dyn Host) -> Vec<PathBuf> {
-    let tmux_args = ["list-panes", "-a", "-F", "#{pane_current_path}"];
+pub fn list_live_panes(host: &dyn Host) -> LivePaneSnapshot {
+    let tmux_args = [
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}\t#{pane_current_path}",
+    ];
     let output = if host.id().is_local() {
         Command::new("tmux").args(tmux_args).output()
     } else {
@@ -437,35 +460,47 @@ pub fn list_live_pane_cwds(host: &dyn Host) -> Vec<PathBuf> {
         let mut remote_cmd = vec!["tmux"];
         remote_cmd.extend(tmux_args);
         let Some(argv) = host.ssh_argv(false, &remote_cmd) else {
-            return Vec::new();
+            return LivePaneSnapshot::default();
         };
         let Some((program, rest)) = argv.split_first() else {
-            return Vec::new();
+            return LivePaneSnapshot::default();
         };
         Command::new(program).args(rest).output()
     };
     let Ok(output) = output else {
-        return Vec::new();
+        return LivePaneSnapshot::default();
     };
     if !output.status.success() {
-        return Vec::new();
+        return LivePaneSnapshot::default();
     }
-    parse_pane_cwds(&String::from_utf8_lossy(&output.stdout))
+    parse_pane_records(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Pure parser: one path per line, blank lines skipped. Trims trailing
-/// newlines but otherwise treats the path as the entire line so cwds
-/// containing whitespace round-trip cleanly.
+/// Pure parser for `#{session_name}\t#{pane_current_path}` records:
+/// one pane per line, blank lines skipped, lines without a tab
+/// dropped (defensive — should not occur with the format string above
+/// but a malformed line shouldn't poison the whole snapshot).
 #[must_use]
-pub fn parse_pane_cwds(tmux_output: &str) -> Vec<PathBuf> {
-    tmux_output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect()
+pub fn parse_pane_records(tmux_output: &str) -> LivePaneSnapshot {
+    let mut cwds = Vec::new();
+    let mut session_names = Vec::new();
+    for line in tmux_output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, cwd)) = line.split_once('\t') else {
+            continue;
+        };
+        session_names.push(name.to_string());
+        cwds.push(PathBuf::from(cwd));
+    }
+    LivePaneSnapshot {
+        cwds,
+        session_names,
+    }
 }
 
-fn find_pane_remote(host: &dyn Host, project_dir: &Path) -> Result<String, AttachError> {
+fn find_pane_remote(host: &dyn Host, session: &Session) -> Result<String, AttachError> {
     // -F format starts with `#{...}` — `Host::ssh_argv` shell-quotes
     // each remote_cmd element so the leading `#` survives the remote
     // shell tokenizer (which would otherwise eat it as a comment).
@@ -495,7 +530,7 @@ fn find_pane_remote(host: &dyn Host, project_dir: &Path) -> Result<String, Attac
         return Err(AttachError::NotFound);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_pane_match(&stdout, project_dir).ok_or(AttachError::NotFound)
+    resolve_pane_target(&stdout, session).ok_or(AttachError::NotFound)
 }
 
 // ---------- PtyDriver ----------
@@ -605,7 +640,7 @@ impl PtyDriver {
     /// `Err`. Returning `AttachOutcome` directly keeps the local
     /// branch readable; the dispatcher in `attach` wraps it in `Ok`.
     fn attach_local(session: &Session) -> AttachOutcome {
-        let argv = match find_pane_local(&session.project_dir) {
+        let argv = match find_pane_local(session) {
             Ok(target) => tmux_attach_argv(&target),
             // `TmuxCommandFailed` here means tmux isn't running or
             // list-panes errored — same condition the legacy driver
@@ -763,7 +798,7 @@ impl PtyDriver {
     /// identical to the `SuspendAndRun` path so the embedded widget
     /// sees the same argv the legacy outside-tmux path would.
     fn attach_remote(session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
-        let remote_cmd = match find_pane_remote(host, &session.project_dir) {
+        let remote_cmd = match find_pane_remote(host, session) {
             Ok(target) => tmux_attach_argv(&target),
             Err(AttachError::NotFound) => tmux_resume_argv(session),
             Err(other) => return Err(other),
@@ -920,7 +955,7 @@ fn user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
 }
 
-fn find_pane_local(project_dir: &Path) -> Result<String, AttachError> {
+fn find_pane_local(session: &Session) -> Result<String, AttachError> {
     let output = Command::new("tmux")
         .args([
             "list-panes",
@@ -936,19 +971,48 @@ fn find_pane_local(project_dir: &Path) -> Result<String, AttachError> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_pane_match(&stdout, project_dir).ok_or(AttachError::NotFound)
+    resolve_pane_target(&stdout, session).ok_or(AttachError::NotFound)
 }
 
-fn parse_pane_match(tmux_output: &str, project_dir: &Path) -> Option<String> {
+/// Resolve the tmux target for `session` from the output of
+/// `tmux list-panes -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_path}'`.
+///
+/// Two-stage lookup, in priority order:
+///
+/// 1. Pane in a tmux session named `agent-mux-<session.id.0>`. That's
+///    the deterministic name `tmux_resume_argv` uses, so once a
+///    session has been re-attached at least once (taking the resume
+///    fallback path) we have an unambiguous pin from `session_id` to
+///    tmux session — even when multiple sessions share a cwd. This
+///    resolves the "two rows collapse onto the same pane" bug from
+///    the cwd-only fallback below.
+///
+/// 2. First pane whose `pane_current_path` matches `session.project_dir`.
+///    Catches externally-created sessions and agent-mux sessions
+///    whose user-side embedded pane is still on the auto-named tmux
+///    session from the initial `spawn_session_local` (before any
+///    re-attach has consolidated onto the deterministic name).
+///
+/// Sessions sharing one cwd that *also* lack a deterministic name
+/// will still collide on the first cwd match. That's a known
+/// limitation; the affordance to fully disambiguate them is filed in
+/// TODO.
+#[must_use]
+fn resolve_pane_target(tmux_output: &str, session: &Session) -> Option<String> {
+    let preferred = format!("agent-mux-{}", session.id.0);
+    let mut cwd_match: Option<String> = None;
     for line in tmux_output.lines() {
         let Some((target, path)) = line.split_once(' ') else {
             continue;
         };
-        if Path::new(path) == project_dir {
+        if target.starts_with(&format!("{preferred}:")) {
             return Some(target.to_string());
         }
+        if cwd_match.is_none() && Path::new(path) == session.project_dir {
+            cwd_match = Some(target.to_string());
+        }
     }
-    None
+    cwd_match
 }
 
 fn run_tmux(args: &[&str]) -> Result<(), AttachError> {
@@ -970,40 +1034,87 @@ mod tests {
     use crate::host::LocalHost;
     use crate::session::HostId;
 
+    fn test_session(id: &str, project_dir: &str) -> Session {
+        use crate::session::{Attention, HostId, Session, SessionId};
+        Session {
+            id: SessionId(id.to_string()),
+            host: HostId::local(),
+            project_dir: PathBuf::from(project_dir),
+            transcript_path: PathBuf::from("/transcripts/x.jsonl"),
+            last_activity: std::time::SystemTime::UNIX_EPOCH,
+            attention: Attention::Unknown,
+            title: None,
+            parent_repo: None,
+            has_live_pane: None,
+        }
+    }
+
     #[test]
-    fn parse_match_finds_exact_path() {
+    fn resolve_pane_target_finds_exact_cwd_match() {
         let out = "main:0.0 /home/u/proj\n\
              main:1.0 /home/u/other\n";
-        let got = parse_pane_match(out, Path::new("/home/u/proj"));
+        let s = test_session("abc", "/home/u/proj");
+        let got = resolve_pane_target(out, &s);
         assert_eq!(got, Some("main:0.0".to_string()));
     }
 
     #[test]
-    fn parse_match_returns_none_when_no_match() {
+    fn resolve_pane_target_returns_none_when_no_match() {
         let out = "main:0.0 /home/u/a\nmain:1.0 /home/u/b\n";
-        assert_eq!(parse_pane_match(out, Path::new("/home/u/c")), None);
+        let s = test_session("abc", "/home/u/c");
+        assert_eq!(resolve_pane_target(out, &s), None);
     }
 
     #[test]
-    fn parse_match_handles_paths_with_spaces() {
+    fn resolve_pane_target_handles_paths_with_spaces() {
         let out = "main:0.0 /home/u/path with spaces\n";
-        let got = parse_pane_match(out, Path::new("/home/u/path with spaces"));
+        let s = test_session("abc", "/home/u/path with spaces");
+        let got = resolve_pane_target(out, &s);
         assert_eq!(got, Some("main:0.0".to_string()));
     }
 
     #[test]
-    fn parse_match_skips_malformed_lines() {
+    fn resolve_pane_target_skips_malformed_lines() {
         let out = "garbage_without_space\nmain:0.0 /good/path\n";
-        let got = parse_pane_match(out, Path::new("/good/path"));
+        let s = test_session("abc", "/good/path");
+        let got = resolve_pane_target(out, &s);
         assert_eq!(got, Some("main:0.0".to_string()));
     }
 
     #[test]
-    fn parse_match_picks_first_when_multiple() {
-        let out = "a:0.0 /home/u/proj\n\
-             b:1.0 /home/u/proj\n";
-        let got = parse_pane_match(out, Path::new("/home/u/proj"));
-        assert_eq!(got, Some("a:0.0".to_string()));
+    fn resolve_pane_target_prefers_agent_mux_session_name_over_cwd_collision() {
+        // Two panes share the same cwd. Without name preference, the
+        // first one wins arbitrarily and two sidebar rows collapse
+        // onto the same pane. With name preference, the
+        // `agent-mux-<id>` pane wins for the session it belongs to.
+        let out = "other:0.0 /home/u/proj\n\
+             agent-mux-target-id:1.0 /home/u/proj\n";
+        let s = test_session("target-id", "/home/u/proj");
+        let got = resolve_pane_target(out, &s);
+        assert_eq!(got, Some("agent-mux-target-id:1.0".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_target_falls_back_to_cwd_when_no_named_session_present() {
+        // No `agent-mux-<id>` pane exists; the cwd-matching pane is
+        // the right answer for externally-created or never-re-attached
+        // sessions.
+        let out = "other:0.0 /home/u/proj\n";
+        let s = test_session("missing-named", "/home/u/proj");
+        let got = resolve_pane_target(out, &s);
+        assert_eq!(got, Some("other:0.0".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_target_picks_named_match_even_when_cwd_differs() {
+        // If `agent-mux-<id>` exists but its cwd no longer matches
+        // project_dir (the user `cd`'d inside the pane), the named
+        // match still wins — it's the deterministic pin.
+        let out = "agent-mux-abc:0.0 /tmp/elsewhere\n\
+             beta:1.0 /home/u/proj\n";
+        let s = test_session("abc", "/home/u/proj");
+        let got = resolve_pane_target(out, &s);
+        assert_eq!(got, Some("agent-mux-abc:0.0".to_string()));
     }
 
     #[test]
@@ -1323,47 +1434,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_cwds_extracts_one_path_per_line() {
-        let out = "/home/u/proj\n/home/u/other\n";
+    fn parse_pane_records_extracts_session_and_cwd_per_line() {
+        let out = "main\t/home/u/proj\nagent-mux-abc\t/home/u/other\n";
+        let snap = parse_pane_records(out);
         assert_eq!(
-            parse_pane_cwds(out),
+            snap.cwds,
             vec![
                 PathBuf::from("/home/u/proj"),
                 PathBuf::from("/home/u/other")
             ]
         );
+        assert_eq!(snap.session_names, vec!["main", "agent-mux-abc"]);
     }
 
     #[test]
-    fn parse_pane_cwds_skips_blank_lines() {
-        // A stray blank line should not produce a `PathBuf::from("")`
-        // — the indicator would never match an empty project_dir, but
-        // keeping the parser clean avoids surprising debug output.
-        let out = "/a\n\n/b\n";
-        assert_eq!(
-            parse_pane_cwds(out),
-            vec![PathBuf::from("/a"), PathBuf::from("/b")]
-        );
+    fn parse_pane_records_skips_blank_lines() {
+        let out = "main\t/a\n\nbeta\t/b\n";
+        let snap = parse_pane_records(out);
+        assert_eq!(snap.cwds, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(snap.session_names, vec!["main", "beta"]);
     }
 
     #[test]
-    fn parse_pane_cwds_handles_paths_with_spaces() {
-        // The pane lister uses `#{pane_current_path}` with no separator,
-        // so a single line *is* the whole path. This is why we don't
-        // share parse_pane_match's split_once(' ') logic.
-        let out = "/home/u/path with spaces\n";
-        assert_eq!(
-            parse_pane_cwds(out),
-            vec![PathBuf::from("/home/u/path with spaces")]
-        );
+    fn parse_pane_records_handles_cwds_with_spaces() {
+        // Spaces in cwds round-trip — tab is the field separator, not
+        // space.
+        let out = "main\t/home/u/path with spaces\n";
+        let snap = parse_pane_records(out);
+        assert_eq!(snap.cwds, vec![PathBuf::from("/home/u/path with spaces")]);
+        assert_eq!(snap.session_names, vec!["main"]);
     }
 
     #[test]
-    fn parse_pane_cwds_returns_empty_for_empty_input() {
+    fn parse_pane_records_drops_lines_without_tab() {
+        // A malformed line (no tab) shouldn't poison the whole
+        // snapshot — defensive against tmux format changes.
+        let out = "no_tab_here\nmain\t/good/path\n";
+        let snap = parse_pane_records(out);
+        assert_eq!(snap.cwds, vec![PathBuf::from("/good/path")]);
+        assert_eq!(snap.session_names, vec!["main"]);
+    }
+
+    #[test]
+    fn parse_pane_records_returns_empty_for_empty_input() {
         // No tmux server / no panes / failed shell-out all collapse to
         // an empty list. The caller treats this as "no live panes",
         // which means every session on that host gets `has_live_pane = Some(false)`.
-        assert_eq!(parse_pane_cwds(""), Vec::<PathBuf>::new());
+        let snap = parse_pane_records("");
+        assert!(snap.cwds.is_empty());
+        assert!(snap.session_names.is_empty());
     }
 
     #[test]

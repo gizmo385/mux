@@ -1171,9 +1171,28 @@ impl App {
                 WatcherEvent::NewTranscript { host, path, mtime } => {
                     self.handle_new_transcript(&host, &path, mtime);
                 }
-                WatcherEvent::LivePanes { host, cwds } => {
-                    let set: HashSet<PathBuf> = cwds.into_iter().collect();
-                    self.catalog.apply_live_panes(&host, &set);
+                WatcherEvent::LivePanes {
+                    host,
+                    cwds,
+                    session_names,
+                } => {
+                    let cwd_set: HashSet<PathBuf> = cwds.into_iter().collect();
+                    // Map the tmux-naming convention `agent-mux-<id>`
+                    // to opaque `SessionId`s here so the catalog never
+                    // deals in tmux strings (per the "tmux specifics
+                    // live behind the Attachment Driver" discipline in
+                    // ARCHITECTURE.md). The convention itself is owned
+                    // by `tmux_resume_argv` in `attachment.rs`; this
+                    // call site recognises the inverse mapping.
+                    let live_session_ids: HashSet<SessionId> = session_names
+                        .into_iter()
+                        .filter_map(|name| {
+                            name.strip_prefix("agent-mux-")
+                                .map(|id| SessionId(id.into()))
+                        })
+                        .collect();
+                    self.catalog
+                        .apply_live_panes(&host, &cwd_set, &live_session_ids);
                 }
             }
         }

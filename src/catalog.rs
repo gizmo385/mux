@@ -75,18 +75,40 @@ impl SessionCatalog {
     }
 
     /// Apply a fresh pane-presence snapshot from the pane poller for
-    /// one host: for every session on `host_id`, set `has_live_pane`
-    /// to `Some(true)` iff its `project_dir` appears in `cwds`,
-    /// otherwise `Some(false)`. Sessions on other hosts are untouched.
+    /// one host. Two-stage match per session, mirroring the attach
+    /// path's `resolve_pane_target` so the indicator agrees with what
+    /// Enter will actually do:
     ///
-    /// A pane poller failure (no tmux, ssh hiccup) surfaces as an
-    /// empty `cwds` set — every session on that host transitions to
-    /// `Some(false)`, which matches the user-visible reality
-    /// (Enter will fall through to `claude --resume`).
-    pub fn apply_live_panes(&mut self, host_id: &HostId, cwds: &HashSet<PathBuf>) {
+    /// 1. If the session's id appears in `live_session_ids`, it has a
+    ///    deterministic live pane (the resume-fallback's
+    ///    `agent-mux-<id>` tmux session is up) — `Some(true)`.
+    /// 2. Otherwise, if `session.project_dir` is in `cwds`, fall back
+    ///    to the cwd match — `Some(true)`. (Catches externally-created
+    ///    sessions and agent-mux sessions whose embedded pane is
+    ///    still on tmux's auto-assigned name from spawn.)
+    /// 3. Otherwise `Some(false)`.
+    ///
+    /// The set is keyed by `SessionId` rather than by tmux session
+    /// name so the catalog never deals in tmux strings — the caller
+    /// (orchestrator-level) maps the tmux convention
+    /// (`agent-mux-<id>`) into ids before invoking this method.
+    ///
+    /// Sessions on other hosts are untouched. A pane poller failure
+    /// (no tmux, ssh hiccup) surfaces as empty sets — every session
+    /// on that host transitions to `Some(false)`, matching the
+    /// user-visible reality (Enter will fall through to `claude
+    /// --resume`).
+    pub fn apply_live_panes(
+        &mut self,
+        host_id: &HostId,
+        cwds: &HashSet<PathBuf>,
+        live_session_ids: &HashSet<SessionId>,
+    ) {
         for session in &mut self.sessions {
             if &session.host == host_id {
-                session.has_live_pane = Some(cwds.contains(&session.project_dir));
+                let named = live_session_ids.contains(&session.id);
+                let cwd_match = cwds.contains(&session.project_dir);
+                session.has_live_pane = Some(named || cwd_match);
             }
         }
     }
@@ -241,7 +263,7 @@ mod tests {
 
         let mut cwds = HashSet::new();
         cwds.insert(PathBuf::from("/work/a"));
-        c.apply_live_panes(&host, &cwds);
+        c.apply_live_panes(&host, &cwds, &HashSet::new());
 
         assert_eq!(c.sessions()[0].has_live_pane, Some(true));
         assert_eq!(c.sessions()[1].has_live_pane, Some(false));
@@ -255,7 +277,7 @@ mod tests {
         c.add(session_on("a1", a.clone()));
         c.add(session_on("b1", b.clone()));
 
-        c.apply_live_panes(&a, &HashSet::new());
+        c.apply_live_panes(&a, &HashSet::new(), &HashSet::new());
         // Both alpha sessions get a snapshot decision...
         assert_eq!(c.sessions()[0].has_live_pane, Some(false));
         // ...but beta is unchanged from its default.
@@ -265,15 +287,62 @@ mod tests {
     #[test]
     fn apply_live_panes_empty_set_marks_every_session_false() {
         // Failure-mode contract: a pane poller error (no tmux server)
-        // surfaces as an empty cwds set, which means every session on
+        // surfaces as empty cwds + names, which means every session on
         // that host is marked as not having a live pane.
         let mut c = SessionCatalog::new();
         let host = HostId("alpha".into());
         c.add(session_on("a", host.clone()));
         c.add(session_on("b", host.clone()));
-        c.apply_live_panes(&host, &HashSet::new());
+        c.apply_live_panes(&host, &HashSet::new(), &HashSet::new());
         assert_eq!(c.sessions()[0].has_live_pane, Some(false));
         assert_eq!(c.sessions()[1].has_live_pane, Some(false));
+    }
+
+    #[test]
+    fn apply_live_panes_marks_true_via_live_session_id_even_when_cwd_differs() {
+        // Deterministic-pin wins independently of cwd — the orchestrator
+        // has resolved an `agent-mux-<id>` tmux session into the
+        // SessionId set, and the catalog respects it without knowing
+        // the tmux naming convention itself.
+        let mut c = SessionCatalog::new();
+        let host = HostId("alpha".into());
+        let mut s = session_on("abc", host.clone());
+        s.project_dir = PathBuf::from("/work/proj");
+        c.add(s);
+
+        let mut ids = HashSet::new();
+        ids.insert(SessionId("abc".into()));
+        c.apply_live_panes(&host, &HashSet::new(), &ids);
+
+        assert_eq!(c.sessions()[0].has_live_pane, Some(true));
+    }
+
+    #[test]
+    fn apply_live_panes_resolves_per_session_when_two_sessions_share_a_cwd() {
+        // Two sessions share a project_dir; only one has a
+        // deterministic-pin live session id. The named one is `Some(true)`
+        // via the id set; the unnamed one falls back to the cwd match
+        // and is also `Some(true)` — preserving externally-created
+        // session behaviour. The attach-side `find_pane_local` gives
+        // the named session priority; here we just pin the indicator.
+        let mut c = SessionCatalog::new();
+        let host = HostId("alpha".into());
+        let cwd = PathBuf::from("/work/proj");
+        let mut a = session_on("abc", host.clone());
+        a.project_dir = cwd.clone();
+        let mut b = session_on("xyz", host.clone());
+        b.project_dir = cwd.clone();
+        c.add(a);
+        c.add(b);
+
+        let mut cwds = HashSet::new();
+        cwds.insert(cwd);
+        let mut ids = HashSet::new();
+        ids.insert(SessionId("abc".into()));
+        c.apply_live_panes(&host, &cwds, &ids);
+
+        assert_eq!(c.sessions()[0].has_live_pane, Some(true)); // id-pinned
+        assert_eq!(c.sessions()[1].has_live_pane, Some(true)); // cwd fallback
     }
 
     #[test]

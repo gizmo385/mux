@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
-use crate::attachment::list_live_pane_cwds;
+use crate::attachment::list_live_panes;
 use crate::host::Host;
 use crate::session::{Attention, HostId, SessionId};
 
@@ -56,17 +56,21 @@ pub enum WatcherEvent {
         path: PathBuf,
         mtime: SystemTime,
     },
-    /// Snapshot of every live tmux pane's `pane_current_path` on
-    /// `host`, as of the latest pane-poll tick. The catalog uses
-    /// this to decide per-session whether Enter will be a fast
-    /// switch (a pane matches the session's `project_dir`) vs an
+    /// Snapshot of every live tmux pane on `host`: `cwds` carries
+    /// each pane's `pane_current_path`, `session_names` carries each
+    /// pane's owning tmux `session_name`. Indices align: index `i` of
+    /// `cwds` describes the same pane as index `i` of `session_names`.
+    /// The catalog uses this to decide per-session whether Enter will
+    /// be a fast switch (deterministic `agent-mux-<id>` tmux session
+    /// exists, or a pane matches the session's `project_dir`) vs an
     /// auto-resume (no match — fall through to `claude --resume`).
-    /// An empty `cwds` is a valid value (it means no live panes /
-    /// no tmux server / ssh hiccup) — every session on the host
-    /// transitions to `Some(false)` in that case.
+    /// Empty lists are a valid value (no live panes / no tmux server
+    /// / ssh hiccup) — every session on the host transitions to
+    /// `Some(false)` in that case.
     LivePanes {
         host: HostId,
         cwds: Vec<PathBuf>,
+        session_names: Vec<String>,
     },
 }
 
@@ -336,11 +340,12 @@ impl TranscriptWatcher {
         thread::spawn(move || {
             let host_id = host.id().clone();
             loop {
-                let cwds = list_live_pane_cwds(host.as_ref());
+                let snap = list_live_panes(host.as_ref());
                 if tx
                     .send(WatcherEvent::LivePanes {
                         host: host_id.clone(),
-                        cwds,
+                        cwds: snap.cwds,
+                        session_names: snap.session_names,
                     })
                     .is_err()
                 {

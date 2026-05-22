@@ -55,18 +55,37 @@ use std::time::{Duration, SystemTime};
 use crate::session::SessionId;
 use crate::watcher::WatcherEvent;
 
-/// Directory under the user's cache root where the hook subcommand
-/// writes marker files and the dashboard watches for them. Picked at
-/// runtime via [`default_hook_dir`] (uses `dirs::cache_dir()`).
-pub const HOOK_DIR_NAME: &str = "agent-mux/hooks";
+/// Subdirectory name (relative to the Claude Code transcripts root)
+/// where hook markers land. The dot prefix keeps it out of the
+/// `<root>/<project-hash>/` layout the existing transcript poller
+/// walks for `.jsonl` files. Local sessions land in the local
+/// `<root>/.agent-mux-hooks/`; remote sessions land in the remote's
+/// `<remote-root>/.agent-mux-hooks/` and the per-host SSH poller
+/// picks them up.
+pub const HOOK_SUBDIR: &str = ".agent-mux-hooks";
 
-/// Default per-platform hook directory: `~/Library/Caches/agent-mux/hooks`
-/// on macOS, `$XDG_CACHE_HOME/agent-mux/hooks` (typically
-/// `~/.cache/agent-mux/hooks`) on Linux. `None` when no cache root
-/// resolves — the subcommand surfaces this loudly rather than silently
-/// writing to `$PWD`.
+/// Compute the hook-marker directory for a Claude Code transcripts
+/// root. Used both by the dashboard's local watcher (against the
+/// locally-resolved transcripts root) and by the remote-poller
+/// addition (against each `[hosts.<name>].transcript_root`). The
+/// unified path means a single `agent-mux hook` subcommand
+/// implementation works identically on local and remote machines.
 #[must_use]
-pub fn default_hook_dir() -> Option<PathBuf> {
+pub fn hook_dir_for_transcripts_root(root: &Path) -> PathBuf {
+    root.join(HOOK_SUBDIR)
+}
+
+/// Best-effort cache-dir fallback used only when the hook payload
+/// arrives without a `transcript_path` field — production Claude Code
+/// payloads always include it, so this path exists for malformed /
+/// hand-crafted callers (e.g. our own smoke tests) and is
+/// deliberately not where real markers land.
+///
+/// Returns `~/Library/Caches/agent-mux/hooks` on macOS,
+/// `$XDG_CACHE_HOME/agent-mux/hooks` on Linux, or `None` when no
+/// cache root resolves.
+#[must_use]
+pub fn fallback_hook_dir() -> Option<PathBuf> {
     dirs::cache_dir().map(|c| c.join("agent-mux").join("hooks"))
 }
 
@@ -113,7 +132,7 @@ pub struct HookEvent {
 /// loudly.
 pub fn receive_hook_from_stdin<R: Read, W: Write>(
     stdin_reader: &mut R,
-    hook_dir: &Path,
+    fallback_dir: &Path,
     now: SystemTime,
     stderr_log: &mut W,
 ) -> io::Result<Option<PathBuf>> {
@@ -124,11 +143,14 @@ pub fn receive_hook_from_stdin<R: Read, W: Write>(
     let notification_type = parse_notification_type(&buf);
     let type_label = notification_type.as_deref().unwrap_or("<missing>");
     if is_input_required_type(notification_type.as_deref()) {
+        let target_dir =
+            target_dir_from_payload(&buf).unwrap_or_else(|| fallback_dir.to_path_buf());
         let _ = writeln!(
             stderr_log,
-            "agent-mux: hook notification_type={type_label} session_id={session_id} \u{2192} writing marker"
+            "agent-mux: hook notification_type={type_label} session_id={session_id} \u{2192} writing marker to {}",
+            target_dir.display()
         );
-        let path = persist_marker(hook_dir, &session_id, now, &buf)?;
+        let path = persist_marker(&target_dir, &session_id, now, &buf)?;
         Ok(Some(path))
     } else {
         let _ = writeln!(
@@ -137,6 +159,24 @@ pub fn receive_hook_from_stdin<R: Read, W: Write>(
         );
         Ok(None)
     }
+}
+
+/// Derive the marker target directory from a hook payload's
+/// `transcript_path` field. Real Claude Code payloads always include
+/// this — the path is `<transcripts-root>/<project-hash>/<session-id>.jsonl`,
+/// so the transcripts root is the parent of the parent, and the hook
+/// dir is `<root>/.agent-mux-hooks/`.
+///
+/// Returns `None` when the payload doesn't carry a usable
+/// `transcript_path` (malformed payloads, hand-crafted test calls,
+/// future schema changes). The caller falls back to its
+/// platform-defined location.
+#[must_use]
+fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let transcript_path = v.as_object()?.get("transcript_path")?.as_str()?;
+    let root = Path::new(transcript_path).parent()?.parent()?;
+    Some(hook_dir_for_transcripts_root(root))
 }
 
 /// Notification types we treat as "user input is required for this
@@ -254,8 +294,10 @@ fn unix_millis(t: SystemTime) -> u128 {
         .unwrap_or(0)
 }
 
-/// Parse a marker file into a [`HookEvent`]. Used by both the
-/// startup-sweep path and the live notify-event path.
+/// Parse a marker file into a [`HookEvent`]. Used by the local
+/// startup-sweep + notify-event path; the remote-host poller uses
+/// [`parse_marker_content`] instead because it already has the file
+/// content in hand (via `Host::read_many`).
 ///
 /// # Errors
 ///
@@ -263,13 +305,28 @@ fn unix_millis(t: SystemTime) -> u128 {
 /// `session_id`.
 pub fn parse_marker(path: &Path) -> io::Result<HookEvent> {
     let raw = fs::read_to_string(path)?;
-    let session_id = parse_session_id(&raw)
+    parse_marker_content(path, &raw)
+}
+
+/// Parse hook-event metadata out of an already-read marker payload.
+/// Used by the remote-host poller after bulk-reading hooks dir
+/// contents over SSH; `parse_marker` is the local sibling that does
+/// its own read first.
+///
+/// `path` is used only to derive `received_at` from the filename's
+/// millisecond prefix; the file at that path doesn't have to exist on
+/// the local filesystem (it lives on the remote in the remote-poller
+/// case). When the filename doesn't carry a millisecond prefix and a
+/// local stat is also unavailable, `received_at` defaults to the Unix
+/// epoch — caller can treat that as a degenerate-but-still-usable
+/// signal.
+///
+/// # Errors
+///
+/// Returns `io::Error` if the payload lacks a `session_id` field.
+pub fn parse_marker_content(path: &Path, raw: &str) -> io::Result<HookEvent> {
+    let session_id = parse_session_id(raw)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing session_id field"))?;
-    // `received_at` comes from the filename's millisecond prefix when
-    // present, falling back to the file's mtime. Filename-derived is
-    // the source of truth (it's what the producer stamped); mtime is
-    // only used if a marker arrived from somewhere that didn't use
-    // `persist_marker`.
     let received_at = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -281,7 +338,7 @@ pub fn parse_marker(path: &Path) -> io::Result<HookEvent> {
     Ok(HookEvent {
         session_id: SessionId(session_id),
         received_at,
-        raw_json: raw,
+        raw_json: raw.to_string(),
     })
 }
 

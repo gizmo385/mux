@@ -143,11 +143,15 @@ agent-mux install-hooks
 
 That edits `~/.claude/settings.json` to register `agent-mux hook` as a Notification handler, pointing at the binary that ran the command (resolved via `current_exe()`). It's idempotent — re-running it is a no-op when the entry is already there, and it updates the path in place if you've moved or reinstalled the binary. Your existing settings (theme, permissions, other hook types) are preserved; a one-time backup lands at `~/.claude/settings.json.bak` before the first write. Use `--dry-run` to preview the change without writing.
 
-Behind the scenes: the hook command writes a marker file under `~/Library/Caches/agent-mux/hooks/` (or `~/.cache/agent-mux/hooks/` on Linux); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification.
+Behind the scenes: the hook command writes a marker file under `<Claude Code transcripts root>/.agent-mux-hooks/` (typically `~/.claude/projects/.agent-mux-hooks/`); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification.
 
 To verify your wiring without waiting for a real permission prompt: run `agent-mux notify-test` to confirm the dispatcher fires end-to-end, then trigger any permission prompt in a Claude Code session and watch the dashboard.
 
-Sessions on remote hosts don't pick up hook events yet (the marker file would land on the remote box, out of reach of the local watcher) — they fall back to the heuristic. Remote hook support is a planned follow-up.
+### Remote hosts
+
+The hook command is the same on remote machines. SSH to each remote host you've configured in `agent-mux`, install the binary somewhere on `$PATH`, and run `agent-mux install-hooks` once. Hook events fired by Claude Code on the remote write markers to the remote's `<transcript_root>/.agent-mux-hooks/`; the local dashboard's per-host SSH poller picks them up on its 3-second cadence (same connection it already uses for transcript polling — no extra round-trip cost).
+
+Caveats: agent-mux must be on the remote's `$PATH` so `install-hooks` resolves the command correctly via `current_exe()`. If you rebuild or reinstall the binary on the remote, re-run `install-hooks` there to update the path; the installer is idempotent and only updates when needed.
 
 ## Setup
 

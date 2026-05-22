@@ -1346,6 +1346,12 @@ mod tests {
         fn write_file(&self, _: &Path, _: &str) -> std::io::Result<()> {
             unreachable!()
         }
+        fn list_files(&self, _: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+            unreachable!()
+        }
+        fn remove(&self, _: &Path) -> std::io::Result<()> {
+            unreachable!()
+        }
         fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>> {
             self.calls
                 .lock()

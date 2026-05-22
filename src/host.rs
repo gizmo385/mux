@@ -139,6 +139,34 @@ pub trait Host: Send + Sync {
     /// Propagates I/O errors from the local FS or the SSH transport.
     fn write_file(&self, path: &Path, content: &str) -> io::Result<()>;
 
+    /// Flat directory listing — every regular file directly inside
+    /// `dir` (no recursion), as absolute paths. Used by the hook-marker
+    /// ingest path: hooks land under `<transcripts-root>/.agent-mux-hooks/`
+    /// and the watcher needs to enumerate them per tick over the same
+    /// connection it already uses for transcript polling.
+    ///
+    /// Missing `dir` is **not** an error — returns an empty `Vec`. The
+    /// hook directory only exists after the first hook fires, so a
+    /// startup poll against a never-fired-yet host must succeed
+    /// cleanly rather than surface a transport failure.
+    ///
+    /// # Errors
+    /// Propagates transport-level failures only.
+    fn list_files(&self, dir: &Path) -> io::Result<Vec<PathBuf>>;
+
+    /// Delete a single file at `path`. A missing file is **not** an
+    /// error (idempotent — a hook marker that the watcher consumed
+    /// can be re-delete-attempted at startup without a spurious
+    /// failure). Anything else propagates.
+    ///
+    /// Used by the hook-marker ingest path to clean up after read so
+    /// the directory doesn't grow without bound. Sibling to
+    /// [`Host::write_file`] on the I/O surface.
+    ///
+    /// # Errors
+    /// Propagates I/O errors other than `NotFound`.
+    fn remove(&self, path: &Path) -> io::Result<()>;
+
     /// Build the argv that runs `remote_cmd` against this host.
     /// Returns `None` for local hosts (the caller runs `remote_cmd`
     /// directly). For SSH hosts, returns the argv that wraps it in an
@@ -267,6 +295,30 @@ impl Host for LocalHost {
 
     fn write_file(&self, path: &Path, content: &str) -> io::Result<()> {
         fs::write(path, content)
+    }
+
+    fn list_files(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                out.push(entry.path());
+            }
+        }
+        Ok(out)
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
@@ -539,6 +591,40 @@ impl Host for SshHost {
             .join(" ");
         script.push_str(&quoted);
         self.ssh_command().arg(&script).output()
+    }
+
+    fn list_files(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+        // `if [ -d DIR ]` folds the missing-dir case into "exit 0,
+        // empty stdout" — matches the trait contract that a never-
+        // fired-yet hook dir is not an error. `find -print0` is the
+        // GNU extension we already depend on for `list_transcripts`,
+        // so portability assumptions are unchanged.
+        let quoted = shell_quote_path(&dir.to_string_lossy());
+        let cmd = format!(
+            "if [ -d {quoted} ]; then \
+                find {quoted} -mindepth 1 -maxdepth 1 -type f -print0 2>/dev/null; \
+             fi"
+        );
+        let stdout = self.exec_script(&cmd)?;
+        let mut out = Vec::new();
+        for chunk in stdout.split(|&b| b == 0) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let path_str = std::str::from_utf8(chunk)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            out.push(PathBuf::from(path_str));
+        }
+        Ok(out)
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        // `rm -f` swallows the "file doesn't exist" case, matching
+        // the trait's idempotent contract — a marker we already
+        // ingested and deleted shouldn't fail a retry.
+        let quoted = shell_quote_path(&path.to_string_lossy());
+        self.exec_script(&format!("rm -f {quoted}"))?;
+        Ok(())
     }
 
     fn write_file(&self, path: &Path, content: &str) -> io::Result<()> {

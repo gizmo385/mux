@@ -329,9 +329,19 @@ impl TranscriptWatcher {
                 .into_iter()
                 .map(|(id, path, mtime)| (path, (id, mtime)))
                 .collect();
+            let hooks_dir = crate::hook_ingest::hook_dir_for_transcripts_root(&root);
             loop {
                 thread::sleep(interval);
                 if !poll_once(host.as_ref(), &host_id, &root, &mut known, &tx) {
+                    return;
+                }
+                // Sibling tick on the same SSH ControlMaster: drain
+                // any new hook markers in `<root>/.agent-mux-hooks/`
+                // and emit them as `WatcherEvent::Hook`. A failure
+                // here doesn't break attention polling — the next
+                // tick retries and a really broken host surfaces via
+                // `list_transcripts` failing anyway.
+                if !poll_hooks_once(host.as_ref(), &hooks_dir, &tx) {
                     return;
                 }
             }
@@ -377,6 +387,65 @@ impl TranscriptWatcher {
             }
         });
     }
+}
+
+/// One tick of the remote hook-marker drain. Lists files in
+/// `hooks_dir` over the same SSH connection the transcript poller
+/// uses, bulk-reads new markers, emits one [`WatcherEvent::Hook`]
+/// per successfully-parsed marker, then deletes the markers on the
+/// remote so the directory doesn't grow without bound.
+///
+/// Returns `false` iff the channel receiver dropped (dashboard
+/// exited); the polling thread breaks out of its loop in that case.
+/// All other failures — missing dir, partial reads, SSH hiccups,
+/// bad payloads — are swallowed silently so a transient remote
+/// issue doesn't break the polling cadence. Markers that fail to
+/// parse stay on the remote for human inspection (same contract as
+/// the local `ingest_marker` path).
+fn poll_hooks_once(host: &dyn Host, hooks_dir: &Path, tx: &Sender<WatcherEvent>) -> bool {
+    let Ok(paths) = host.list_files(hooks_dir) else {
+        return true;
+    };
+    // Skip mid-write `.tmp` artifacts for the same reason the local
+    // ingest path does — a tmp+rename producer can leave them
+    // briefly visible.
+    let marker_paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| p.extension().is_none_or(|e| e != "tmp"))
+        .collect();
+    if marker_paths.is_empty() {
+        return true;
+    }
+    let path_refs: Vec<&Path> = marker_paths.iter().map(PathBuf::as_path).collect();
+    let Ok(contents) = host.read_many(&path_refs) else {
+        return true;
+    };
+    for (path, content_result) in marker_paths.iter().zip(contents.into_iter()) {
+        let Ok(raw) = content_result else {
+            // Per-path NotFound / read failure — leave the marker
+            // for the next tick. (A removed-mid-tick file lands here
+            // and resolves itself.)
+            continue;
+        };
+        let Ok(event) = crate::hook_ingest::parse_marker_content(path, &raw) else {
+            // Bad payload stays on the remote for inspection.
+            continue;
+        };
+        if tx
+            .send(WatcherEvent::Hook {
+                id: event.session_id,
+                received_at: event.received_at,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        // Best-effort delete; a failed remove just means the next
+        // tick re-emits the same hook event, which the notifier's
+        // episodic-flag suppression collapses harmlessly.
+        let _ = host.remove(path);
+    }
+    true
 }
 
 /// One tick of the remote poller. Returns `false` iff the receiver
@@ -782,6 +851,27 @@ mod tests {
             unreachable!()
         }
 
+        fn list_files(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+            // Return every file in the map whose parent matches dir.
+            // Lets the hook-poller tests drive markers through the
+            // same in-memory store as transcripts.
+            let mut out: Vec<PathBuf> = self
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|p| p.parent() == Some(dir))
+                .cloned()
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            self.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+
         fn ssh_argv(&self, _tty: bool, _remote_cmd: &[&str]) -> Option<Vec<String>> {
             None
         }
@@ -941,6 +1031,12 @@ mod tests {
             fn write_file(&self, _: &Path, _: &str) -> io::Result<()> {
                 unreachable!()
             }
+            fn list_files(&self, _: &Path) -> io::Result<Vec<PathBuf>> {
+                Ok(Vec::new())
+            }
+            fn remove(&self, _: &Path) -> io::Result<()> {
+                Ok(())
+            }
             fn ssh_argv(&self, _: bool, _: &[&str]) -> Option<Vec<String>> {
                 None
             }
@@ -999,5 +1095,90 @@ mod tests {
         // `.hidden` has stem ".hidden" (no extension), so it does emit.
         // The point is no panic.
         assert!(!drain(&rx).is_empty());
+    }
+
+    // ---- poll_hooks_once ----
+
+    #[test]
+    fn poll_hooks_once_emits_event_per_marker_and_deletes_after_send() {
+        let host = MockHost::new("devbox");
+        let hooks_dir = PathBuf::from("/r/.agent-mux-hooks");
+        let marker = hooks_dir.join("0000000123456-sess-a.json");
+        host.put(
+            &marker,
+            r#"{"session_id":"sess-a","notification_type":"permission_prompt"}"#,
+            ts(1),
+        );
+        let (tx, rx) = mpsc::channel();
+        assert!(poll_hooks_once(&host, &hooks_dir, &tx));
+        let events = drain(&rx);
+        assert_eq!(events.len(), 1, "exactly one Hook event: {events:?}");
+        match &events[0] {
+            WatcherEvent::Hook { id, .. } => assert_eq!(id.0, "sess-a"),
+            other => panic!("expected Hook event, got {other:?}"),
+        }
+        // Successful ingest deletes the marker so the next tick
+        // doesn't re-emit (the notifier's episodic flag would
+        // collapse the duplicate, but the watcher shouldn't generate
+        // it in the first place).
+        assert!(host.list_files(&hooks_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn poll_hooks_once_skips_tmp_artifacts() {
+        // A producer mid-write leaves `<name>.tmp` briefly visible.
+        // The remote poller must not bulk-read it (the content is
+        // half-written) or delete it (the producer is still using it).
+        let host = MockHost::new("devbox");
+        let hooks_dir = PathBuf::from("/r/.agent-mux-hooks");
+        let tmp_path = hooks_dir.join("0000000000001-sess-b.json.tmp");
+        host.put(&tmp_path, r#"{"session_id":"sess-b"}"#, ts(1));
+        let (tx, rx) = mpsc::channel();
+        assert!(poll_hooks_once(&host, &hooks_dir, &tx));
+        assert!(drain(&rx).is_empty(), "must not emit for .tmp");
+        // The .tmp stays in place — producer still owns it.
+        let remaining = host.list_files(&hooks_dir).unwrap();
+        assert!(remaining.iter().any(|p| p == &tmp_path));
+    }
+
+    #[test]
+    fn poll_hooks_once_returns_true_when_dir_missing() {
+        // Fresh host that has never fired a hook — list_files returns
+        // empty, no events, no error.
+        let host = MockHost::new("devbox");
+        let (tx, rx) = mpsc::channel();
+        assert!(poll_hooks_once(
+            &host,
+            Path::new("/r/.agent-mux-hooks"),
+            &tx
+        ));
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[test]
+    fn poll_hooks_once_leaves_bad_payloads_on_disk_for_inspection() {
+        let host = MockHost::new("devbox");
+        let hooks_dir = PathBuf::from("/r/.agent-mux-hooks");
+        let bad = hooks_dir.join("0000000000001-bad.json");
+        host.put(&bad, "garbage", ts(1));
+        let (tx, rx) = mpsc::channel();
+        assert!(poll_hooks_once(&host, &hooks_dir, &tx));
+        assert!(drain(&rx).is_empty(), "no event for unparseable payload");
+        // Bad marker stays for a human to look at.
+        assert!(host.list_files(&hooks_dir).unwrap().contains(&bad));
+    }
+
+    #[test]
+    fn poll_hooks_once_returns_false_when_receiver_dropped() {
+        let host = MockHost::new("devbox");
+        let hooks_dir = PathBuf::from("/r/.agent-mux-hooks");
+        host.put(
+            &hooks_dir.join("0000000000001-s.json"),
+            r#"{"session_id":"s","notification_type":"idle_prompt"}"#,
+            ts(1),
+        );
+        let (tx, rx) = mpsc::channel::<WatcherEvent>();
+        drop(rx);
+        assert!(!poll_hooks_once(&host, &hooks_dir, &tx));
     }
 }

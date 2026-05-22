@@ -146,19 +146,21 @@ fn main() -> io::Result<()> {
             // Producer side of the Claude Code Notification hook
             // ingress. Reads payload from stdin; if the event is
             // input-required (permission/idle/elicitation prompt),
-            // writes a marker file the running dashboard's watcher
-            // picks up. Other notification types (auth_success,
-            // post-elicitation completions, anything unrecognised) are
-            // logged to stderr and dropped so the user doesn't get a
-            // ping per tool finish. Fire-and-forget — exits as soon
-            // as the marker is on disk (or skipped) so Claude Code's
-            // hook pipeline isn't blocked on agent-mux's UI thread.
-            let dir = agent_mux::hook_ingest::default_hook_dir()
+            // writes a marker file to
+            // `<transcripts-root>/.agent-mux-hooks/<unix-millis>-<sid>.json`.
+            // The transcripts root comes from the payload's
+            // `transcript_path` field — same path shape on local and
+            // remote machines, so the local watcher and the remote
+            // poller find markers at the same relative location. The
+            // cache-dir fallback only fires for malformed payloads
+            // missing `transcript_path` (production payloads always
+            // include it).
+            let fallback = agent_mux::hook_ingest::fallback_hook_dir()
                 .ok_or_else(|| io::Error::other("no cache directory resolved on this platform"))?;
             let mut stderr = io::stderr();
             match agent_mux::hook_ingest::receive_hook_from_stdin(
                 &mut io::stdin().lock(),
-                &dir,
+                &fallback,
                 SystemTime::now(),
                 &mut stderr,
             )? {
@@ -2411,13 +2413,18 @@ fn sidebar_border_style(app: &App) -> Style {
 fn init_hook_watcher(
     event_tx: &std::sync::mpsc::Sender<WatcherEvent>,
 ) -> Option<notify::RecommendedWatcher> {
-    let Some(dir) = agent_mux::hook_ingest::default_hook_dir() else {
+    // Watch <local-transcripts-root>/.agent-mux-hooks/. The hook
+    // subcommand derives this same path from the payload's
+    // `transcript_path` so local and remote producers + consumers
+    // share one path convention.
+    let Some(root) = claude_projects_dir() else {
         eprintln!(
-            "agent-mux: hook watcher disabled (no cache directory resolved); \
+            "agent-mux: hook watcher disabled (no Claude Code transcripts dir resolved); \
              heuristic-only attention path stays in effect"
         );
         return None;
     };
+    let dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
     match agent_mux::hook_ingest::spawn_hook_watcher(&dir, event_tx) {
         Ok(w) => Some(w),
         Err(e) => {

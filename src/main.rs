@@ -161,6 +161,18 @@ fn main() -> io::Result<()> {
                 path.display()
             )
         }
+        Some("install-hooks") => {
+            // Mutates ~/.claude/settings.json to wire the Notification
+            // hook command at this binary's path. Idempotent; updates
+            // a stale entry in place; preserves everything else in the
+            // user's settings file. `--dry-run` prints the planned
+            // content without writing.
+            let dry_run = argv.iter().any(|s| s == "--dry-run");
+            let settings = agent_mux::hook_install::default_settings_path()
+                .ok_or_else(|| io::Error::other("no home directory resolved on this platform"))?;
+            let binary = std::env::current_exe()?;
+            agent_mux::hook_install::install_hooks_at(&settings, &binary, dry_run, &mut stdout)
+        }
         Some("help" | "--help" | "-h") => cli::print_help(&mut stdout),
         Some(other) => {
             let mut stderr = io::stderr();

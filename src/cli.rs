@@ -560,11 +560,15 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  agent-mux hook           Internal: invoked by Claude Code's Notification hook"
+        "  agent-mux install-hooks  Wire Claude Code's Notification hook into ~/.claude/settings.json"
     )?;
     writeln!(
         out,
-        "                           (configure via ~/.claude/settings.json — see README)."
+        "                           (idempotent; --dry-run prints the change without writing)."
+    )?;
+    writeln!(
+        out,
+        "  agent-mux hook           Internal: invoked by Claude Code's Notification hook."
     )?;
     writeln!(out, "  agent-mux help           Show this help.")?;
     writeln!(out)?;
@@ -833,7 +837,14 @@ mod tests {
     #[test]
     fn help_lists_every_subcommand() {
         let out = run(print_help);
-        for cmd in ["themes", "config", "notify-test", "hook", "help"] {
+        for cmd in [
+            "themes",
+            "config",
+            "notify-test",
+            "install-hooks",
+            "hook",
+            "help",
+        ] {
             assert!(out.contains(cmd), "missing subcommand {cmd:?}:\n{out}");
         }
     }

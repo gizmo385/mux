@@ -8,6 +8,7 @@ pub mod delete_worktree_modal;
 pub mod discovery;
 pub mod embedded_pty;
 pub mod hook_ingest;
+pub mod hook_install;
 pub mod host;
 pub mod new_session_modal;
 pub mod notifications;

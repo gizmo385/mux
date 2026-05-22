@@ -135,24 +135,15 @@ These `agent-mux-<id>` tmux sessions accumulate on the remote over time. Clean t
 
 agent-mux's attention heuristic derives state from the transcript JSONL, but the transcript alone can't distinguish "the assistant is running a tool" from "the assistant is waiting for you to approve a permission prompt." Wiring up Claude Code's `Notification` hook closes that gap — Claude Code fires the hook exactly when it needs your attention (permission prompts, idle-awaiting-input), and agent-mux uses the hook event as the authoritative signal until the transcript advances.
 
-Setup is one edit to `~/.claude/settings.json`:
+Run once:
 
-```json
-{
-  "hooks": {
-    "Notification": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {"type": "command", "command": "/absolute/path/to/agent-mux hook"}
-        ]
-      }
-    ]
-  }
-}
+```
+agent-mux install-hooks
 ```
 
-Replace `/absolute/path/to/agent-mux` with the actual path on your machine (`which agent-mux` will give it to you). The hook command writes a marker file under `~/Library/Caches/agent-mux/hooks/` (or `~/.cache/agent-mux/hooks/` on Linux); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification.
+That edits `~/.claude/settings.json` to register `agent-mux hook` as a Notification handler, pointing at the binary that ran the command (resolved via `current_exe()`). It's idempotent — re-running it is a no-op when the entry is already there, and it updates the path in place if you've moved or reinstalled the binary. Your existing settings (theme, permissions, other hook types) are preserved; a one-time backup lands at `~/.claude/settings.json.bak` before the first write. Use `--dry-run` to preview the change without writing.
+
+Behind the scenes: the hook command writes a marker file under `~/Library/Caches/agent-mux/hooks/` (or `~/.cache/agent-mux/hooks/` on Linux); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification.
 
 To verify your wiring without waiting for a real permission prompt: run `agent-mux notify-test` to confirm the dispatcher fires end-to-end, then trigger any permission prompt in a Claude Code session and watch the dashboard.
 

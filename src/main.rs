@@ -144,22 +144,31 @@ fn main() -> io::Result<()> {
         }
         Some("hook") => {
             // Producer side of the Claude Code Notification hook
-            // ingress. Reads payload from stdin, writes a marker file
-            // the running dashboard's watcher picks up. Fire-and-forget
-            // — exits as soon as the marker is on disk so Claude Code's
+            // ingress. Reads payload from stdin; if the event is
+            // input-required (permission/idle/elicitation prompt),
+            // writes a marker file the running dashboard's watcher
+            // picks up. Other notification types (auth_success,
+            // post-elicitation completions, anything unrecognised) are
+            // logged to stderr and dropped so the user doesn't get a
+            // ping per tool finish. Fire-and-forget — exits as soon
+            // as the marker is on disk (or skipped) so Claude Code's
             // hook pipeline isn't blocked on agent-mux's UI thread.
             let dir = agent_mux::hook_ingest::default_hook_dir()
                 .ok_or_else(|| io::Error::other("no cache directory resolved on this platform"))?;
-            let path = agent_mux::hook_ingest::receive_hook_from_stdin(
+            let mut stderr = io::stderr();
+            match agent_mux::hook_ingest::receive_hook_from_stdin(
                 &mut io::stdin().lock(),
                 &dir,
                 SystemTime::now(),
-            )?;
-            writeln!(
-                stdout,
-                "agent-mux: hook marker written to {}",
-                path.display()
-            )
+                &mut stderr,
+            )? {
+                Some(path) => writeln!(
+                    stdout,
+                    "agent-mux: hook marker written to {}",
+                    path.display()
+                ),
+                None => Ok(()),
+            }
         }
         Some("install-hooks") => {
             // Mutates ~/.claude/settings.json to wire the Notification

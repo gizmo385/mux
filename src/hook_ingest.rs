@@ -84,10 +84,19 @@ pub struct HookEvent {
     pub raw_json: String,
 }
 
-/// Read a Claude Code hook payload from `stdin_reader`, persist it to
-/// the cache directory as a marker file the dashboard's watcher will
-/// ingest, and return the resolved marker path. Production callers
-/// pass `io::stdin().lock()`; tests pass an in-memory cursor.
+/// Read a Claude Code hook payload from `stdin_reader`, decide whether
+/// it represents a user-input-required event, and (if so) persist it
+/// to the cache directory as a marker file the dashboard's watcher
+/// will ingest. Production callers pass `io::stdin().lock()`; tests
+/// pass an in-memory cursor.
+///
+/// Returns `Ok(Some(path))` when a marker was written, `Ok(None)` when
+/// the event was recognised but filtered out (e.g. `auth_success` —
+/// fires on every successful authentication, not a user attention
+/// signal). In both cases the `notification_type` value is logged to
+/// `stderr_log` so the user can see (in shell scrollback) what kinds
+/// of events Claude Code is actually emitting on their setup — that's
+/// the dogfooding lever for refining the allowlist over time.
 ///
 /// The marker file name is `<unix-millis>-<session_id>.json` so file
 /// ordering on disk matches event ordering (the timestamp prefix
@@ -102,16 +111,82 @@ pub struct HookEvent {
 /// [`io::ErrorKind::InvalidData`] — we have nothing to correlate to a
 /// catalog session, so dropping silently would be worse than failing
 /// loudly.
-pub fn receive_hook_from_stdin<R: Read>(
+pub fn receive_hook_from_stdin<R: Read, W: Write>(
     stdin_reader: &mut R,
     hook_dir: &Path,
     now: SystemTime,
-) -> io::Result<PathBuf> {
+    stderr_log: &mut W,
+) -> io::Result<Option<PathBuf>> {
     let mut buf = String::new();
     stdin_reader.read_to_string(&mut buf)?;
     let session_id = parse_session_id(&buf)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing session_id field"))?;
-    persist_marker(hook_dir, &session_id, now, &buf)
+    let notification_type = parse_notification_type(&buf);
+    let type_label = notification_type.as_deref().unwrap_or("<missing>");
+    if is_input_required_type(notification_type.as_deref()) {
+        let _ = writeln!(
+            stderr_log,
+            "agent-mux: hook notification_type={type_label} session_id={session_id} \u{2192} writing marker"
+        );
+        let path = persist_marker(hook_dir, &session_id, now, &buf)?;
+        Ok(Some(path))
+    } else {
+        let _ = writeln!(
+            stderr_log,
+            "agent-mux: hook notification_type={type_label} session_id={session_id} \u{2192} skipped (not input-required)"
+        );
+        Ok(None)
+    }
+}
+
+/// Notification types we treat as "user input is required for this
+/// session." Anything in this allowlist surfaces as a `NeedsInput`
+/// transition in the dashboard; anything else is logged and dropped.
+///
+/// The allowlist is hardcoded rather than configurable because (a)
+/// the per-platform name space is finite and documented by Claude
+/// Code, and (b) the user-facing tuning knob would be redundant —
+/// disabling notifications altogether is already covered by
+/// `[notifications] enabled = false`. If a future Claude Code adds a
+/// new input-required notification type, dogfooding will surface it
+/// via the `stderr_log` line above and we add it here.
+///
+/// Excluded on purpose:
+/// - `auth_success` — fires on every successful authentication,
+///   not a user attention signal.
+/// - `elicitation_complete` / `elicitation_response` — those are
+///   *post-input* events. The matching `elicitation_dialog` event is
+///   the input-required signal; once the user has acted, the
+///   completion event re-firing a notification would be redundant
+///   noise.
+const INPUT_REQUIRED_NOTIFICATION_TYPES: &[&str] =
+    &["permission_prompt", "idle_prompt", "elicitation_dialog"];
+
+/// True iff `notification_type` should fire a `NeedsInput` notification.
+/// A missing value (`None`) is treated as input-required: an unknown
+/// payload shape should stay loud rather than silently quiet (matches
+/// the conservative-fallback pattern in `derive_attention_from_content`).
+#[must_use]
+fn is_input_required_type(notification_type: Option<&str>) -> bool {
+    match notification_type {
+        None => true,
+        Some(t) => INPUT_REQUIRED_NOTIFICATION_TYPES.contains(&t),
+    }
+}
+
+/// Pull `notification_type` out of the hook JSON. Returns `None` when
+/// the field is absent, non-string, or empty — caller decides what to
+/// do with that (currently: treat as input-required, see
+/// [`is_input_required_type`]).
+#[must_use]
+fn parse_notification_type(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let raw = v.as_object()?.get("notification_type")?.as_str()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Pull `session_id` out of the hook JSON. Tolerant of surrounding
@@ -297,46 +372,144 @@ mod tests {
     use std::sync::mpsc;
     use tempfile::TempDir;
 
-    #[test]
-    fn receive_writes_marker_with_session_id_in_filename() {
-        let tmp = TempDir::new().unwrap();
-        let payload = r#"{"session_id":"abc-123","hook_event_name":"Notification"}"#;
-        let mut input = Cursor::new(payload.as_bytes());
-        let path = receive_hook_from_stdin(
+    /// Test helper: fire `receive_hook_from_stdin` against an
+    /// in-memory payload + stderr buffer. Returns the marker path (if
+    /// any) and the captured stderr text so each test can assert on
+    /// both the filesystem effect and the observability log.
+    fn dispatch(payload: &str, hook_dir: &Path) -> (io::Result<Option<PathBuf>>, String) {
+        let mut input = Cursor::new(payload.as_bytes().to_vec());
+        let mut log = Vec::new();
+        let result = receive_hook_from_stdin(
             &mut input,
-            tmp.path(),
+            hook_dir,
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_234_567),
-        )
-        .expect("write marker");
+            &mut log,
+        );
+        (result, String::from_utf8(log).unwrap())
+    }
+
+    #[test]
+    fn receive_writes_marker_for_permission_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"abc-123","hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let (result, log) = dispatch(payload, tmp.path());
+        let path = result.expect("write marker").expect("marker written");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.ends_with("-abc-123.json"), "unexpected name {name:?}");
-        let contents = fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, payload);
+        assert_eq!(fs::read_to_string(&path).unwrap(), payload);
+        assert!(
+            log.contains("notification_type=permission_prompt") && log.contains("writing marker"),
+            "stderr log should include type + action: {log}"
+        );
+    }
+
+    #[test]
+    fn receive_writes_marker_for_idle_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"a","notification_type":"idle_prompt"}"#;
+        let (result, _) = dispatch(payload, tmp.path());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn receive_writes_marker_for_elicitation_dialog() {
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"a","notification_type":"elicitation_dialog"}"#;
+        let (result, _) = dispatch(payload, tmp.path());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn receive_skips_auth_success_notifications() {
+        // The dogfooding signal that drove this filter: auth_success
+        // fires on every successful authentication, including the
+        // moment a long-running tool completes and Claude Code
+        // re-authenticates. Was the loudest source of the
+        // "notifications fire any time a tool finishes" complaint.
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"a","notification_type":"auth_success"}"#;
+        let (result, log) = dispatch(payload, tmp.path());
+        assert!(
+            result.unwrap().is_none(),
+            "auth_success should not write a marker"
+        );
+        assert!(
+            log.contains("notification_type=auth_success") && log.contains("skipped"),
+            "stderr log should record the skip: {log}"
+        );
+        assert!(
+            fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "no marker file should be created"
+        );
+    }
+
+    #[test]
+    fn receive_skips_elicitation_complete_and_response() {
+        // Post-input completion events — the matching
+        // elicitation_dialog already fired the user-attention signal;
+        // firing again on the response would be redundant noise.
+        let tmp = TempDir::new().unwrap();
+        for nt in ["elicitation_complete", "elicitation_response"] {
+            let payload = format!(r#"{{"session_id":"a","notification_type":"{nt}"}}"#);
+            let (result, log) = dispatch(&payload, tmp.path());
+            assert!(result.unwrap().is_none(), "{nt} must be filtered");
+            assert!(log.contains("skipped"), "{nt}: {log}");
+        }
+    }
+
+    #[test]
+    fn receive_writes_marker_when_notification_type_field_is_missing() {
+        // Conservative fallback: an unknown/older payload shape stays
+        // loud rather than silently quiet. Matches the
+        // missing-stop_reason fallback in derive_attention_from_content.
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"a","hook_event_name":"Notification"}"#;
+        let (result, log) = dispatch(payload, tmp.path());
+        assert!(result.unwrap().is_some());
+        assert!(
+            log.contains("notification_type=<missing>"),
+            "log shape: {log}"
+        );
+    }
+
+    #[test]
+    fn receive_skips_unrecognised_notification_type_values() {
+        // Defensive: a future schema bump could add a new non-input
+        // event type we don't know about. Filter it out (with a log
+        // line so dogfooding surfaces it for allowlist refinement).
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"a","notification_type":"some_future_event"}"#;
+        let (result, log) = dispatch(payload, tmp.path());
+        assert!(result.unwrap().is_none());
+        assert!(
+            log.contains("notification_type=some_future_event") && log.contains("skipped"),
+            "log shape: {log}"
+        );
     }
 
     #[test]
     fn receive_accepts_camel_case_session_id() {
         let tmp = TempDir::new().unwrap();
-        let payload = r#"{"sessionId":"abc"}"#;
-        let mut input = Cursor::new(payload.as_bytes());
-        let path = receive_hook_from_stdin(&mut input, tmp.path(), SystemTime::UNIX_EPOCH).unwrap();
-        assert!(path.exists());
+        let payload = r#"{"sessionId":"abc","notification_type":"permission_prompt"}"#;
+        let (result, _) = dispatch(payload, tmp.path());
+        assert!(result.unwrap().is_some());
     }
 
     #[test]
     fn receive_rejects_payload_without_session_id() {
         let tmp = TempDir::new().unwrap();
-        let mut input = Cursor::new(br#"{"hook_event_name":"Notification"}"#.as_slice());
-        let err = receive_hook_from_stdin(&mut input, tmp.path(), SystemTime::UNIX_EPOCH)
-            .expect_err("should reject");
+        let payload =
+            r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let (result, _) = dispatch(payload, tmp.path());
+        let err = result.expect_err("should reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn receive_rejects_malformed_json() {
         let tmp = TempDir::new().unwrap();
-        let mut input = Cursor::new(b"not valid json".as_slice());
-        assert!(receive_hook_from_stdin(&mut input, tmp.path(), SystemTime::UNIX_EPOCH).is_err());
+        let (result, _) = dispatch("not valid json", tmp.path());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -344,9 +517,10 @@ mod tests {
         // Defensive: today's session ids are UUIDs, but a future
         // schema with slashes would otherwise create subdirectories.
         let tmp = TempDir::new().unwrap();
-        let payload = r#"{"session_id":"weird/id with spaces"}"#;
-        let mut input = Cursor::new(payload.as_bytes());
-        let path = receive_hook_from_stdin(&mut input, tmp.path(), SystemTime::UNIX_EPOCH).unwrap();
+        let payload =
+            r#"{"session_id":"weird/id with spaces","notification_type":"permission_prompt"}"#;
+        let (result, _) = dispatch(payload, tmp.path());
+        let path = result.unwrap().expect("marker written");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(!name.contains('/'), "slash leaked into filename: {name:?}");
         assert!(!name.contains(' '), "space leaked into filename: {name:?}");

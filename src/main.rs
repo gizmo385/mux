@@ -7,8 +7,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -214,11 +214,21 @@ fn enter_screen(embedded: bool) -> io::Result<()> {
         // selection still works behind Shift.
         execute!(stdout, EnableMouseCapture, EnableBracketedPaste)?;
     }
+    // Focus reporting (DEC 1004): emits `ESC [I` / `ESC [O` on the
+    // terminal-window-focus-gain/loss boundary, which the notifier
+    // uses to decide whether the user is actually looking at
+    // agent-mux. Enabled in both embedded and non-embedded modes —
+    // attention suppression matters either way. Terminals that don't
+    // implement focus reporting silently drop the request and the
+    // app falls back to "always notify" (the `terminal_focused`
+    // field defaults to false).
+    execute!(stdout, EnableFocusChange)?;
     Ok(())
 }
 
 fn leave_screen(embedded: bool) -> io::Result<()> {
     let mut stdout = io::stdout();
+    execute!(stdout, DisableFocusChange)?;
     if embedded {
         execute!(stdout, DisableBracketedPaste, DisableMouseCapture)?;
     }
@@ -364,6 +374,22 @@ struct App {
     /// successful `EmbedPty` attach; back to `Sidebar` on prefix-escape
     /// (`Ctrl-a Esc`) or PTY exit.
     focus: Focus,
+    /// Whether agent-mux's terminal window currently owns OS-level
+    /// focus. Driven by DEC 1004 focus-reporting events
+    /// (`Event::FocusGained` / `Event::FocusLost`); enabled in
+    /// [`enter_screen`]. Used by the notification path to suppress
+    /// toasts only when the user is *both* watching the embedded
+    /// session and has the terminal focused — `Focus::Terminal`
+    /// alone isn't enough, since an alt-tab away leaves the in-app
+    /// focus state intact.
+    ///
+    /// Defaults to `false` so terminals that don't implement focus
+    /// reporting silently fall back to "always notify" — the safe
+    /// failure mode (missed suppression is annoying; missed
+    /// notification is the bug we exist to avoid). A terminal that
+    /// does support focus reporting will send `FocusGained` on app
+    /// startup, lifting this to `true` within the first event tick.
+    terminal_focused: bool,
     /// Whether the binary was launched with `--embedded`. Drives the
     /// mouse-capture + bracketed-paste opt-ins at terminal-setup time
     /// and gates the corresponding input routing in the main loop.
@@ -638,6 +664,7 @@ impl App {
             theme,
             embedded: None,
             focus: Focus::default(),
+            terminal_focused: false,
             embedded_mode,
             tool_launches: ToolLaunchRegistry::new(),
             session_names: load_session_names_or_empty(),
@@ -1362,13 +1389,12 @@ impl App {
         });
         let host = session.host.clone();
         let project = session.project_dir.clone();
-        // Suppress the toast when the user is *already engaged* with
-        // this exact session: embedded PTY is open on it and keyboard
-        // focus is on the terminal (not the sidebar). The notifier
-        // doesn't arm its episodic flag in this case, so a later
-        // transition while focus is elsewhere still fires.
-        let actively_viewed = matches!(self.focus, Focus::Terminal { .. })
-            && self.embedded.as_ref().is_some_and(|e| e.session_id == *id);
+        let actively_viewed = compute_actively_viewed(
+            self.focus,
+            self.terminal_focused,
+            self.embedded.as_ref().map(|e| &e.session_id),
+            id,
+        );
         self.notifier.on_attention_update(
             &Transition {
                 id,
@@ -1891,9 +1917,19 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 }
                 // Resize falls through — the next draw's resize cascade
                 // picks up the new terminal size automatically.
-                // FocusGained/FocusLost don't fire (we didn't enable
-                // them) but a stray instance is a safe no-op.
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => continue,
+                Event::Resize(_, _) => continue,
+                // DEC 1004 focus events drive the notifier's
+                // `actively_viewed` predicate so an alt-tab away from
+                // the terminal lifts the suppression even when the
+                // in-app `Focus::Terminal` state is still set.
+                Event::FocusGained => {
+                    app.terminal_focused = true;
+                    continue;
+                }
+                Event::FocusLost => {
+                    app.terminal_focused = false;
+                    continue;
+                }
                 Event::Key(_) => {}
             }
             let Event::Key(key) = raw else { continue };
@@ -2677,6 +2713,38 @@ fn draw_embedded(
     embedded.last_inner = Some(inner);
     frame.render_widget(term_block, split[1]);
     embedded.pty.render(frame, inner);
+}
+
+/// Whether the user is actively engaged with the session whose attention
+/// just transitioned — three `ANDed` conditions:
+///
+/// 1. `terminal_focused`: agent-mux's terminal window owns OS-level
+///    focus. Without this an alt-tab to a browser would leave the
+///    in-app `Focus::Terminal` state intact and the user would miss
+///    real attention transitions while the terminal sat unfocused.
+/// 2. In-app focus is on the terminal (not the sidebar). Sidebar focus
+///    means the user is browsing the dashboard — the row update is
+///    visually obvious, but they're not watching the pane content.
+///    Kept strict for now per user-stated preference for the safe
+///    failure mode (more notifications, not fewer).
+/// 3. The embedded PTY hosts the transitioning session. With a
+///    *different* session embedded the user can't see the new
+///    `NeedsInput`'s content; they need the notification.
+///
+/// Lifted out of the call site so the regression that produced this
+/// function (a first-iteration predicate missing condition 1) has a
+/// pure-function unit test instead of relying on live-event-loop
+/// dogfooding to catch it.
+#[must_use]
+fn compute_actively_viewed(
+    focus: Focus,
+    terminal_focused: bool,
+    embedded_session_id: Option<&SessionId>,
+    transition_session_id: &SessionId,
+) -> bool {
+    terminal_focused
+        && matches!(focus, Focus::Terminal { .. })
+        && embedded_session_id == Some(transition_session_id)
 }
 
 /// Whether the embedded PTY should be resized to `proposed`. False for
@@ -3678,5 +3746,92 @@ mod tests {
         assert!(!should_resize_pty((24, 80), (0, 80)));
         assert!(!should_resize_pty((24, 80), (24, 0)));
         assert!(!should_resize_pty((24, 80), (0, 0)));
+    }
+
+    // ---- compute_actively_viewed ----
+
+    fn sid(s: &str) -> SessionId {
+        SessionId(s.to_string())
+    }
+
+    #[test]
+    fn compute_actively_viewed_true_only_when_all_three_conditions_hold() {
+        let id = sid("a");
+        assert!(compute_actively_viewed(
+            Focus::Terminal {
+                leader_armed: false
+            },
+            true,
+            Some(&id),
+            &id,
+        ));
+    }
+
+    #[test]
+    fn compute_actively_viewed_false_when_terminal_not_os_focused() {
+        // The regression that motivated extracting this helper: an
+        // alt-tab away from agent-mux leaves the in-app `Focus::Terminal`
+        // state intact, but the user isn't watching the pane any more
+        // so the notification must fire.
+        let id = sid("a");
+        assert!(!compute_actively_viewed(
+            Focus::Terminal {
+                leader_armed: false
+            },
+            false,
+            Some(&id),
+            &id,
+        ));
+    }
+
+    #[test]
+    fn compute_actively_viewed_false_when_in_app_focus_is_sidebar() {
+        let id = sid("a");
+        assert!(!compute_actively_viewed(
+            Focus::Sidebar,
+            true,
+            Some(&id),
+            &id,
+        ));
+    }
+
+    #[test]
+    fn compute_actively_viewed_false_when_no_session_is_embedded() {
+        let id = sid("a");
+        assert!(!compute_actively_viewed(
+            Focus::Terminal {
+                leader_armed: false
+            },
+            true,
+            None,
+            &id,
+        ));
+    }
+
+    #[test]
+    fn compute_actively_viewed_false_when_embedded_session_differs_from_transition() {
+        let embedded = sid("a");
+        let other = sid("b");
+        assert!(!compute_actively_viewed(
+            Focus::Terminal {
+                leader_armed: false
+            },
+            true,
+            Some(&embedded),
+            &other,
+        ));
+    }
+
+    #[test]
+    fn compute_actively_viewed_ignores_leader_armed_state() {
+        // Mid-leader-chord is still "actively engaged"; the user is in
+        // the middle of typing a sequence, not browsing the dashboard.
+        let id = sid("a");
+        assert!(compute_actively_viewed(
+            Focus::Terminal { leader_armed: true },
+            true,
+            Some(&id),
+            &id,
+        ));
     }
 }

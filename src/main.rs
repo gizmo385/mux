@@ -1378,15 +1378,9 @@ impl App {
         let Some(session) = self.catalog.sessions().iter().find(|s| s.id == *id) else {
             return;
         };
-        let title = session.title.as_deref().unwrap_or_else(|| {
-            // Fallback when the session has no resolved title: use the
-            // tail of the session id so multiple title-less sessions
-            // remain distinguishable in the notification stream.
-            let id_str = session.id.0.as_str();
-            id_str
-                .get(id_str.len().saturating_sub(6)..)
-                .unwrap_or(id_str)
-        });
+        let name_override = self.session_names.get(&session.host, &session.id);
+        let title =
+            resolve_notification_title(name_override, session.title.as_deref(), &session.id);
         let host = session.host.clone();
         let project = session.project_dir.clone();
         let actively_viewed = compute_actively_viewed(
@@ -2753,6 +2747,35 @@ fn compute_actively_viewed(
         && embedded_session_id == Some(transition_session_id)
 }
 
+/// Pick the title an OS notification should carry for a given session.
+/// Mirrors the sidebar's precedence so a rename a user already sees on
+/// the row appears verbatim in the toast — the prior version skipped
+/// straight to the catalog's `session.title` and surfaced the
+/// transcript-derived `aiTitle` (often the first user-message line) in
+/// the notification even after the user had renamed the session.
+///
+/// Precedence: user rename override (the value the `r` overlay writes
+/// into `SessionNameStore`) → catalog-resolved title (`aiTitle` /
+/// `task.toml`) → trailing chunk of the session id so two unnamed
+/// sessions remain distinguishable in the notification stream.
+///
+/// Lifted out of the `fire_attention_notification` call site for the
+/// same reason `compute_actively_viewed` was: a pure-function unit
+/// test pins the precedence without requiring a live App fixture.
+#[must_use]
+fn resolve_notification_title<'a>(
+    name_override: Option<&'a str>,
+    catalog_title: Option<&'a str>,
+    session_id: &'a SessionId,
+) -> &'a str {
+    name_override.or(catalog_title).unwrap_or_else(|| {
+        let id_str = session_id.0.as_str();
+        id_str
+            .get(id_str.len().saturating_sub(6)..)
+            .unwrap_or(id_str)
+    })
+}
+
 /// Whether the embedded PTY should be resized to `proposed`. False for
 /// zero-sized areas (vt100 rejects them, and there's nothing meaningful
 /// to render anyway) and for no-change ticks (the common case — 60-Hz
@@ -3839,5 +3862,55 @@ mod tests {
             Some(&id),
             &id,
         ));
+    }
+
+    // ---- resolve_notification_title ----
+
+    #[test]
+    fn resolve_notification_title_prefers_user_override_over_catalog_title() {
+        // The dogfood bug 2026-05-24: notifications were surfacing the
+        // transcript-derived `aiTitle` (often the first user-message
+        // line — the "original commit title" the user described) even
+        // after they had renamed the session via the `r` overlay.
+        let id = sid("session-id");
+        assert_eq!(
+            resolve_notification_title(Some("my rename"), Some("aiTitle"), &id),
+            "my rename"
+        );
+    }
+
+    #[test]
+    fn resolve_notification_title_falls_back_to_catalog_title_when_no_override() {
+        let id = sid("session-id");
+        assert_eq!(
+            resolve_notification_title(None, Some("aiTitle"), &id),
+            "aiTitle"
+        );
+    }
+
+    #[test]
+    fn resolve_notification_title_falls_back_to_id_suffix_when_neither_set() {
+        // Title-less sessions remain distinguishable in the
+        // notification stream via the last six chars of the id.
+        let id = sid("abcdef-0123456789");
+        assert_eq!(resolve_notification_title(None, None, &id), "456789");
+    }
+
+    #[test]
+    fn resolve_notification_title_returns_full_id_when_shorter_than_suffix_window() {
+        let id = sid("ab");
+        assert_eq!(resolve_notification_title(None, None, &id), "ab");
+    }
+
+    #[test]
+    fn resolve_notification_title_override_takes_effect_even_when_catalog_title_is_none() {
+        // A renamed session whose transcript hasn't produced an
+        // `aiTitle` yet (early in the conversation) should still
+        // surface the user's rename rather than the id suffix.
+        let id = sid("abcdef");
+        assert_eq!(
+            resolve_notification_title(Some("loop runner"), None, &id),
+            "loop runner"
+        );
     }
 }

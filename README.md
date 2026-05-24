@@ -200,6 +200,16 @@ curl -L "https://github.com/gizmo385/mux/releases/download/${VERSION}/agent-mux-
 
 Or substitute `latest` for `${VERSION}` to track `main`.
 
+## Install via cargo
+
+Published to [crates.io](https://crates.io/crates/agent-mux) alongside every tagged release:
+
+```sh
+cargo install agent-mux
+```
+
+Builds from source against your local toolchain; takes a couple of minutes. Requires Rust 1.94+ (matches the repo's `rust-toolchain.toml`). Re-run with `--force` to upgrade, or pin a version with `--version`.
+
 ## Install via nix flake
 
 The repository is a flake. From another flake, add it as an input and reference `packages.<system>.default`:

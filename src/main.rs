@@ -272,6 +272,20 @@ fn suspend_and_run(
     }
 }
 
+/// Captures *which copy* of a session the cursor sat on before an
+/// operation that may reshape `current_rows`. A favorited session
+/// appears twice in the row list (once in the pinned favorites
+/// group as [`DisplayRow::FavoriteSessionRow`], once in its natural
+/// host/project group as [`DisplayRow::SessionRow`]), and a re-seat
+/// that walked rows in iteration order would silently land on the
+/// favorites copy every time. `in_favorites = true` means the
+/// cursor was on the favorites-group copy.
+#[derive(Debug, Clone)]
+struct SelectionAnchor {
+    id: SessionId,
+    in_favorites: bool,
+}
+
 struct App {
     catalog: SessionCatalog,
     list_state: ListState,
@@ -742,7 +756,15 @@ impl App {
             Some(s) if !s.query.is_empty() => {
                 let q = s.query.to_lowercase();
                 let sessions = self.catalog.sessions();
-                build_display_rows_filtered(sessions, |i| matches_query(&sessions[i], &q))
+                // `|_| false` for is_favorite until step 3 of the
+                // favorites spec wires the store load + `f` keybind.
+                // The DisplayRow plumbing for the favorites group is in
+                // place but the favorites set is permanently empty.
+                build_display_rows_filtered(
+                    sessions,
+                    |i| matches_query(&sessions[i], &q),
+                    |_| false,
+                )
             }
             _ => build_display_rows(self.catalog.sessions()),
         };
@@ -779,7 +801,7 @@ impl App {
     /// the unfiltered view; otherwise selection re-seats to the first
     /// session row.
     fn exit_search(&mut self) {
-        let prior = self.selected_session().map(|s| s.id.clone());
+        let prior = self.selected_anchor_for_reseat();
         self.search = None;
         self.reseat_selection_to(prior.as_ref());
     }
@@ -799,7 +821,7 @@ impl App {
         }
         // Capture selection *before* mutating the search state — the
         // helper borrows `self` and would alias the mut-borrow below.
-        let prior = self.selected_id_for_reseat();
+        let prior = self.selected_anchor_for_reseat();
         let Some(search) = self.search.as_mut() else {
             // Should be unreachable thanks to the Editing-mode check
             // above, but staying defensive avoids a panic if the
@@ -845,28 +867,51 @@ impl App {
         }
     }
 
-    /// Capture the currently-selected session id *before* an operation
-    /// that may reshape `current_rows`. Used by [`reseat_selection_to`]
-    /// to keep selection on the same session across filter changes.
-    fn selected_id_for_reseat(&self) -> Option<SessionId> {
-        self.selected_session().map(|s| s.id.clone())
+    /// Capture the currently-selected session *and* which copy of it
+    /// the cursor sits on before an operation that may reshape
+    /// `current_rows`. The boolean is `true` when the cursor is on
+    /// the favorites-group copy ([`DisplayRow::FavoriteSessionRow`])
+    /// and `false` when on the natural host/project copy
+    /// ([`DisplayRow::SessionRow`]).
+    ///
+    /// Used by [`Self::reseat_selection_to`] to keep selection on
+    /// the same *copy* of the same session across filter changes,
+    /// catalog drains, and favorite-toggle reshuffles. Without the
+    /// flag, `position(|r| matches_session_id)` would return the
+    /// first match in iteration order — favorites come first, so a
+    /// user sitting on a session's natural-group row would have
+    /// their highlight silently jump to the favorites copy on every
+    /// re-seat.
+    fn selected_anchor_for_reseat(&self) -> Option<SelectionAnchor> {
+        let idx = self.list_state.selected()?;
+        let rows = self.current_rows();
+        match rows.get(idx)? {
+            DisplayRow::SessionRow(i) => {
+                let id = self.catalog.sessions().get(*i)?.id.clone();
+                Some(SelectionAnchor {
+                    id,
+                    in_favorites: false,
+                })
+            }
+            DisplayRow::FavoriteSessionRow(i) => {
+                let id = self.catalog.sessions().get(*i)?.id.clone();
+                Some(SelectionAnchor {
+                    id,
+                    in_favorites: true,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// After a change that may have reshaped `current_rows`, re-seat
-    /// selection: if the previously-selected session is still visible,
-    /// move the highlight to its new row index; otherwise fall back
-    /// to the first session row (or `None` if the filter is empty).
-    fn reseat_selection_to(&mut self, prior: Option<&SessionId>) {
+    /// selection. Delegates to the pure [`pick_reseat_target`] helper
+    /// so the resolution logic is unit-testable without an App
+    /// fixture (matches the `compute_actively_viewed` /
+    /// `resolve_notification_title` lift-out pattern).
+    fn reseat_selection_to(&mut self, prior: Option<&SelectionAnchor>) {
         let rows = self.current_rows();
-        let sessions = self.catalog.sessions();
-        let new_idx = prior
-            .and_then(|id| {
-                rows.iter().position(|r| match r {
-                    DisplayRow::SessionRow(i) => sessions[*i].id == *id,
-                    _ => false,
-                })
-            })
-            .or_else(|| first_session_index(&rows));
+        let new_idx = pick_reseat_target(&rows, self.catalog.sessions(), prior);
         self.list_state.select(new_idx);
     }
 
@@ -943,7 +988,7 @@ impl App {
                     // live read overlays the same id; if the entry
                     // disappeared, selection falls back to the first
                     // visible session row.
-                    let prior = self.selected_id_for_reseat();
+                    let prior = self.selected_anchor_for_reseat();
                     self.catalog.reconcile_host(&host_id, sessions);
                     self.reseat_selection_to(prior.as_ref());
                 }
@@ -1270,7 +1315,7 @@ impl App {
         // session when it survives, and falls back to the first
         // session row when the prior id is gone (the deleted one was
         // selected).
-        let prior = self.selected_id_for_reseat();
+        let prior = self.selected_anchor_for_reseat();
         while let Ok(result) = self.delete_rx.try_recv() {
             match result {
                 DeleteWorktreeResult::Deleted(id) => {
@@ -1319,7 +1364,7 @@ impl App {
         // to the first session row when the prior id is gone (e.g. a
         // delete consumed it), matching the rest of the codebase's
         // re-seat sites.
-        let prior = self.selected_id_for_reseat();
+        let prior = self.selected_anchor_for_reseat();
         while let Ok(event) = self.updates.try_recv() {
             match event {
                 WatcherEvent::Attention(update) => {
@@ -1878,13 +1923,21 @@ impl App {
     /// navigation helpers shouldn't allow this but the lookup stays
     /// defensive), or the underlying session index has gone out of
     /// range (defensive against a catalog mutation racing a keypress).
+    ///
+    /// Recognises both [`DisplayRow::SessionRow`] (natural
+    /// host/project group) and [`DisplayRow::FavoriteSessionRow`]
+    /// (pinned favorites group) — they resolve to the same
+    /// [`Session`]. Use [`Self::selected_anchor_for_reseat`] when the
+    /// distinction between the two copies matters for post-reshape
+    /// re-seat.
     fn selected_session(&self) -> Option<&Session> {
         let idx = self.list_state.selected()?;
         let rows = self.current_rows();
-        let DisplayRow::SessionRow(session_idx) = rows.get(idx)? else {
-            return None;
+        let session_idx = match rows.get(idx)? {
+            DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => *i,
+            _ => return None,
         };
-        self.catalog.sessions().get(*session_idx)
+        self.catalog.sessions().get(session_idx)
     }
 
     /// Returns the tool-launch index when the selected row is a
@@ -2329,13 +2382,23 @@ fn build_sidebar_items(
         .map(|row| match row {
             DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
             DisplayRow::ProjectHeader(path) => ListItem::new(format_project_header(path, home)),
-            DisplayRow::SessionRow(i) => {
+            // Both session-row variants render identically for now.
+            // Step 4 of the favorites spec will introduce a `★` glyph
+            // prefix on `FavoriteSessionRow` and the distinct
+            // `── favorites ──` header style; until then the
+            // favorites section is functionally invisible because
+            // the store load (step 3) hasn't shipped — the
+            // favorites set is always empty in production.
+            DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
                 let s = &sessions[*i];
                 let name_override = session_names.get(&s.host, &s.id);
                 ListItem::new(format_session_row(s, theme, name_override))
             }
             DisplayRow::ToolsHeader => ListItem::new(format_tools_header()),
             DisplayRow::ToolRow(i) => ListItem::new(format_tool_row(&tool_launches[*i])),
+            DisplayRow::FavoritesHeader => {
+                ListItem::new(format_project_header(Path::new("favorites"), None))
+            }
         })
         .collect()
 }
@@ -2798,6 +2861,51 @@ fn resolve_notification_title<'a>(
             .get(id_str.len().saturating_sub(6)..)
             .unwrap_or(id_str)
     })
+}
+
+/// Pick the row index to land selection on after a catalog reshape.
+/// Pure helper lifted out of [`App::reseat_selection_to`] so the
+/// three-tier resolution gets unit tests against a hand-built row
+/// slice (matches the `compute_actively_viewed` /
+/// `resolve_notification_title` pattern; an App fixture would be
+/// heavy and would not exercise the interesting edge cases more
+/// crisply).
+///
+/// Resolution order:
+/// 1. Same session id *and* same copy kind (favorites vs natural) —
+///    the cursor stays exactly where the user put it.
+/// 2. Same session id but the matching kind is gone (the user
+///    toggled favorite while sitting on the now-removed copy).
+///    Land on whichever copy survives.
+/// 3. Fall back to [`first_session_index`] (or `None` when the row
+///    list has no session-bearing rows).
+#[must_use]
+fn pick_reseat_target(
+    rows: &[DisplayRow],
+    sessions: &[Session],
+    prior: Option<&SelectionAnchor>,
+) -> Option<usize> {
+    let matches_id = |i: usize, id: &SessionId| sessions.get(i).is_some_and(|s| s.id == *id);
+    if let Some(anchor) = prior {
+        let same_kind = rows.iter().position(|r| match r {
+            DisplayRow::SessionRow(i) if !anchor.in_favorites => matches_id(*i, &anchor.id),
+            DisplayRow::FavoriteSessionRow(i) if anchor.in_favorites => matches_id(*i, &anchor.id),
+            _ => false,
+        });
+        if same_kind.is_some() {
+            return same_kind;
+        }
+        let either_kind = rows.iter().position(|r| match r {
+            DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
+                matches_id(*i, &anchor.id)
+            }
+            _ => false,
+        });
+        if either_kind.is_some() {
+            return either_kind;
+        }
+    }
+    first_session_index(rows)
 }
 
 /// Whether the embedded PTY should be resized to `proposed`. False for
@@ -3936,5 +4044,116 @@ mod tests {
             resolve_notification_title(Some("loop runner"), None, &id),
             "loop runner"
         );
+    }
+
+    // ---- pick_reseat_target ----
+
+    fn mock_session(id_str: &str) -> Session {
+        use agent_mux::session::{Attention, HostId};
+        use std::path::PathBuf;
+        Session {
+            id: sid(id_str),
+            host: HostId::local(),
+            project_dir: PathBuf::from("/p"),
+            transcript_path: PathBuf::from(format!("/t/{id_str}.jsonl")),
+            last_activity: SystemTime::UNIX_EPOCH,
+            attention: Attention::Unknown,
+            title: None,
+            parent_repo: None,
+            has_live_pane: None,
+            hook_pinned: None,
+        }
+    }
+
+    fn anchor(id: &str, in_favorites: bool) -> SelectionAnchor {
+        SelectionAnchor {
+            id: sid(id),
+            in_favorites,
+        }
+    }
+
+    #[test]
+    fn pick_reseat_target_prefers_same_kind_when_both_copies_exist() {
+        // Session "a" is favorited so it appears twice. The user was
+        // on the *natural* copy. Re-seat must land on the natural
+        // copy (row index 3), not the favorites copy (row index 1).
+        let sessions = vec![mock_session("a"), mock_session("b")];
+        let rows = vec![
+            DisplayRow::FavoritesHeader,
+            DisplayRow::FavoriteSessionRow(0),
+            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::SessionRow(0),
+            DisplayRow::SessionRow(1),
+        ];
+        let prior = anchor("a", false);
+        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(3));
+    }
+
+    #[test]
+    fn pick_reseat_target_prefers_favorite_kind_when_anchor_was_favorited() {
+        // Mirror image: the user was on the favorites copy. Re-seat
+        // must land on the favorites copy, not silently jump to the
+        // natural copy.
+        let sessions = vec![mock_session("a")];
+        let rows = vec![
+            DisplayRow::FavoritesHeader,
+            DisplayRow::FavoriteSessionRow(0),
+            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::SessionRow(0),
+        ];
+        let prior = anchor("a", true);
+        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(1));
+    }
+
+    #[test]
+    fn pick_reseat_target_falls_back_to_other_kind_when_matching_kind_gone() {
+        // User was on the favorites copy of "a", then toggled
+        // favorite off — the favorites copy is gone but the natural
+        // copy remains. Re-seat must land on the natural copy
+        // rather than jumping to an unrelated session.
+        let sessions = vec![mock_session("a"), mock_session("b")];
+        let rows = vec![
+            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::SessionRow(0),
+            DisplayRow::SessionRow(1),
+        ];
+        let prior = anchor("a", true);
+        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(1));
+    }
+
+    #[test]
+    fn pick_reseat_target_falls_back_to_first_session_when_anchor_session_gone() {
+        // The anchored session id is no longer in the row list (e.g.
+        // a delete consumed it). Land on the first session-bearing
+        // row — same fallback the pre-favorites re-seat used.
+        let sessions = vec![mock_session("b")];
+        let rows = vec![
+            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::SessionRow(0),
+        ];
+        let prior = anchor("a-gone", false);
+        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(1));
+    }
+
+    #[test]
+    fn pick_reseat_target_returns_first_session_index_with_no_prior_anchor() {
+        // Initial seed path: no prior selection, just land on the
+        // first session-bearing row.
+        let sessions = vec![mock_session("a")];
+        let rows = vec![
+            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::SessionRow(0),
+        ];
+        assert_eq!(pick_reseat_target(&rows, &sessions, None), Some(1));
+    }
+
+    #[test]
+    fn pick_reseat_target_returns_none_for_empty_session_list() {
+        // Catalog drained to empty. Nothing to select.
+        let sessions: Vec<Session> = vec![];
+        let rows: Vec<DisplayRow> = vec![];
+        let prior = anchor("a-gone", false);
+        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), None);
+        assert_eq!(pick_reseat_target(&rows, &sessions, None), None);
     }
 }

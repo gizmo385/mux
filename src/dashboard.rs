@@ -30,6 +30,18 @@ pub enum DisplayRow {
     /// Index into `ToolLaunchRegistry::launches()`. Enter on a tool
     /// row re-attaches the embedded pane to that tool's tmux session.
     ToolRow(usize),
+    /// Header for the user-pinned favorites group surfaced at the very
+    /// top of the sidebar when `FavoritesStore` is non-empty. Omitted
+    /// otherwise so an empty set doesn't produce a bare header.
+    FavoritesHeader,
+    /// Index into the `sessions` slice for a row that appears inside
+    /// the pinned favorites group. Distinct from [`Self::SessionRow`]
+    /// so the same session id can render twice (favorited sessions
+    /// also still appear in their natural host/project group) without
+    /// the re-seat logic collapsing the two copies — `main.rs` tracks
+    /// which copy the user is on via `(SessionId, in_favorites: bool)`
+    /// and prefers the matching kind on re-seat.
+    FavoriteSessionRow(usize),
 }
 
 /// Group `sessions` by host (local first, SSH hosts alphabetical),
@@ -43,22 +55,68 @@ pub enum DisplayRow {
 /// when a new host is added.
 #[must_use]
 pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
-    build_display_rows_filtered(sessions, |_| true)
+    build_display_rows_filtered(sessions, |_| true, |_| false)
 }
 
 /// Like [`build_display_rows`] but emits rows only for sessions where
-/// `include(i)` returns true. Host and project headers are omitted when
-/// none of their children survive the filter — the grouping collapses
-/// naturally rather than leaving orphaned headers.
+/// `include(i)` returns true, and prepends a pinned favorites group
+/// for sessions where `is_favorite(i)` returns true (recency desc
+/// across all favorited sessions, irrespective of host/project).
 ///
-/// `SessionRow(i)` indices still point into the original `sessions`
-/// slice, so the dashboard can resolve a row back to its session
-/// without holding a parallel filtered slice.
+/// Host and project headers in the natural grouping are omitted when
+/// none of their children survive the filter — the grouping collapses
+/// naturally rather than leaving orphaned headers. Same rule for the
+/// favorites group: an empty favorited set produces no
+/// `FavoritesHeader` row, not an empty group.
+///
+/// A favorited session appears *twice* in the output (once as
+/// [`DisplayRow::FavoriteSessionRow`] in the pinned group, once as
+/// [`DisplayRow::SessionRow`] in its natural host/project group).
+/// This is deliberate: neither view loses information, and the
+/// per-project completeness view stays whole. The selection-tracking
+/// in `main.rs` disambiguates the two copies via
+/// `(SessionId, in_favorites: bool)`.
+///
+/// `SessionRow(i)` / `FavoriteSessionRow(i)` indices still point into
+/// the original `sessions` slice, so the dashboard can resolve a row
+/// back to its session without holding a parallel filtered slice.
+///
+/// `is_favorite` is also filtered through `include` — a favorited
+/// session that doesn't match the current search query is hidden from
+/// the favorites group too. Asymmetric "favorites ignore search"
+/// surprises users more than it helps; the favorites group simply
+/// shrinks (possibly to empty, taking its header with it) under a
+/// narrow query.
 #[must_use]
-pub fn build_display_rows_filtered<F>(sessions: &[Session], include: F) -> Vec<DisplayRow>
+pub fn build_display_rows_filtered<F, G>(
+    sessions: &[Session],
+    include: F,
+    is_favorite: G,
+) -> Vec<DisplayRow>
 where
     F: Fn(usize) -> bool,
+    G: Fn(usize) -> bool,
 {
+    let mut rows = Vec::new();
+
+    // Pinned favorites group first. Recency desc across all favorited
+    // sessions; the `is_favorite` predicate also passes through
+    // `include` so the search filter applies symmetrically (per the
+    // spec's resolved "favorites obey the filter" decision).
+    let mut favorite_idxs: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| include(*i) && is_favorite(*i))
+        .map(|(i, _)| i)
+        .collect();
+    if !favorite_idxs.is_empty() {
+        favorite_idxs.sort_by(|&a, &b| sessions[b].last_activity.cmp(&sessions[a].last_activity));
+        rows.push(DisplayRow::FavoritesHeader);
+        for i in favorite_idxs {
+            rows.push(DisplayRow::FavoriteSessionRow(i));
+        }
+    }
+
     let mut by_host: BTreeMap<HostId, Vec<usize>> = BTreeMap::new();
     for (i, s) in sessions.iter().enumerate() {
         if !include(i) {
@@ -74,7 +132,6 @@ where
         _ => a.as_str().cmp(b.as_str()),
     });
 
-    let mut rows = Vec::new();
     for host in ordered_hosts {
         rows.push(DisplayRow::HostHeader(host.clone()));
         let session_idxs = by_host.remove(&host).unwrap_or_default();
@@ -316,22 +373,34 @@ fn walk_session_index(current: Option<usize>, rows: &[DisplayRow], step: isize) 
 }
 
 /// Whether `row` accepts selection / Enter dispatch. Today: sessions
-/// and tool launches. Headers (host, project, tools) are skipped by
-/// j/k navigation so the cursor never lands on a non-actionable line.
+/// (in either the pinned favorites group or the natural host/project
+/// group) and tool launches. Headers (host, project, tools,
+/// favorites) are skipped by j/k navigation so the cursor never lands
+/// on a non-actionable line.
 #[must_use]
 fn is_selectable(row: &DisplayRow) -> bool {
-    matches!(row, DisplayRow::SessionRow(_) | DisplayRow::ToolRow(_))
+    matches!(
+        row,
+        DisplayRow::SessionRow(_) | DisplayRow::FavoriteSessionRow(_) | DisplayRow::ToolRow(_)
+    )
 }
 
-/// First `SessionRow` index in `rows`, or `None` if there are no
-/// sessions. Used to seed selection when the catalog goes from empty
-/// to non-empty. Tool rows are not eligible — the dashboard's
-/// default selection should land on real work, not on a transient
-/// `[[tools]]` launch.
+/// First session-bearing row index in `rows` (either a
+/// `FavoriteSessionRow` or a `SessionRow`), or `None` if there are
+/// none. Used to seed selection when the catalog goes from empty to
+/// non-empty. Tool rows are not eligible — the dashboard's default
+/// selection should land on real work, not on a transient
+/// `[[tools]]` launch. When the favorites group is non-empty, this
+/// lands on the first favorite (favorites render first in the row
+/// list); otherwise the first natural session row.
 #[must_use]
 pub fn first_session_index(rows: &[DisplayRow]) -> Option<usize> {
-    rows.iter()
-        .position(|r| matches!(r, DisplayRow::SessionRow(_)))
+    rows.iter().position(|r| {
+        matches!(
+            r,
+            DisplayRow::SessionRow(_) | DisplayRow::FavoriteSessionRow(_)
+        )
+    })
 }
 
 /// First `SessionRow` index belonging to the project group the current
@@ -467,9 +536,21 @@ mod tests {
 
     /// Helper: stringify the row layout as a flat Vec for assertions —
     /// host headers as `"H:<id>"`, project headers as `"P:<path>"`,
-    /// session rows as `"S:<id>"`.
+    /// session rows as `"S:<id>"`, favorites header as `"FH"`,
+    /// favorite session rows as `"F:<id>"`.
     fn layout(sessions: &[Session]) -> Vec<String> {
-        build_display_rows(sessions)
+        layout_with_favorites(sessions, |_| false)
+    }
+
+    /// Variant of [`layout`] that exercises the favorites group via
+    /// a per-test predicate. Plain [`layout`] passes `|_| false` so
+    /// the favorites section never appears, keeping the pre-favorites
+    /// expected-output assertions unchanged.
+    fn layout_with_favorites<G>(sessions: &[Session], is_favorite: G) -> Vec<String>
+    where
+        G: Fn(usize) -> bool,
+    {
+        build_display_rows_filtered(sessions, |_| true, is_favorite)
             .into_iter()
             .map(|r| match r {
                 DisplayRow::HostHeader(host) => format!("H:{host}"),
@@ -477,6 +558,8 @@ mod tests {
                 DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
                 DisplayRow::ToolsHeader => "TH:tools".to_string(),
                 DisplayRow::ToolRow(i) => format!("T:{i}"),
+                DisplayRow::FavoritesHeader => "FH".to_string(),
+                DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
             })
             .collect()
     }
@@ -623,6 +706,106 @@ mod tests {
             l,
             vec!["H:local", "P:/p-hot", "S:hot", "P:/p-cold", "S:cold"]
         );
+    }
+
+    #[test]
+    fn favorites_section_appears_above_host_groups_when_non_empty() {
+        // Two sessions across two projects; favorite the older one.
+        // The pinned favorites section comes first, then the natural
+        // host/project tree (which still contains both sessions —
+        // favorites duplicate, they don't relocate).
+        let s = vec![
+            session("a", "local", "/p1", 100),
+            session("b", "local", "/p2", 5),
+        ];
+        let favs = std::collections::HashSet::from([0usize]);
+        let l = layout_with_favorites(&s, |i| favs.contains(&i));
+        assert_eq!(
+            l,
+            vec![
+                "FH", "F:a", // pinned at the top
+                "H:local", "P:/p2", "S:b", "P:/p1", "S:a", // natural tree, recency-ordered
+            ]
+        );
+    }
+
+    #[test]
+    fn favorites_section_omitted_when_no_favorites_set() {
+        // The pinned-group header must not appear with an empty set
+        // — otherwise the user sees `── favorites ──` followed by
+        // nothing, which reads as visual noise.
+        let s = vec![session("a", "local", "/p", 0)];
+        let l = layout_with_favorites(&s, |_| false);
+        assert!(!l.iter().any(|r| r == "FH"));
+        assert!(!l.iter().any(|r| r.starts_with("F:")));
+    }
+
+    #[test]
+    fn favorites_section_orders_by_recency_desc_across_hosts_and_projects() {
+        // Three favorited sessions spanning two hosts and three
+        // projects must list strictly by `last_activity` desc inside
+        // the pinned group, regardless of their natural host/project
+        // grouping.
+        let s = vec![
+            session("old", "local", "/p1", 1000),
+            session("new", "alpenglow", "/p3", 5),
+            session("mid", "local", "/p2", 100),
+        ];
+        let l = layout_with_favorites(&s, |_| true);
+        // Strip everything after the natural-tree start so the
+        // assertion focuses on favorites ordering only.
+        let head: Vec<_> = l.iter().take_while(|r| !r.starts_with("H:")).collect();
+        assert_eq!(head, vec!["FH", "F:new", "F:mid", "F:old"]);
+    }
+
+    #[test]
+    fn favorites_obey_the_search_filter() {
+        // Resolved spec decision: favorites also disappear when the
+        // search query excludes them — asymmetric "favorites always
+        // show" surprises users more than it helps. Here only "keep"
+        // matches the query, and it's the only thing that should
+        // appear in the favorites group too (despite both being
+        // favorited).
+        let s = vec![
+            session_with_title("a", "local", "/p", 0, Some("skip me")),
+            session_with_title("b", "local", "/p", 5, Some("keep me")),
+        ];
+        let q = "keep";
+        let rows = build_display_rows_filtered(
+            &s,
+            |i| matches_query(&s[i], q),
+            |_| true, // both favorited
+        );
+        let labels: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::FavoriteSessionRow(i) => Some(s[*i].id.0.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["b"], "filtered-out favorite must not appear");
+    }
+
+    #[test]
+    fn favorite_session_row_indices_still_point_at_original_slice() {
+        // Symmetric contract to SessionRow: FavoriteSessionRow(i) is
+        // an index into the original sessions slice, never a
+        // re-indexed favorites-only position.
+        let s = vec![
+            session("a", "local", "/p", 0),
+            session("b", "local", "/p", 5),
+            session("c", "local", "/p", 10),
+        ];
+        let favs = std::collections::HashSet::from([1usize]);
+        let rows = build_display_rows_filtered(&s, |_| true, |i| favs.contains(&i));
+        let favorite_rows: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::FavoriteSessionRow(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(favorite_rows, vec![1]);
     }
 
     #[test]
@@ -830,7 +1013,7 @@ mod tests {
 
     fn filtered_layout(sessions: &[Session], query: &str) -> Vec<String> {
         let q = query.to_lowercase();
-        build_display_rows_filtered(sessions, |i| matches_query(&sessions[i], &q))
+        build_display_rows_filtered(sessions, |i| matches_query(&sessions[i], &q), |_| false)
             .into_iter()
             .map(|r| match r {
                 DisplayRow::HostHeader(host) => format!("H:{host}"),
@@ -838,6 +1021,8 @@ mod tests {
                 DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
                 DisplayRow::ToolsHeader => "TH:tools".to_string(),
                 DisplayRow::ToolRow(i) => format!("T:{i}"),
+                DisplayRow::FavoritesHeader => "FH".to_string(),
+                DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
             })
             .collect()
     }
@@ -891,7 +1076,7 @@ mod tests {
             session_with_title("b", "local", "/p", 1, Some("keep me")),
         ];
         let q = "keep";
-        let rows = build_display_rows_filtered(&s, |i| matches_query(&s[i], q));
+        let rows = build_display_rows_filtered(&s, |i| matches_query(&s[i], q), |_| false);
         let session_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {

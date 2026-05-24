@@ -76,7 +76,6 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 
 ### UI polish
 
-- footer keybind line is dense after the group-jump hints landed (2026-05-17): `j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · n: new · q: quit  ·  return: …` will truncate on narrow terminals. Not a regression (the line was already long) but worth a follow-up. Plausible shapes: (a) drop secondary hints (`t: terminal`, `n: new`) when terminal width < threshold; (b) hide the group-jump hints once the user has used them once (a "learned" signal); (c) split into two footer rows. Defer until dogfooding shows whether it actually bites. `#ui #footer`
 - larger move on return-to-dashboard discoverability: in inside-tmux mode, name the agent-mux window predictably (e.g. `agent-mux`) so the hint can become "switch-client -t agent-mux" instead of the generic "prefix+s" picker. Deferred — the footer hint shipped first to see whether it's enough in dogfooding before introducing a window-naming convention. `#ui #attachment`
 - decide UX when agent-mux is launched from inside an existing tmux session vs from a bare shell. `#ui #dogfood`
 

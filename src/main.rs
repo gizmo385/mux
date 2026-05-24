@@ -2617,11 +2617,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .iter()
         .filter(|r| matches!(r, DisplayRow::SessionRow(_)))
         .count();
-    let title = if app.search.is_some() {
-        format!(" sessions ({visible_sessions}/{}) ", app.catalog.len())
-    } else {
-        format!(" sessions ({}) ", app.catalog.len())
-    };
+    let title = compose_sidebar_title(app.catalog.len(), visible_sessions, app.search.is_some());
     let items = build_sidebar_items(
         &rows,
         app.catalog.sessions(),
@@ -2786,9 +2782,38 @@ fn compose_footer(
             .collect();
         format!(" · {}", entries.join(" · "))
     };
+    // Pure-movement hints (j/k / J/K / ⌃j/⌃k) live in the sidebar's
+    // top title bar now — see `compose_sidebar_title` — so the footer
+    // only carries action verbs. Frees space for `r: rename` and
+    // `f: favorite`, both of which previously had no surface to be
+    // advertised on.
     format!(
-        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · n: new (N: no worktree) · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
+        " ⏎: attach · t: terminal · n: new (N: no worktree) · r: rename · f: favorite · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
     )
+}
+
+/// Compose the sidebar's top title bar text. Carries the session
+/// count plus the pure-movement keybind triplet (`j/k`, `J/K`,
+/// `⌃jk`) — moved here from the footer 2026-05-24 after the footer
+/// density crossed the line (favorites added `f`; rename was already
+/// hidden, and the footer had no room without dropping something).
+///
+/// Format: ` sessions (N) · j/k · J/K · ⌃jk ` when search is
+/// inactive; ` sessions (V/N) · j/k · J/K · ⌃jk ` when a filter is
+/// applied (V = currently visible sessions). The triplet is the
+/// glyph-only abbreviation per the user's explicit choice — labels
+/// (`: move` / `: project` / `: host`) are dropped to fit the
+/// 40-column embedded sidebar. The 99% case (counts < 1000 without
+/// search; < 100 with search) fits with margin; ratatui truncates
+/// the title at the border when the count pushes it over.
+#[must_use]
+fn compose_sidebar_title(catalog_len: usize, visible: usize, search_active: bool) -> String {
+    let count = if search_active {
+        format!("{visible}/{catalog_len}")
+    } else {
+        catalog_len.to_string()
+    };
+    format!(" sessions ({count}) · j/k · J/K · ⌃jk ")
 }
 
 /// Resolve a tool's footer label: explicit `name` wins, else the
@@ -3597,7 +3622,13 @@ mod tests {
     }
 
     #[test]
-    fn footer_keybind_line_advertises_group_jumps() {
+    fn footer_keybind_line_omits_movement_hints_now_that_title_carries_them() {
+        // Group-jump and j/k hints moved to the sidebar title bar
+        // (`compose_sidebar_title`) 2026-05-24 — the footer used to
+        // advertise them but had no room left for `r: rename` and
+        // `f: favorite` once those shipped. The complement test
+        // `sidebar_title_carries_movement_keybind_triplet` pins the
+        // hints' new home.
         let s = compose_footer(
             None,
             None,
@@ -3609,8 +3640,26 @@ mod tests {
             Focus::Sidebar,
             &[],
         );
-        assert!(s.contains("J/K: project"), "got: {s}");
-        assert!(s.contains("⌃j/⌃k: host"), "got: {s}");
+        assert!(!s.contains("j/k:"), "movement hints should be gone: {s}");
+        assert!(!s.contains("J/K:"), "group-jump hints should be gone: {s}");
+        assert!(!s.contains("⌃j/⌃k:"), "host-jump hints should be gone: {s}");
+    }
+
+    #[test]
+    fn footer_keybind_line_advertises_rename_and_favorite() {
+        let s = compose_footer(
+            None,
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            &no_empty_scans(),
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("r: rename"), "got: {s}");
+        assert!(s.contains("f: favorite"), "got: {s}");
     }
 
     #[test]
@@ -4258,5 +4307,63 @@ mod tests {
         let prior = anchor("a-gone", false);
         assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), None);
         assert_eq!(pick_reseat_target(&rows, &sessions, None), None);
+    }
+
+    // ---- compose_sidebar_title ----
+
+    #[test]
+    fn sidebar_title_carries_movement_keybind_triplet() {
+        // The whole reason this function exists: relocate the
+        // movement hints from the dense footer. If a future refactor
+        // drops the hints from the title without re-homing them,
+        // this test catches it.
+        let t = compose_sidebar_title(7, 7, false);
+        assert!(t.contains("j/k"), "j/k hint must appear: {t}");
+        assert!(t.contains("J/K"), "J/K hint must appear: {t}");
+        assert!(t.contains("⌃jk"), "⌃jk hint must appear: {t}");
+    }
+
+    #[test]
+    fn sidebar_title_shows_bare_count_outside_search() {
+        // Outside search the count is just `(N)` — no `V/N` shape.
+        // Check the parenthesised form directly rather than asserting
+        // on `/`, since the movement triplet legitimately contains
+        // slashes (`j/k`, `J/K`).
+        let t = compose_sidebar_title(12, 12, false);
+        assert!(t.contains("(12)"), "bare count: {t}");
+        assert!(!t.contains("(12/"), "no V/N form outside search: {t}");
+    }
+
+    #[test]
+    fn sidebar_title_shows_visible_over_total_when_search_active() {
+        // Search narrows the visible row count below the total —
+        // the title makes both numbers visible so the user can see
+        // how aggressively the current query is filtering.
+        let t = compose_sidebar_title(50, 3, true);
+        assert!(t.contains("sessions (3/50)"), "visible/total: {t}");
+    }
+
+    #[test]
+    fn sidebar_title_handles_zero_sessions_without_panic() {
+        // Empty catalog still renders a coherent title (the dashboard
+        // shows a no-sessions footer instead, but the title bar
+        // remains visible above it).
+        let t = compose_sidebar_title(0, 0, false);
+        assert!(t.contains("sessions (0)"), "zero count: {t}");
+    }
+
+    #[test]
+    fn sidebar_title_stays_within_embed_sidebar_budget_for_typical_counts() {
+        // Embed mode pins the sidebar at 40 cols; ratatui's Block
+        // reserves border chars, leaving ~36 cols for the title text.
+        // The 99% case (counts < 1000, no search) must fit with
+        // margin — protects against a future format tweak silently
+        // overflowing into truncation.
+        let t = compose_sidebar_title(999, 999, false);
+        assert!(
+            t.chars().count() <= 36,
+            "typical-case title overflows 40-col embed sidebar ({} cols): {t}",
+            t.chars().count(),
+        );
     }
 }

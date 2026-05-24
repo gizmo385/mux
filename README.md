@@ -39,7 +39,7 @@ When you press Enter on a session, agent-mux spawns `tmux attach -t <pane>` (or 
 
 `n` (new session) uses the same embedded-pane path: agent-mux spawns claude into a detached tmux session (`tmux new-session -d -P -F '#{session_name}' -c <cwd> claude`), lets tmux pick the session name, then attaches the embedded pane to it. The dashboard later discovers the new session via the transcript watcher and a normal Enter on that row re-attaches by matching the pane's cwd.
 
-Border style reflects focus: bold border = the embedded pane has the keyboard; dim border = the sidebar does. Footer shows the relevant keybinds for current focus.
+Border style reflects focus: bold border = the embedded pane has the keyboard; dim border = the sidebar does. The sidebar's top title bar shows the session count and the movement keybind triplet (`j/k`, `J/K`, `⌃jk`); the bottom footer carries the action-verb keybinds (`⏎/t/n/N/r/f/d/q`) and any user-configured `[[tools]]` bindings.
 
 `--no-embed` disables the embedded pane entirely and reverts to the legacy `tmux switch-client` / `SuspendAndRun` behaviour.
 

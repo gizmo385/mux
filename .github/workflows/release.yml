@@ -3,6 +3,8 @@ name: release
 on:
   push:
     branches: [main]
+  release:
+    types: [published]
   workflow_dispatch:
 
 concurrency:
@@ -86,3 +88,23 @@ jobs:
             --title "Latest main build" \
             --notes "$notes" \
             --prerelease
+
+  publish-tagged:
+    name: upload binaries to tagged release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload binaries to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

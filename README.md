@@ -180,21 +180,28 @@ Stdout-detection: `themes` emits ANSI escapes only when stdout is a real termina
 
 ## Pre-built binaries
 
-Each push to `main` publishes fresh binaries to the [`latest` release](https://github.com/gizmo385/mux/releases/tag/latest):
+Two release channels, both shipping the same artifacts:
+
+- **Tagged (`vX.Y.Z`)** — stable, immutable. Cut by [release-plz](https://release-plz.ieni.dev/) from the conventional-commit log. Use these if you want predictable installs. Browse them at [releases](https://github.com/gizmo385/mux/releases).
+- **`latest`** (rolling) — replaced on every push to `main`, marked as a prerelease. Use this if you want the bleeding edge.
+
+Artifacts:
 
 - `agent-mux-aarch64-apple-darwin.tar.gz` — macOS, Apple Silicon
 - `agent-mux-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64 (glibc)
 - `agent-mux-x86_64-unknown-linux-musl.tar.gz` — Linux x86_64 (static, portable)
 
-Install on macOS (Apple Silicon):
+Install a tagged release on macOS (Apple Silicon):
 
 ```sh
-curl -L https://github.com/gizmo385/mux/releases/download/latest/agent-mux-aarch64-apple-darwin.tar.gz \
+# Pick a version from https://github.com/gizmo385/mux/releases
+VERSION=vX.Y.Z
+curl -L "https://github.com/gizmo385/mux/releases/download/${VERSION}/agent-mux-aarch64-apple-darwin.tar.gz" \
   | tar -xz -C /tmp \
   && install -m 755 /tmp/agent-mux /usr/local/bin/agent-mux
 ```
 
-Tagged releases (when present) are the stable pin; `latest` tracks `main` and is overwritten on every push.
+Or substitute `latest` for `${VERSION}` to track `main`.
 
 ## Install via nix flake
 

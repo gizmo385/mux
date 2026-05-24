@@ -1,0 +1,20 @@
+# release-plz config — https://release-plz.ieni.dev/docs/config
+#
+# Releases are driven by Conventional Commits in the log. See
+# PROCESS.md § Versioning and releases for the workflow shape.
+
+[workspace]
+# crates.io publish is a separate decision — not flipped on yet.
+publish = false
+
+# Skip cargo-semver-checks for pre-1.0. The public API isn't stable
+# enough to make semver-check failures load-bearing yet; revisit when
+# we cut 1.0.
+semver_check = false
+
+# Create the git tag and the GitHub release. The tag push triggers
+# .github/workflows/release.yml, which uploads the cross-platform
+# binaries to the release this step creates.
+git_tag_enable = true
+git_release_enable = true
+git_release_type = "prod"

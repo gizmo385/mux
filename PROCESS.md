@@ -54,6 +54,29 @@ Hard strictness. Format, lint, and tests must pass; the commit is refused otherw
 
 CI runs the full check suite on every push: format-check, lint, typecheck, tests, and the build. CI failure is a hair-on-fire signal — the rule is "always green on `main`," and a red CI is a bug to be fixed before any further work.
 
+## Versioning and releases
+
+Releases are cut by [release-plz](https://release-plz.ieni.dev/) off the back of the commit log. The shape: every push to `main` updates an auto-maintained "Release PR" that bumps `Cargo.toml`, regenerates `CHANGELOG.md`, and lists what would ship. Merging that PR creates a `vX.Y.Z` git tag, which fires `release.yml` to upload cross-platform binaries to a non-prerelease GitHub release. Cutting a release is therefore: review the open Release PR, merge it.
+
+### Conventional Commits
+
+The commit log is the source of truth for what the next version should be. Every commit on `main` follows [Conventional Commits 1.0](https://www.conventionalcommits.org/):
+
+    <type>(<scope>): <subject>
+
+`<type>` is one of `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `perf`, `build`, `ci`, `style`. `<scope>` is the area touched (`session`, `attention`, `remote`, `embedded-pty`, `notifications`, `readme`, …) and is optional but encouraged — the existing log is uniformly scoped and it stays that way. Breaking changes are marked with a `!` after the type (`feat!:`) or a `BREAKING CHANGE:` footer in the body.
+
+release-plz reads these to choose the next version: `fix` bumps the patch, `feat` bumps the minor, breaking changes bump the minor (pre-1.0) or the major (post-1.0). Non-conforming subjects are silently ignored by the bump logic — the change still lands, it just doesn't move the version.
+
+### The two release channels
+
+- **Tagged (`vX.Y.Z`).** Stable, immutable, pinnable. Cut when the release-plz PR merges.
+- **`latest`** (rolling). Replaced on every push to `main`. Marked as a prerelease. For users who want the bleeding edge.
+
+### Setup
+
+release-plz needs a token that can push tags and PRs *in a way that triggers downstream workflows* — the default `GITHUB_TOKEN` does not, which would leave `release.yml` un-fired on tag creation. A fine-grained Personal Access Token scoped to this repository, with `contents: write` and `pull-requests: write`, stored as the repository secret `RELEASE_PLZ_TOKEN`, is enough. If the secret is missing or expired the release-plz workflow fails noisily and no PR moves — that is the intended failure mode.
+
 ## Code review
 
 Code review is layered. Each layer catches what the cheaper layers cannot.

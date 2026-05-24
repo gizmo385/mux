@@ -1,0 +1,52 @@
+name: release-plz
+
+# Maintains the "Release PR" (version bump + CHANGELOG) and, when that
+# PR merges, creates the matching git tag + GitHub release. The tag push
+# triggers release.yml, which uploads the cross-platform binaries.
+#
+# Requires the repo secret RELEASE_PLZ_TOKEN — a fine-grained PAT with
+# contents:write + pull-requests:write. The built-in GITHUB_TOKEN won't
+# work here because tag pushes made with it do not trigger other
+# workflows (an anti-loop safety in Actions). See PROCESS.md.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

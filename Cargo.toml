@@ -5,6 +5,11 @@ edition = "2024"
 description = "A fast, terminal-first multiplexer for managing multiple Claude Code conversations across local and remote hosts."
 license = "MIT"
 authors = ["gizmo385"]
+repository = "https://github.com/gizmo385/mux"
+homepage = "https://github.com/gizmo385/mux"
+readme = "README.md"
+keywords = ["claude", "tui", "terminal", "tmux", "ssh"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 crossterm = "0.29.0"

@@ -4,8 +4,9 @@
 # PROCESS.md § Versioning and releases for the workflow shape.
 
 [workspace]
-# crates.io publish is a separate decision — not flipped on yet.
-publish = false
+# Publish to crates.io when the Release PR merges. Requires the repo
+# secret CARGO_REGISTRY_TOKEN — see PROCESS.md § Versioning and releases.
+publish = true
 
 # Skip cargo-semver-checks for pre-1.0. The public API isn't stable
 # enough to make semver-check failures load-bearing yet; revisit when

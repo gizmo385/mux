@@ -56,7 +56,7 @@ CI runs the full check suite on every push: format-check, lint, typecheck, tests
 
 ## Versioning and releases
 
-Releases are cut by [release-plz](https://release-plz.ieni.dev/) off the back of the commit log. The shape: every push to `main` updates an auto-maintained "Release PR" that bumps `Cargo.toml`, regenerates `CHANGELOG.md`, and lists what would ship. Merging that PR creates a `vX.Y.Z` git tag, which fires `release.yml` to upload cross-platform binaries to a non-prerelease GitHub release. Cutting a release is therefore: review the open Release PR, merge it.
+Releases are cut by [release-plz](https://release-plz.ieni.dev/) off the back of the commit log. The shape: every push to `main` updates an auto-maintained "Release PR" that bumps `Cargo.toml`, regenerates `CHANGELOG.md`, and lists what would ship. Merging that PR creates a `vX.Y.Z` git tag, which fires `release.yml` to upload cross-platform binaries to a non-prerelease GitHub release. The same merge also publishes the crate to [crates.io](https://crates.io/crates/agent-mux). Cutting a release is therefore: review the open Release PR, merge it.
 
 ### Conventional Commits
 
@@ -70,12 +70,17 @@ release-plz reads these to choose the next version: `fix` bumps the patch, `feat
 
 ### The two release channels
 
-- **Tagged (`vX.Y.Z`).** Stable, immutable, pinnable. Cut when the release-plz PR merges.
-- **`latest`** (rolling). Replaced on every push to `main`. Marked as a prerelease. For users who want the bleeding edge.
+- **Tagged (`vX.Y.Z`).** Stable, immutable, pinnable. Cut when the release-plz PR merges. Published to crates.io alongside the GitHub release.
+- **`latest`** (rolling). Replaced on every push to `main`. Marked as a prerelease. GitHub-only — crates.io is tagged-releases-only since pre-releases on the registry would muddy `cargo install agent-mux` semantics.
 
 ### Setup
 
-release-plz needs a token that can push tags and PRs *in a way that triggers downstream workflows* — the default `GITHUB_TOKEN` does not, which would leave `release.yml` un-fired on tag creation. A fine-grained Personal Access Token scoped to this repository, with `contents: write` and `pull-requests: write`, stored as the repository secret `RELEASE_PLZ_TOKEN`, is enough. If the secret is missing or expired the release-plz workflow fails noisily and no PR moves — that is the intended failure mode.
+Two repository secrets, both required for the release-plz workflow to function:
+
+- **`RELEASE_PLZ_TOKEN`** — a fine-grained PAT scoped to this repo with `contents: write` and `pull-requests: write`. The default `GITHUB_TOKEN` can't be used because tag pushes made with it don't trigger downstream workflows (an anti-loop safety in Actions), which would leave `release.yml` un-fired on tag creation.
+- **`CARGO_REGISTRY_TOKEN`** — a [crates.io API token](https://crates.io/me) scoped to publish updates of `agent-mux`. release-plz's `release` command invokes `cargo publish` against this token when a merged Release PR ships a new version. The first-time publish of a brand-new crate goes through the same path — no manual `cargo publish` warmup needed, provided the crate name is still available at registration time.
+
+If either secret is missing or expired the release-plz workflow fails noisily and no PR moves — the intended failure mode. A missing `CARGO_REGISTRY_TOKEN` does *not* affect the GitHub release path; the binary upload via `release.yml` still works, only the crates.io publish step fails.
 
 ## Code review
 

@@ -515,6 +515,14 @@ impl Notifier {
         {
             return;
         }
+        // Suppress without arming the episodic flag: the user is
+        // looking at this session right now, but if they later move
+        // focus away while the session remains in NeedsInput, a
+        // *future* transition (e.g. they reply, Claude works, stops
+        // again) should still fire. Arming here would block that.
+        if t.actively_viewed {
+            return;
+        }
         let entry = self.state.entry(t.id.clone()).or_default();
         if entry.fired_for_current_episode {
             return;
@@ -590,6 +598,22 @@ pub struct Transition<'a> {
     pub title: &'a str,
     pub host: &'a HostId,
     pub project: &'a Path,
+    /// True when the user is *actively engaged* with this specific
+    /// session at transition time — the embedded PTY pane currently
+    /// hosts this session and keyboard focus is on the terminal, not
+    /// the sidebar. Set by the call site in `main.rs`; the notifier
+    /// uses it to suppress an OS toast that would tell the user
+    /// something they're already looking at.
+    ///
+    /// Suppression skips the episodic-flag arm so a *later* transition
+    /// (or this same `NeedsInput` episode observed once focus has
+    /// moved elsewhere) still fires normally. Today the notifier only
+    /// sees explicit attention-state transitions from the catalog, so
+    /// moving focus away mid-episode without a state change does not
+    /// produce a belated toast — acceptable per
+    /// `TODO.md`'s terminal-focus-suppression scoping (we're after
+    /// the loud false-positive, not a re-evaluation engine).
+    pub actively_viewed: bool,
 }
 
 #[cfg(test)]
@@ -796,6 +820,35 @@ mod tests {
                 title,
                 host,
                 project,
+                actively_viewed: false,
+            },
+            now,
+        );
+    }
+
+    /// `fire`, but with the user actively engaged with the transitioning
+    /// session at the moment of the update. Mirrors the main.rs call
+    /// site's `actively_viewed = true` branch.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_active(
+        n: &mut Notifier,
+        id: &SessionId,
+        prev: Attention,
+        new: Attention,
+        title: &str,
+        host: &HostId,
+        project: &Path,
+        now: SystemTime,
+    ) {
+        n.on_attention_update(
+            &Transition {
+                id,
+                prev,
+                new,
+                title,
+                host,
+                project,
+                actively_viewed: true,
             },
             now,
         );
@@ -1185,6 +1238,68 @@ mod tests {
         let log = rec.log.lock().unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].title, "agent-mux: y");
+    }
+
+    #[test]
+    fn does_not_fire_when_user_is_actively_viewing_the_session() {
+        let (mut n, rec) = notifier_with_log();
+        fire_active(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn actively_viewed_suppression_does_not_arm_episodic_flag() {
+        // A user who's looking at the pane during the transition gets
+        // no toast. If they later move focus away and another
+        // transition arrives for the same session, that one MUST
+        // fire — arming the episodic flag at the active-viewing point
+        // would block it incorrectly.
+        let (mut n, rec) = notifier_with_log();
+        fire_active(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "first",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 0, "active-view suppression");
+        // Session leaves NeedsInput (user replied), comes back. By
+        // then the user has moved focus away.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "first",
+            &local(),
+            Path::new("/p"),
+            at(10),
+        );
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "second",
+            &local(),
+            Path::new("/p"),
+            at(20),
+        );
+        let log = rec.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "second transition should fire");
+        assert_eq!(log[0].title, "agent-mux: second");
     }
 
     #[test]

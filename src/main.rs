@@ -1417,6 +1417,13 @@ impl App {
         });
         let host = session.host.clone();
         let project = session.project_dir.clone();
+        // Suppress the toast when the user is *already engaged* with
+        // this exact session: embedded PTY is open on it and keyboard
+        // focus is on the terminal (not the sidebar). The notifier
+        // doesn't arm its episodic flag in this case, so a later
+        // transition while focus is elsewhere still fires.
+        let actively_viewed = matches!(self.focus, Focus::Terminal { .. })
+            && self.embedded.as_ref().is_some_and(|e| e.session_id == *id);
         self.notifier.on_attention_update(
             &Transition {
                 id,
@@ -1425,6 +1432,7 @@ impl App {
                 title,
                 host: &host,
                 project: &project,
+                actively_viewed,
             },
             SystemTime::now(),
         );

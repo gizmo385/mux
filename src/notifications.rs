@@ -309,25 +309,60 @@ fn build_osascript(payload: &Payload) -> String {
     script
 }
 
+/// Fold non-ASCII characters to ASCII analogs for the WSL toast path.
+///
+/// WSL→Windows argv conversion goes through NT's wide-arg layer under
+/// the active console code page; non-ASCII bytes the user (or we) put
+/// in `Payload::title`/`body` arrive at `wsl-notify-send.exe` mojibake'd.
+/// 2026-05-23 dogfooding caught the production body's `·` (U+00B7,
+/// from `format!("{host} · {project}", ...)`) rendering as garbage in
+/// the resulting toast. Mapping the common typographic offenders to
+/// ASCII before the spawn fixes both the separator we control and any
+/// smart-quote/em-dash a user puts in a task title; unknown non-ASCII
+/// falls back to `?` so the toast stays readable rather than corrupt.
+#[must_use]
+fn ascii_fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{00B7}' => out.push('|'),
+            '\u{2013}' | '\u{2014}' => out.push('-'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{201C}' | '\u{201D}' => out.push('"'),
+            '\u{2026}' => out.push_str("..."),
+            c if c.is_ascii() => out.push(c),
+            _ => out.push('?'),
+        }
+    }
+    out
+}
+
 /// WSL dispatcher that shells out to `wsl-notify-send.exe` on the
 /// Windows side. Requires the binary on the user's Windows `PATH`
 /// (installed separately — see <https://github.com/stuartleeks/wsl-notify-send>).
 /// Bypasses Linux D-Bus, which 2026-05-20 dogfooding confirmed is
-/// fragile under `WSLg`.
+/// fragile under `WSLg`. Title and body are passed through
+/// [`ascii_fold`] first because the interop arg pipe is lossy on
+/// non-ASCII (see that function's docs).
 pub struct WslToastDispatcher;
 
 impl Dispatcher for WslToastDispatcher {
     fn dispatch(&self, payload: Payload) -> Result<(), String> {
         let sound_file = payload.sound_file.clone();
+        let title = ascii_fold(&payload.title);
+        let body = ascii_fold(&payload.body);
         std::thread::spawn(move || {
-            // `wsl-notify-send.exe` flags: `--category` is the title;
-            // the positional is the body. Older versions accept the
-            // same shape; if a user has a different fork, an explicit
-            // backend = "dbus" override gets them off this path.
+            // argv: `wsl-notify-send.exe --category <title> <body>`. Per
+            // 2026-05-23 dogfooding against v0.1.871612270, `--category`
+            // surfaces as the toast title and the sole positional is the
+            // body — empirical, not what `--help` implies. Passing two
+            // positionals makes the binary print its usage and exit
+            // non-zero, which the spawned thread silently swallows, so a
+            // wrong shape disappears as "no toast" rather than an error.
             let _ = Command::new("wsl-notify-send.exe")
                 .arg("--category")
-                .arg(&payload.title)
-                .arg(&payload.body)
+                .arg(&title)
+                .arg(&body)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -342,8 +377,8 @@ impl Dispatcher for WslToastDispatcher {
     fn dispatch_blocking(&self, payload: Payload) -> Result<(), String> {
         let _ = Command::new("wsl-notify-send.exe")
             .arg("--category")
-            .arg(&payload.title)
-            .arg(&payload.body)
+            .arg(ascii_fold(&payload.title))
+            .arg(ascii_fold(&payload.body))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -578,6 +613,22 @@ mod tests {
     fn pick_dispatcher_explicit_wsl_toast_returns_wsl_toast_label() {
         let (_, label) = pick_dispatcher(NotificationsBackend::WslToast);
         assert_eq!(label, "wsl-toast");
+    }
+
+    #[test]
+    fn ascii_fold_passes_through_pure_ascii_and_substitutes_known_offenders() {
+        assert_eq!(ascii_fold("plain ascii"), "plain ascii");
+        // Production body separator from notifications.rs `format!("{} · {}", ...)`.
+        assert_eq!(ascii_fold("local · /tmp/dir"), "local | /tmp/dir");
+        // Likely to appear in user-supplied task titles.
+        assert_eq!(ascii_fold("a — b – c"), "a - b - c");
+        assert_eq!(
+            ascii_fold("\u{2018}q\u{2019} \u{201C}r\u{201D}"),
+            "'q' \"r\""
+        );
+        assert_eq!(ascii_fold("done\u{2026}"), "done...");
+        // Unknown non-ASCII degrades to `?` rather than smuggling raw bytes.
+        assert_eq!(ascii_fold("emoji 🎉 here"), "emoji ? here");
     }
 
     fn payload(title: &str, body: &str, sound: bool) -> Payload {

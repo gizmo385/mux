@@ -9,7 +9,7 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 - **Create new sessions from inside the dashboard.** Press `n` to pick a repo, name a task, and pick a base branch — agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/`, writes task metadata, and launches `claude` inside it. Press `N` instead to skip the worktree step and open `claude` straight in the repo root (for quick exploratory chats where a fresh worktree would just be in the way). Either way, the new session lands in the embedded pane next to the sidebar, not a fullscreen handoff. Works equally for local and remote-host repos.
 - **Inline transcript preview.** `p` toggles a right-side pane showing the selected session's recent prompts, replies, tool calls, and tool results — without attaching. Lazy-fetched per selection and cached so navigating back is instant.
 - **Search / filter** the session list by title, project, or host with `/`.
-- **OS notifications** when a session moves into `needs-input` (libnotify on Linux, NSUserNotification on macOS).
+- **OS notifications** when a session moves into `needs-input` (libnotify on Linux, `osascript` on macOS, `wsl-notify-send.exe` on WSL).
 - **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`) with per-element overrides. Run `agent-mux themes` for a coloured preview.
 
 ## Keybinds

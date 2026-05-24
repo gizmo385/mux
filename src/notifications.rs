@@ -444,6 +444,14 @@ fn is_wsl() -> bool {
 struct SessionState {
     last_fired: Option<SystemTime>,
     fired_for_current_episode: bool,
+    /// Payload captured when an entry into `NeedsInput` was suppressed
+    /// because the user was actively viewing the session at the time.
+    /// Drained by [`Notifier::on_terminal_focus_lost`] to deliver a
+    /// belated toast when the user moves window-manager focus away
+    /// from the terminal without any new attention transition.
+    /// Cleared when the session leaves `NeedsInput` (the trigger no
+    /// longer applies) or once the belated toast actually fires.
+    pending_payload: Option<Payload>,
 }
 
 pub struct Notifier {
@@ -498,6 +506,12 @@ impl Notifier {
                 && let Some(s) = self.state.get_mut(t.id)
             {
                 s.fired_for_current_episode = false;
+                // The user has acted (or attention drifted) — any
+                // payload we were holding for a belated focus-loss
+                // toast no longer applies. Clearing here keeps
+                // `on_terminal_focus_lost` from firing for an episode
+                // that's already over.
+                s.pending_payload = None;
             }
             return;
         }
@@ -515,12 +529,24 @@ impl Notifier {
         {
             return;
         }
+        let payload = Payload {
+            title: format!("agent-mux: {}", t.title),
+            body: format!("{} · {}", t.host, t.project.display()),
+            sound: self.config.sound,
+            sound_file: self.config.sound_file.clone(),
+        };
         // Suppress without arming the episodic flag: the user is
         // looking at this session right now, but if they later move
         // focus away while the session remains in NeedsInput, a
         // *future* transition (e.g. they reply, Claude works, stops
         // again) should still fire. Arming here would block that.
+        // The payload is stashed so [`on_terminal_focus_lost`] can
+        // deliver a belated toast if the user alt-tabs away without
+        // any further attention transition (the false-negative path
+        // 2026-05-24 dogfooding surfaced).
         if t.actively_viewed {
+            let entry = self.state.entry(t.id.clone()).or_default();
+            entry.pending_payload = Some(payload);
             return;
         }
         let entry = self.state.entry(t.id.clone()).or_default();
@@ -535,15 +561,75 @@ impl Notifier {
         {
             return;
         }
-        let payload = Payload {
-            title: format!("agent-mux: {}", t.title),
-            body: format!("{} · {}", t.host, t.project.display()),
-            sound: self.config.sound,
-            sound_file: self.config.sound_file.clone(),
-        };
         if self.dispatcher.dispatch(payload).is_ok() {
             entry.last_fired = Some(now);
             entry.fired_for_current_episode = true;
+            // Belated toast no longer needed — the immediate one fired.
+            entry.pending_payload = None;
+        }
+    }
+
+    /// Deliver toasts for sessions whose entry into `NeedsInput` was
+    /// previously suppressed because the user was actively viewing
+    /// them. Called from the main event loop on DEC 1004 `FocusLost`
+    /// (window-manager focus left the agent-mux terminal).
+    ///
+    /// Why this exists: [`on_attention_update`] deliberately does not
+    /// arm `fired_for_current_episode` when `actively_viewed` is true
+    /// — a *future* attention transition for the same session must
+    /// still fire normally. But moving window-manager focus away
+    /// without any further transition produced no signal at all,
+    /// which 2026-05-24 dogfooding caught as the false-negative
+    /// "Claude asked for a permission and I didn't notice because
+    /// I'd alt-tabbed to my browser." This method closes that gap.
+    ///
+    /// For each session with a stored pending payload (and the
+    /// episodic flag still clear), the captured payload is dispatched
+    /// and the flag is armed. Sessions without a pending payload are
+    /// untouched; the master toggle and per-host disables already
+    /// gated the entry into the pending state at suppression time, so
+    /// no second check is needed here. On dispatch failure the
+    /// payload is restored to give the next focus-loss edge a retry,
+    /// matching the rest of the notifier's "transient failure should
+    /// not silently swallow a user-attention signal" stance.
+    pub fn on_terminal_focus_lost(&mut self, now: SystemTime) {
+        // Two-phase to sidestep the `&mut self.dispatcher` /
+        // `&mut self.state` borrow conflict: first collect the work
+        // items (id + payload + current debounce timestamp), then
+        // hand each off to the dispatcher in a borrow-free loop, then
+        // write the resulting state back.
+        let mut work: Vec<(SessionId, Payload)> = Vec::new();
+        for (id, entry) in &mut self.state {
+            let Some(payload) = entry.pending_payload.as_ref() else {
+                continue;
+            };
+            if entry.fired_for_current_episode {
+                continue;
+            }
+            if let Some(last) = entry.last_fired
+                && now
+                    .duration_since(last)
+                    .ok()
+                    .is_some_and(|d| d < DEBOUNCE_WINDOW)
+            {
+                continue;
+            }
+            work.push((id.clone(), payload.clone()));
+        }
+        for (id, payload) in work {
+            let dispatched = self.dispatcher.dispatch(payload).is_ok();
+            if let Some(entry) = self.state.get_mut(&id)
+                && dispatched
+            {
+                entry.last_fired = Some(now);
+                entry.fired_for_current_episode = true;
+                entry.pending_payload = None;
+            }
+            // On dispatch failure we deliberately leave `pending_payload`
+            // intact (it was never `take`n in this revision) so a
+            // later focus-loss edge can retry — same "transient
+            // backend outage shouldn't silently swallow a
+            // user-attention signal" stance as the rest of the notifier.
         }
     }
 
@@ -607,12 +693,12 @@ pub struct Transition<'a> {
     ///
     /// Suppression skips the episodic-flag arm so a *later* transition
     /// (or this same `NeedsInput` episode observed once focus has
-    /// moved elsewhere) still fires normally. Today the notifier only
-    /// sees explicit attention-state transitions from the catalog, so
-    /// moving focus away mid-episode without a state change does not
-    /// produce a belated toast — acceptable per
-    /// `TODO.md`'s terminal-focus-suppression scoping (we're after
-    /// the loud false-positive, not a re-evaluation engine).
+    /// moved elsewhere) still fires normally. The suppressed payload
+    /// is stashed on the per-session state so
+    /// [`Notifier::on_terminal_focus_lost`] can deliver a belated
+    /// toast when the user moves window-manager focus away from the
+    /// terminal without producing any new attention transition —
+    /// closes the false-negative path 2026-05-24 dogfooding surfaced.
     pub actively_viewed: bool,
 }
 
@@ -1300,6 +1386,217 @@ mod tests {
         let log = rec.log.lock().unwrap();
         assert_eq!(log.len(), 1, "second transition should fire");
         assert_eq!(log[0].title, "agent-mux: second");
+    }
+
+    #[test]
+    fn focus_loss_delivers_belated_toast_for_actively_viewed_suppression() {
+        // The dogfooded scenario (2026-05-24): user is staring at the
+        // session's embedded pane when it enters NeedsInput, then
+        // alt-tabs to a browser. The transition-time suppression is
+        // correct (no toast while looking at it), but the focus-loss
+        // edge must deliver the belated toast — otherwise the user
+        // misses the permission prompt entirely.
+        let (mut n, rec) = notifier_with_log();
+        fire_active(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "permission prompt",
+            &local(),
+            Path::new("/proj"),
+            at(0),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 0, "suppressed at transition");
+        n.on_terminal_focus_lost(at(1));
+        let log = rec.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "belated toast on focus loss");
+        assert_eq!(log[0].title, "agent-mux: permission prompt");
+    }
+
+    #[test]
+    fn focus_loss_is_a_noop_when_no_session_has_a_pending_payload() {
+        // The vast majority of focus-loss edges happen with no pending
+        // payloads — every alt-tab away while nothing is waiting. The
+        // method must be cheap and silent in that case.
+        let (mut n, rec) = notifier_with_log();
+        n.on_terminal_focus_lost(at(0));
+        assert!(rec.log.lock().unwrap().is_empty());
+        // And a normal (non-actively-viewed) fire followed by focus
+        // loss must not re-fire — the episodic flag is already armed,
+        // no pending payload was stored.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(10),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+        n.on_terminal_focus_lost(at(20));
+        assert_eq!(
+            rec.log.lock().unwrap().len(),
+            1,
+            "focus loss must not duplicate an already-fired toast"
+        );
+    }
+
+    #[test]
+    fn focus_loss_does_not_refire_after_session_leaves_needs_input() {
+        // Pending payload must be cleared when the user replies (or
+        // attention drifts) so a later focus-loss doesn't surface a
+        // stale toast for an episode that's already over.
+        let (mut n, rec) = notifier_with_log();
+        fire_active(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(5),
+        );
+        n.on_terminal_focus_lost(at(10));
+        assert!(
+            rec.log.lock().unwrap().is_empty(),
+            "no toast — the episode is over"
+        );
+    }
+
+    #[test]
+    fn focus_loss_belated_toast_arms_episodic_flag_so_idle_redrives_dont_refire() {
+        // Once the belated toast lands, a subsequent NeedsInput→NeedsInput
+        // catalog tick (the watcher periodically re-asserts the same
+        // state) must not double-fire. Same invariant the normal
+        // dispatch path enforces via `fired_for_current_episode`.
+        let (mut n, rec) = notifier_with_log();
+        fire_active(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        n.on_terminal_focus_lost(at(1));
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+        // Watcher re-asserts (no real transition). Must not refire.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(10),
+        );
+        // A second focus-loss edge (user re-focused then alt-tabbed
+        // again) must also not refire — pending was drained.
+        n.on_terminal_focus_lost(at(20));
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn focus_loss_belated_toast_restores_pending_on_dispatch_failure() {
+        // Symmetric with the normal dispatch path: a transient
+        // backend outage must not silently swallow the user-attention
+        // signal. Restoring the pending payload lets the next focus-
+        // loss edge retry (e.g. user re-focuses then alt-tabs again).
+        let mut n = Notifier::new(Box::new(FailingDispatcher), NotificationsConfig::default());
+        n.on_attention_update(
+            &Transition {
+                id: &sid("a"),
+                prev: Attention::Working,
+                new: Attention::NeedsInput,
+                title: "x",
+                host: &local(),
+                project: Path::new("/p"),
+                actively_viewed: true,
+            },
+            at(0),
+        );
+        n.on_terminal_focus_lost(at(1));
+        // Failed dispatch must leave the session re-fire-able. Swap
+        // in a working recorder and prove a second focus-loss fires.
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        n.dispatcher = Box::new(SharedRecorder(std::sync::Arc::clone(&rec)));
+        n.on_terminal_focus_lost(at(2));
+        assert_eq!(
+            rec.log.lock().unwrap().len(),
+            1,
+            "retry should fire after a working dispatcher is swapped in"
+        );
+    }
+
+    #[test]
+    fn focus_loss_belated_toast_respects_debounce_against_prior_fire() {
+        // Edge case: a normal fire arms last_fired, then the session
+        // leaves and re-enters NeedsInput while actively-viewed
+        // (stashes pending), and the user alt-tabs within the
+        // debounce window of the prior fire. The same debounce that
+        // protects against catalog flapping should suppress the
+        // belated toast too — otherwise we get two pings in <5s
+        // for what's effectively the same attention episode from the
+        // user's perspective.
+        let (mut n, rec) = notifier_with_log();
+        // Fire 1 at t=0 (normal, not actively viewed).
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(0),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+        // Leaves and re-enters NeedsInput within the debounce window,
+        // now actively viewed — stashes pending.
+        fire(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(1),
+        );
+        fire_active(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(2),
+        );
+        // Focus loss inside the debounce window — must NOT fire.
+        n.on_terminal_focus_lost(at(3));
+        assert_eq!(
+            rec.log.lock().unwrap().len(),
+            1,
+            "debounce should suppress the belated toast"
+        );
     }
 
     #[test]

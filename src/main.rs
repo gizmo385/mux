@@ -1928,6 +1928,12 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 }
                 Event::FocusLost => {
                     app.terminal_focused = false;
+                    // Re-evaluate sessions whose `NeedsInput` entry was
+                    // suppressed because they were actively viewed at
+                    // transition time. The user has just alt-tabbed
+                    // away from the terminal, so any belated toast we
+                    // stashed should fire now.
+                    app.notifier.on_terminal_focus_lost(SystemTime::now());
                     continue;
                 }
                 Event::Key(_) => {}

@@ -41,6 +41,7 @@ use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
 };
+use agent_mux::favorites::{FavoritesStore, default_store_path as favorites_default_store_path};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
 use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
@@ -423,6 +424,12 @@ struct App {
     /// flows through this store. Overrides take precedence over the
     /// transcript's `aiTitle` / `task.toml` title.
     session_names: SessionNameStore,
+    /// User-pinned sessions surfaced in the `── favorites ──` group
+    /// at the very top of the sidebar. Keyed by `(host, session_id)`;
+    /// loaded at startup from `~/.cache/agent-mux/favorites.json`.
+    /// The `f` keybind toggles membership for the selected session
+    /// row (see [`Self::toggle_favorite_selected`]).
+    favorites: FavoritesStore,
     /// Active rename overlay. `Some` when the user pressed `r` on a
     /// session row and is editing the new name; `None` otherwise.
     /// While `Some`, every keystroke routes through
@@ -682,6 +689,7 @@ impl App {
             embedded_mode,
             tool_launches: ToolLaunchRegistry::new(),
             session_names: load_session_names_or_empty(),
+            favorites: load_favorites_or_empty(),
             rename: None,
         })
     }
@@ -707,6 +715,40 @@ impl App {
             buffer: initial,
         });
         self.status = None;
+    }
+
+    /// Toggle favorite for the currently-selected session row. No-op
+    /// when the cursor isn't on a session row (header / tool row /
+    /// empty list). Re-seats selection after the toggle because
+    /// favoriting adds a row to the pinned group (shifting natural-
+    /// tree indices down by two — the favorites header plus the
+    /// favorited row), and unfavoriting removes those two rows.
+    /// Without the re-seat, the highlight would jump to whatever
+    /// row landed at the old absolute index. `SelectionAnchor`
+    /// carries the in-favorites flag, so the cursor stays on the
+    /// natural-tree copy when toggling from there (rather than
+    /// silently jumping to the new favorites copy).
+    fn toggle_favorite_selected(&mut self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let host = session.host.clone();
+        let id = session.id.clone();
+        let title = session
+            .title
+            .clone()
+            .unwrap_or_else(|| session.id.0.clone());
+        let prior = self.selected_anchor_for_reseat();
+        let now_favorited = self.favorites.toggle(&host, &id);
+        self.reseat_selection_to(prior.as_ref());
+        self.status = Some(format!(
+            "{}: {title}",
+            if now_favorited {
+                "favorited"
+            } else {
+                "unfavorited"
+            }
+        ));
     }
 
     /// Route a key while the rename overlay is active. Returns
@@ -752,21 +794,25 @@ impl App {
     /// selection resolution) sees the same set of rows; otherwise a
     /// j/k stroke could walk a list shape the user can't actually see.
     fn current_rows(&self) -> Vec<DisplayRow> {
+        let sessions = self.catalog.sessions();
+        // Closure body borrows `self.favorites` immutably; the closure
+        // outlives the build call but the `&self` borrow guarantees
+        // the store stays put for the duration.
+        let is_favorite = |i: usize| {
+            sessions
+                .get(i)
+                .is_some_and(|s| self.favorites.contains(&s.host, &s.id))
+        };
         let session_rows = match self.search.as_ref() {
             Some(s) if !s.query.is_empty() => {
                 let q = s.query.to_lowercase();
-                let sessions = self.catalog.sessions();
-                // `|_| false` for is_favorite until step 3 of the
-                // favorites spec wires the store load + `f` keybind.
-                // The DisplayRow plumbing for the favorites group is in
-                // place but the favorites set is permanently empty.
                 build_display_rows_filtered(
                     sessions,
                     |i| matches_query(&sessions[i], &q),
-                    |_| false,
+                    is_favorite,
                 )
             }
-            _ => build_display_rows(self.catalog.sessions()),
+            _ => build_display_rows_filtered(sessions, |_| true, is_favorite),
         };
         // Surface the Tools group above sessions when one or more
         // launches are running. Search filtering doesn't affect this
@@ -2213,6 +2259,10 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.open_rename();
             ActionOutcome::Continue
         }
+        Action::ToggleFavorite => {
+            app.toggle_favorite_selected();
+            ActionOutcome::Continue
+        }
         Action::LaunchTool(idx) => match app.launch_tool(idx) {
             Some(cmd) => ActionOutcome::Suspend(cmd),
             None => ActionOutcome::Continue,
@@ -2247,6 +2297,11 @@ enum Action {
     DeleteWorktree,
     /// `r` — open the inline rename overlay for the selected session.
     RenameSession,
+    /// `f` — toggle favorite for the selected session. Surfaces /
+    /// removes the session from the pinned `── favorites ──` group
+    /// at the top of the sidebar; persists to
+    /// `~/.cache/agent-mux/favorites.json`.
+    ToggleFavorite,
     /// User-configured `[[tools]]` keybind. The index is into
     /// `App.config.tools` — `dispatch_action` reads the binding back
     /// out of the same vec at fire time so a stale index can't
@@ -2280,6 +2335,7 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::OpenSearch),
         KeyCode::Char('d') => Some(Action::DeleteWorktree),
         KeyCode::Char('r') => Some(Action::RenameSession),
+        KeyCode::Char('f') => Some(Action::ToggleFavorite),
         // Tool keybinds dispatch after built-ins. Config-load
         // validation rejected any tool whose `key` shadows a built-in
         // (RESERVED_KEY_CHARS in config.rs), so the order here is
@@ -2377,28 +2433,36 @@ fn build_sidebar_items(
     theme: &Theme,
     tool_launches: &[ToolLaunch],
     session_names: &SessionNameStore,
+    favorites: &FavoritesStore,
 ) -> Vec<ListItem<'static>> {
     rows.iter()
         .map(|row| match row {
             DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
             DisplayRow::ProjectHeader(path) => ListItem::new(format_project_header(path, home)),
-            // Both session-row variants render identically for now.
-            // Step 4 of the favorites spec will introduce a `★` glyph
-            // prefix on `FavoriteSessionRow` and the distinct
-            // `── favorites ──` header style; until then the
-            // favorites section is functionally invisible because
-            // the store load (step 3) hasn't shipped — the
-            // favorites set is always empty in production.
-            DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
+            DisplayRow::SessionRow(i) => {
                 let s = &sessions[*i];
                 let name_override = session_names.get(&s.host, &s.id);
-                ListItem::new(format_session_row(s, theme, name_override))
+                let is_favorite = favorites.contains(&s.host, &s.id);
+                ListItem::new(format_session_row(
+                    s,
+                    theme,
+                    name_override,
+                    is_favorite,
+                    false,
+                ))
+            }
+            DisplayRow::FavoriteSessionRow(i) => {
+                let s = &sessions[*i];
+                let name_override = session_names.get(&s.host, &s.id);
+                // A row in the favorites group is, by construction,
+                // favorited — pass `true` directly rather than
+                // round-tripping through the store (which would also
+                // be correct but reads as a tautology).
+                ListItem::new(format_session_row(s, theme, name_override, true, true))
             }
             DisplayRow::ToolsHeader => ListItem::new(format_tools_header()),
             DisplayRow::ToolRow(i) => ListItem::new(format_tool_row(&tool_launches[*i])),
-            DisplayRow::FavoritesHeader => {
-                ListItem::new(format_project_header(Path::new("favorites"), None))
-            }
+            DisplayRow::FavoritesHeader => ListItem::new(format_favorites_header()),
         })
         .collect()
 }
@@ -2473,6 +2537,17 @@ fn build_notifier(cfg: &config::NotificationsConfig) -> Notifier {
 fn load_session_names_or_empty() -> SessionNameStore {
     default_store_path()
         .map(SessionNameStore::load_or_empty)
+        .unwrap_or_default()
+}
+
+/// Load the persistent favorites store from the default cache path,
+/// degrading silently to an empty store when no cache path resolves.
+/// Mirrors [`load_session_names_or_empty`] for the same reason: keep
+/// the App field initialiser a one-liner.
+#[must_use]
+fn load_favorites_or_empty() -> FavoritesStore {
+    favorites_default_store_path()
+        .map(FavoritesStore::load_or_empty)
         .unwrap_or_default()
 }
 
@@ -2554,6 +2629,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.theme,
         app.tool_launches.launches(),
         &app.session_names,
+        &app.favorites,
     );
     let sidebar_block = Block::default()
         .borders(Borders::ALL)
@@ -2996,10 +3072,23 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
     ))
 }
 
+/// Header for the pinned favorites group at the very top of the
+/// sidebar. Same `── label ──` BOLD shape as the host header — the
+/// favorites group sits at the same vertical scope as a host, so the
+/// styling matches.
+fn format_favorites_header() -> Line<'static> {
+    Line::from(Span::styled(
+        "── favorites ──".to_string(),
+        Style::new().add_modifier(Modifier::BOLD),
+    ))
+}
+
 fn format_session_row(
     session: &Session,
     theme: &Theme,
     name_override: Option<&str>,
+    is_favorite: bool,
+    in_favorites_group: bool,
 ) -> Line<'static> {
     let attention = effective_attention(session);
     let glyph = attention_glyph(attention);
@@ -3016,15 +3105,20 @@ fn format_session_row(
     let title_dim = matches!(session.has_live_pane, Some(false));
     let title_style = if title_dim { dim } else { Style::new() };
 
-    // Indented two levels under the project header. Project text is
-    // no longer per-row (the header carries it); for title-less
-    // sessions, fall back to a short session-id suffix so two
-    // unnamed sessions in the same project remain distinguishable.
-    let mut spans = vec![
-        Span::raw("    "),
-        Span::styled(glyph, glyph_style),
-        Span::raw(" "),
-    ];
+    // Indent depth: 2 spaces inside the favorites group (one level
+    // under `── favorites ──`), 4 spaces in the natural host/project
+    // tree (two levels under the host header + project header).
+    let indent = if in_favorites_group { "  " } else { "    " };
+    let mut spans = vec![Span::raw(indent)];
+    // ★ glyph appears on *both* copies of a favorited session — the
+    // user reads "this is one of my pinned ones" the same way
+    // regardless of which copy they happen to be looking at. Dim
+    // styling keeps it out of the attention-glyph's hierarchy.
+    if is_favorite {
+        spans.push(Span::styled("★ ", dim));
+    }
+    spans.push(Span::styled(glyph, glyph_style));
+    spans.push(Span::raw(" "));
     // User overrides take precedence over both `aiTitle` and the
     // task-toml-derived title (the 2026-05-21 rename feature). A
     // newly-arriving AI title does *not* clobber the override — once
@@ -3046,6 +3140,15 @@ fn format_session_row(
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(age, dim));
+    // Favorites group spans hosts (`recency desc across all hosts`),
+    // so the host label is otherwise invisible — the natural tree's
+    // `── local ──` / `── alpenglow ──` header doesn't apply here.
+    // Append it inline so the user can tell two same-titled sessions
+    // on different hosts apart.
+    if in_favorites_group {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("[{}]", session.host), dim));
+    }
     Line::from(spans)
 }
 

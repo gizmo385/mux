@@ -79,31 +79,6 @@ Flat backlog grouped by feature area. Each entry tagged with `#area`. Done items
 - footer keybind line is dense after the group-jump hints landed (2026-05-17): `j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · n: new · q: quit  ·  return: …` will truncate on narrow terminals. Not a regression (the line was already long) but worth a follow-up. Plausible shapes: (a) drop secondary hints (`t: terminal`, `n: new`) when terminal width < threshold; (b) hide the group-jump hints once the user has used them once (a "learned" signal); (c) split into two footer rows. Defer until dogfooding shows whether it actually bites. `#ui #footer`
 - larger move on return-to-dashboard discoverability: in inside-tmux mode, name the agent-mux window predictably (e.g. `agent-mux`) so the hint can become "switch-client -t agent-mux" instead of the generic "prefix+s" picker. Deferred — the footer hint shipped first to see whether it's enough in dogfooding before introducing a window-naming convention. `#ui #attachment`
 - decide UX when agent-mux is launched from inside an existing tmux session vs from a bare shell. `#ui #dogfood`
-- favorite sessions with a pinned section at the top of the sidebar (raised by user 2026-05-19, spec resolved 2026-05-24). Motivating pain: an active conversation's `last_activity` advances on every tool_use / NeedsInput / transcript write, and `build_display_rows` re-sorts projects by `max(last_activity) desc` — so frequently-attended sessions never settle into a stable position the user can muscle-memory. Pinning them at the top decouples that subset from the activity-driven reshuffle. Resolved design:
-
-  - **Unit: session, not project.** Per-`(host, session_id)` keying, same precedent as `SessionNameStore`. A "favorite project" without a session is what the Repo Registry pin (`n`-picker) already covers; the actual pain is per-session. Project-level favorites can layer on later if dogfooding surfaces a real ask.
-  - **Persistence: `~/.cache/agent-mux/favorites.json`.** Atomic tmp+rename, malformed degrades to empty — identical pattern to `session_names.json`. Config-file persistence is overkill: session ids aren't portable across machines (local uuids; remote ids live per-host), so "survives a machine move" buys nothing. Stale entries (session deleted, host gone) are left in place — they re-bind if the same id reappears, same as renames; a startup-time intersection against the catalog is unnecessary cleanup work.
-  - **Keybind: `f` to toggle.** Free in the dashboard map. Must be added to `RESERVED_KEY_CHARS` so user `[[tools]]` bindings can't shadow it.
-  - **Render: pinned `── favorites ──` group at the top, *plus* in-place `★` glyph in the normal host/project group.** Favorited sessions appear twice — once in the favorites section, once in their natural location — so neither view loses information (the per-project completeness view stays whole). Inactive-but-favorited sessions still surface in the top group; dim styling follows the existing `has_live_pane = Some(false)` rule.
-  - **Sort within favorites: recency desc.** Matches the rest of the sidebar; cheapest implementation. Manual reorder is a real UX lift (reorder mode, persistence-of-order, conflict resolution across closes) — defer until dogfooding shows recency isn't enough.
-  - **Search interaction: favorites obey the filter.** A favorited row that doesn't match the query is hidden, including from the pinned section. Asymmetric "favorites ignore search" surprises users more than it helps. Empty favorites section during a narrow search is acceptable.
-  - **Notifications: no tie-in for v1.** Favorites are a sidebar-stability feature only. Per-favorite notification overrides (e.g. "fire even when this host is in `disabled_hosts`," distinct sound) wait for a real dogfooded gap.
-
-  Implementation sketch (in order, each its own commit):
-  1. `src/favorites.rs`: `FavoritesStore` modeled on `SessionNameStore` — `HashSet<(HostId, SessionId)>`, `load_or_empty`, `toggle`, `contains`, `save` (atomic).
-  2. `dashboard::DisplayRow`: add `FavoritesHeader` variant and either widen `SessionRow(i)` to `SessionRow { idx: usize, in_favorites: bool }` *or* introduce `FavoriteSessionRow(i)` — the former is fewer match arms, but the latter keeps `is_selectable` / `next_session_index` from needing a new field check. Lean toward the variant split; the existing helpers already pattern-match on the enum and adding a peer variant is local. **Caveat:** `reseat_selection_to` uses `rows.iter().position(...)` which returns the *first* match — with a session appearing as both `FavoriteSessionRow(i)` and `SessionRow(i)`, after a re-seat the highlight could jump to the favorites copy when the user was on the in-place copy. Fix at the same time: re-seat preserves which "instance" the user was on (track a small `(SessionId, in_favorites: bool)` tuple instead of just the id).
-  3. `build_display_rows_filtered`: accept `&FavoritesStore` (or a `HashSet<&(HostId, SessionId)>`), emit the favorites section first if non-empty, then the existing host/project tree. Recency-desc within the section.
-  4. `format_session_row`: render `★` glyph (theme-able via a new `[theme.favorite]` knob, or reuse an existing colour for v1).
-  5. `App::open_favorite` (or just inline in the action dispatch): on `f`, toggle for the selected session, persist immediately (same write-through pattern as renames).
-  6. `RESERVED_KEY_CHARS` gets `f`.
-
-  Out of scope explicitly (revisit only if dogfooding asks):
-  - Project-level favorites (see unit decision above).
-  - Manual reorder within favorites (see sort decision above).
-  - Notification priority tie-in (see notif decision above).
-  - Cross-machine sync of favorites for remote sessions — the cache is per-machine; favoriting `(alpenglow, session-xyz)` on laptop A doesn't propagate to laptop B. Acceptable: the user can re-favorite, and the cost is one keystroke.
-
-  `#ui #sidebar #favorites`
 
 ### Discovery & catalog perf
 

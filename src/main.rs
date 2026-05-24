@@ -1263,6 +1263,14 @@ impl App {
     /// it and return focus to the sidebar (otherwise the user is
     /// staring at a tmux pane whose cwd no longer exists).
     fn drain_deletes(&mut self) {
+        // A successful delete removes the row from the catalog and can
+        // also collapse the project header (if it was the project's
+        // last session) — both reshape row indices under the cursor.
+        // Capture-prior + reseat-after pins the highlight to the same
+        // session when it survives, and falls back to the first
+        // session row when the prior id is gone (the deleted one was
+        // selected).
+        let prior = self.selected_id_for_reseat();
         while let Ok(result) = self.delete_rx.try_recv() {
             match result {
                 DeleteWorktreeResult::Deleted(id) => {
@@ -1294,9 +1302,24 @@ impl App {
                 }
             }
         }
+        self.reseat_selection_to(prior.as_ref());
     }
 
     fn drain_updates(&mut self) {
+        // `build_display_rows` orders projects by `max(last_activity)
+        // desc`, so any attention update / new transcript / hook event
+        // that touches `last_activity` (or adds/removes a session) can
+        // reshuffle the row layout under the user's cursor. The
+        // `list_state` holds an absolute row index, not a session id —
+        // without a re-seat, the highlight stays on the old index and
+        // visually jumps onto a different row (often the project
+        // header, which then reads as "the project title disappeared").
+        // Capture-prior + reseat-after pins the highlight to the same
+        // *session* across the drain. `reseat_selection_to` falls back
+        // to the first session row when the prior id is gone (e.g. a
+        // delete consumed it), matching the rest of the codebase's
+        // re-seat sites.
+        let prior = self.selected_id_for_reseat();
         while let Ok(event) = self.updates.try_recv() {
             match event {
                 WatcherEvent::Attention(update) => {
@@ -1368,6 +1391,7 @@ impl App {
                 }
             }
         }
+        self.reseat_selection_to(prior.as_ref());
     }
 
     /// Route an attention transition to the notifier with the session's

@@ -7,10 +7,9 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 - **One dashboard for every Claude Code session you have running** — locally and on any SSH-reachable host you've configured. Sessions group by host, then by project. Each row shows live attention state (● needs-input, ◐ working, ○ idle), title, and time since last activity.
 - **Attach without leaving the dashboard.** Pressing Enter hosts the active session inside an embedded terminal pane next to the sidebar: you see tmux + Claude Code on the right, the live session list on the left, and the sidebar keeps updating other sessions' attention state while you work. `--no-embed` reverts to the legacy "take over the whole terminal" behaviour for users who prefer it.
 - **Create new sessions from inside the dashboard.** Press `n` to pick a repo, name a task, and pick a base branch — agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/`, writes task metadata, and launches `claude` inside it. Press `N` instead to skip the worktree step and open `claude` straight in the repo root (for quick exploratory chats where a fresh worktree would just be in the way). Either way, the new session lands in the embedded pane next to the sidebar, not a fullscreen handoff. Works equally for local and remote-host repos.
-- **Inline transcript preview.** `p` toggles a right-side pane showing the selected session's recent prompts, replies, tool calls, and tool results — without attaching. Lazy-fetched per selection and cached so navigating back is instant.
 - **Search / filter** the session list by title, project, or host with `/`.
 - **OS notifications** when a session moves into `needs-input` (libnotify on Linux, `osascript` on macOS, `wsl-notify-send.exe` on WSL).
-- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`) with per-element overrides. Run `agent-mux themes` for a coloured preview.
+- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`) with per-element overrides. Run `agent-mux themes` for a swatch preview.
 
 ## Keybinds
 
@@ -27,7 +26,6 @@ The dashboard discovers local Claude Code sessions, groups them under host heade
 - `d` — delete the selected session's worktree (worktree-backed sessions only — sessions started outside a worktree are skipped with a status line). Opens a confirmation modal showing the task, path, and host plus a `[ ] force` toggle (`f` to flip on/off); `Enter` confirms, `Esc` cancels. Without force, git refuses on uncommitted changes — re-confirm with force on if that's what you want. The branch the worktree was on, the transcript file, and any remote `agent-mux-<id>` tmux session are left alone — clean those up yourself if you want them gone.
 - Custom tool keybinds — add `[[tools]]` entries to `~/.config/agent-mux/config.toml` and the dashboard will dispatch user-defined keybinds that launch a terminal tool in the selected session's cwd. Same dispatch family as `t: terminal`: inside tmux a new window opens with the command; outside tmux the TUI suspends and runs the command directly. `{cwd}` and `{host}` in command tokens are substituted at fire time. Keys are validated against built-ins at load (collisions are rejected, not silently overridden). Example: a binding `key = "g"`, `command = ["lazygit"]` makes `g` open lazygit in the selected worktree.
 - `/` — search/filter sessions by title, project directory, or host (case-insensitive substring). Type to narrow live, `Enter` to apply (keeps filter and returns focus to the list), `Esc` to clear and exit, `/` again to edit the active filter.
-- `p` — toggle the preview pane: a right-side split showing the last entries of the selected session's transcript without attaching. Disabled while the embedded pane is active — the terminal *is* the preview, in HD.
 - `q` / Ctrl-C — quit (in sidebar focus only; inside the embedded pane, Ctrl-C interrupts the running child, the standard tty behaviour)
 
 ### Embedded pane
@@ -95,9 +93,8 @@ disabled_hosts = []     # host labels to silence entirely
 # preset. Bad names fail loudly at load.
 #
 # Built-in presets:
-#   "default"   — cyan/green/red preview, uncoloured glyphs.
-#   "bright"    — high contrast; every attention state coloured,
-#                 preview switches to bright_* variants.
+#   "default"   — uncoloured attention glyphs.
+#   "bright"    — high contrast; every attention state in bright_* variants.
 #   "mono"      — no colours at all (modifiers like bold/dim still apply).
 #   "warm"      — sunset palette: reds, ambers, earthy browns.
 #   "cool"      — ocean palette: blues, teals, sea greens (errors stay rose).

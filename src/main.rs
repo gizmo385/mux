@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use agent_mux::attachment::{
     AttachOutcome, AttachmentDriver, EmbedSpec, PtyDriver, SuspendCommand, TmuxDriver,
@@ -29,10 +29,10 @@ use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
 use agent_mux::config::{self, Config, Theme, ToolBinding};
 use agent_mux::dashboard::{
-    DisplayRow, Focus, PreviewEntry, SearchMode, SearchOutcome, SearchState, apply_fg,
-    build_display_rows, build_display_rows_filtered, compose_preview_pane_lines,
-    first_session_index, is_pty_leader, matches_query, next_host_index, next_project_index,
-    next_session_index, prev_host_index, prev_project_index, prev_session_index,
+    DisplayRow, Focus, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
+    build_display_rows_filtered, first_session_index, is_pty_leader, matches_query,
+    next_host_index, next_project_index, next_session_index, prev_host_index, prev_project_index,
+    prev_session_index,
 };
 use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
@@ -44,7 +44,6 @@ use agent_mux::embedded_pty::{
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
 use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
-use agent_mux::preview::parse_preview;
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
 use agent_mux::session_names::{SessionNameStore, default_store_path};
@@ -88,21 +87,6 @@ const SIDEBAR_WIDTH: u16 = 40;
 /// without a restart; long enough that rapid open/close of the modal
 /// doesn't repeat the depth-1 walk on every keystroke.
 const REPO_REFRESH_TTL: Duration = Duration::from_secs(30);
-
-/// Bytes of transcript tail to fetch for each preview. Enough for a
-/// double-digit number of entries on typical sessions even after the
-/// JSONL grows verbose with usage metadata and thinking blocks. M5
-/// candidate for `[preview]` config.
-const PREVIEW_BYTES: u64 = 64 * 1024;
-
-/// Maximum `PreviewLine`s the parser keeps from the transcript tail.
-/// This is the source-entry cap; the renderer then trims composed
-/// visual lines to the actual pane height at render time, so the cap
-/// only matters as an upper bound on how much we're willing to render
-/// on a very tall terminal. 100 covers ~50-row preview panes even when
-/// every entry is a single-line tool call, with headroom for longer
-/// multi-line assistant replies. M5 candidate for `[preview]` config.
-const PREVIEW_LIMIT: usize = 100;
 
 fn main() -> io::Result<()> {
     // `args().skip(1)` drops argv[0] (program path). Anything left is
@@ -360,23 +344,6 @@ struct App {
     /// means the filter persists but normal navigation works. See
     /// [`SearchState`] for the full mode contract.
     search: Option<SearchState>,
-    /// M3 preview pane. `false` = hidden, `true` = visible (right
-    /// split of the list area). Toggled by `p`. Independent from
-    /// `preview_cache`: closing the pane keeps cached previews so
-    /// re-opening is instant for sessions the user already looked at.
-    preview_open: bool,
-    /// Per-session preview cache. Insertion semantics double as
-    /// in-flight deduplication (see [`PreviewEntry`]): a `Loading`
-    /// entry means a fetch thread is already running for that
-    /// session, so successive selection changes don't stack
-    /// concurrent reads. An attention event for a session invalidates
-    /// its cache entry (the transcript advanced, refetch on next tick).
-    preview_cache: HashMap<SessionId, PreviewEntry>,
-    /// Sender cloned into each preview-fetch thread.
-    preview_tx: Sender<PreviewResult>,
-    /// Drained each tick — completed previews flow in here from the
-    /// fetch threads and land in `preview_cache`.
-    preview_rx: Receiver<PreviewResult>,
     /// M4: fires OS notifications on session attention transitions
     /// into `NeedsInput`. Owns its own per-session suppression state.
     notifier: Notifier,
@@ -509,15 +476,6 @@ struct RepoScanResult {
     folders_scanned: Vec<PathBuf>,
 }
 
-/// Payload sent from a preview-fetch thread back to the main loop. The
-/// receiver inserts `entry` into `preview_cache` keyed by `session_id`.
-/// Errors flow as `Failed` rather than a separate channel so cache state
-/// stays unified — every fetch leaves a definitive entry behind.
-struct PreviewResult {
-    session_id: SessionId,
-    entry: PreviewEntry,
-}
-
 /// Payload from a background SSH-discovery thread. The two-phase shape
 /// is load-bearing for UX: `Connected` fires as soon as the SSH
 /// `ControlMaster` is up (a few seconds) so cached remote sessions
@@ -646,8 +604,6 @@ impl App {
         // `drain_remote_discoveries` once each `SshHost` is connected.
         watcher.start_pane_polling_host(Arc::clone(&local_host), REMOTE_POLL_INTERVAL);
 
-        let (preview_tx, preview_rx) = channel();
-
         let notifier = build_notifier(&config.notifications);
         let theme = Theme::from_config(&config.theme).map_err(io::Error::other)?;
 
@@ -678,10 +634,6 @@ impl App {
             empty_scans: Vec::new(),
             in_tmux: std::env::var_os("TMUX").is_some(),
             search: None,
-            preview_open: false,
-            preview_cache: HashMap::new(),
-            preview_tx,
-            preview_rx,
             notifier,
             theme,
             embedded: None,
@@ -1294,7 +1246,6 @@ impl App {
                         self.embedded = None;
                         self.focus = Focus::Sidebar;
                     }
-                    self.preview_cache.remove(&id);
                     match removed {
                         Some(s) => {
                             self.status =
@@ -1342,12 +1293,6 @@ impl App {
                         // would freeze at the discovery-time mtime.
                         self.catalog.touch_activity(&update.id, mtime);
                     }
-                    // Transcript advanced — drop the cached preview so
-                    // the next `ensure_preview_for_selected` refetches.
-                    // Stale previews are worse than a brief "loading…"
-                    // because the user can't tell from the dashboard
-                    // when the transcript moved underneath them.
-                    self.preview_cache.remove(&update.id);
                     if let Some(prev) = prev {
                         self.fire_attention_notification(&update.id, prev, update.attention);
                     }
@@ -1436,58 +1381,6 @@ impl App {
             },
             SystemTime::now(),
         );
-    }
-
-    fn toggle_preview(&mut self) {
-        self.preview_open = !self.preview_open;
-    }
-
-    /// Drain completed preview fetches into the cache. Each entry
-    /// supersedes whatever was there (the `Loading` placeholder, or
-    /// a stale `Ready`/`Failed` if the cache was invalidated mid-flight).
-    fn drain_preview_results(&mut self) {
-        while let Ok(result) = self.preview_rx.try_recv() {
-            self.preview_cache.insert(result.session_id, result.entry);
-        }
-    }
-
-    /// If the preview pane is open and the selected session has no
-    /// cached entry yet, spawn a background fetch. `Loading` goes in
-    /// the cache synchronously so a flurry of selection changes
-    /// dispatches at most one fetch per session — see [`PreviewEntry`].
-    ///
-    /// Silently no-ops when the pane is closed, no session is selected,
-    /// or the session's `Host` impl isn't connected yet (the cached
-    /// remote case before the SSH handshake completes — the entry
-    /// stays absent, and the next tick after the host lands will
-    /// dispatch).
-    fn ensure_preview_for_selected(&mut self) {
-        if !self.preview_open {
-            return;
-        }
-        let Some(session) = self.selected_session() else {
-            return;
-        };
-        let id = session.id.clone();
-        if self.preview_cache.contains_key(&id) {
-            return;
-        }
-        let Some(host) = self.hosts.get(&session.host).cloned() else {
-            return;
-        };
-        let path = session.transcript_path.clone();
-        self.preview_cache.insert(id.clone(), PreviewEntry::Loading);
-        let tx = self.preview_tx.clone();
-        std::thread::spawn(move || {
-            let entry = match host.read_tail(&path, PREVIEW_BYTES) {
-                Ok(text) => PreviewEntry::Ready(parse_preview(&text, PREVIEW_LIMIT)),
-                Err(e) => PreviewEntry::Failed(e.to_string()),
-            };
-            let _ = tx.send(PreviewResult {
-                session_id: id,
-                entry,
-            });
-        });
     }
 
     /// React to a watcher-emitted "previously-unknown transcript appeared"
@@ -2055,11 +1948,6 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 }
             }
         }
-        // Run on every loop iteration — covers all causes of "selected
-        // session changed *or* host arrived *or* cache was invalidated"
-        // without each call site needing to remember to dispatch.
-        app.drain_preview_results();
-        app.ensure_preview_for_selected();
     }
 }
 
@@ -2204,10 +2092,6 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.open_search();
             ActionOutcome::Continue
         }
-        Action::TogglePreview => {
-            app.toggle_preview();
-            ActionOutcome::Continue
-        }
         Action::DeleteWorktree => {
             app.open_delete_worktree();
             ActionOutcome::Continue
@@ -2247,7 +2131,6 @@ enum Action {
     /// `N` — pick a repo, spawn claude in its root, no worktree.
     NewSessionNoWorktree,
     OpenSearch,
-    TogglePreview,
     DeleteWorktree,
     /// `r` — open the inline rename overlay for the selected session.
     RenameSession,
@@ -2282,7 +2165,6 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
         KeyCode::Char('n') => Some(Action::NewSession),
         KeyCode::Char('N') => Some(Action::NewSessionNoWorktree),
         KeyCode::Char('/') => Some(Action::OpenSearch),
-        KeyCode::Char('p') => Some(Action::TogglePreview),
         KeyCode::Char('d') => Some(Action::DeleteWorktree),
         KeyCode::Char('r') => Some(Action::RenameSession),
         // Tool keybinds dispatch after built-ins. Config-load
@@ -2559,36 +2441,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌ ");
 
-    // Three layout modes for the main area (in priority order):
-    // 1. Embedded PTY active → compact sidebar + embedded terminal
-    //    (preview pane hidden — the terminal *is* the preview).
-    // 2. Preview pane open → 55/45 list + inline preview.
-    // 3. Default → list takes the full main area.
+    // Two layout modes for the main area:
+    // 1. Embedded PTY active → compact sidebar + embedded terminal.
+    // 2. Default → list takes the full main area.
     if app.embedded.is_some() {
         draw_embedded(frame, app, list, layout[1]);
-    } else if app.preview_open {
-        let split = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(layout[1]);
-        frame.render_stateful_widget(list, split[0], &mut app.list_state);
-
-        let (entry, preview_title) = match app.selected_session() {
-            Some(s) => (app.preview_cache.get(&s.id).cloned(), preview_pane_title(s)),
-            None => (None, " preview ".to_string()),
-        };
-        // Inner height = pane height minus the top + bottom border.
-        // This is the line budget the composer trims to so the newest
-        // entry always sits at the bottom of the visible area.
-        let max_preview_lines = usize::from(split[1].height.saturating_sub(2));
-        let body = compose_preview_pane_lines(
-            entry.as_ref(),
-            app.list_state.selected().is_some(),
-            &app.theme,
-            max_preview_lines,
-        );
-        let preview = Paragraph::new(body)
-            .block(Block::default().borders(Borders::ALL).title(preview_title))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(preview, split[1]);
     } else {
         frame.render_stateful_widget(list, layout[1], &mut app.list_state);
     }
@@ -2731,7 +2588,7 @@ fn compose_footer(
         format!(" · {}", entries.join(" · "))
     };
     format!(
-        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · p: preview · n: new (N: no worktree) · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
+        " j/k: move · J/K: project · ⌃j/⌃k: host · ⏎: attach · t: terminal · n: new (N: no worktree) · d: delete{tool_hints} · q: quit  ·  return: {return_hint}{suffix} "
     )
 }
 
@@ -2832,10 +2689,9 @@ fn should_resize_pty(current: (u16, u16), proposed: (u16, u16)) -> bool {
     proposed.0 > 0 && proposed.1 > 0 && current != proposed
 }
 
-/// Title rendered in the embedded terminal's block. Mirrors
-/// `preview_pane_title`'s fallback (last 6 of session id, "…" prefix)
-/// for title-less sessions so the same anchor reads consistently
-/// whether you're looking at the inline preview or the embedded pane.
+/// Title rendered in the embedded terminal's block. Falls back to the
+/// last 6 chars of the session id (with a "…" prefix) for title-less
+/// sessions so multi-session worktrees still distinguish at a glance.
 fn terminal_block_label(app: &App, session_id: &SessionId) -> String {
     // Look up the session by id rather than relying on selection,
     // because the user may have navigated to a different row while
@@ -2849,22 +2705,6 @@ fn terminal_block_label(app: &App, session_id: &SessionId) -> String {
     let suffix: String = id.chars().rev().take(6).collect();
     let suffix: String = suffix.chars().rev().collect();
     format!("…{suffix}")
-}
-
-/// Title for the preview pane's bordered block. Lifts the session's
-/// title (or its id-suffix fallback) so the pane labels what the user
-/// is looking at — without this the right pane and the list both
-/// show the same content with no contextual anchor.
-fn preview_pane_title(session: &Session) -> String {
-    let label = session.title.as_deref().map_or_else(
-        || {
-            let suffix: String = session.id.0.chars().rev().take(6).collect();
-            let suffix: String = suffix.chars().rev().collect();
-            format!("…{suffix}")
-        },
-        str::to_string,
-    );
-    format!(" preview: {label} ")
 }
 
 /// Header line for the sidebar's "Tools" group. Same bold treatment
@@ -3422,22 +3262,6 @@ mod tests {
             &[],
         );
         assert!(s.contains("d: delete"), "got: {s}");
-    }
-
-    #[test]
-    fn footer_keybind_line_advertises_preview_toggle() {
-        let s = compose_footer(
-            None,
-            None,
-            false,
-            true,
-            0,
-            &no_connect_errors(),
-            &no_empty_scans(),
-            Focus::Sidebar,
-            &[],
-        );
-        assert!(s.contains("p: preview"), "got: {s}");
     }
 
     #[test]

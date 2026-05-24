@@ -873,8 +873,7 @@ impl PtyDriver {
 /// Human-readable label for the embedded pane title. Prefers the
 /// session's resolved title (from `.agent-mux/task.toml` or
 /// `aiTitle`); falls back to a short id suffix so multiple title-less
-/// sessions stay distinguishable. Mirrors `preview_pane_title` in
-/// main.rs.
+/// sessions stay distinguishable.
 fn embed_label(session: &Session) -> String {
     if let Some(title) = &session.title {
         return title.clone();
@@ -1647,9 +1646,8 @@ mod tests {
 
     #[test]
     fn embed_label_falls_back_to_id_suffix_when_no_title() {
-        // Mirrors the fallback in main.rs's `preview_pane_title` and the
-        // dashboard's title-less row rendering — last 6 chars of the
-        // session id, prefixed with "…".
+        // Title-less fallback: last 6 chars of the session id, prefixed
+        // with "…", matching the embedded pane's block label.
         let session = Session {
             id: crate::session::SessionId("1234567890abcdef".into()),
             ..make_session(HostId::local(), "/p")

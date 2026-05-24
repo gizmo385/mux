@@ -101,18 +101,14 @@ pub fn print_themes<W: Write>(out: &mut W, color: bool) -> io::Result<()> {
 }
 
 /// Single source of truth for the table's element columns: the glyph
-/// that appears in the dashboard for each attention/preview element,
-/// plus the config field name. [`theme_field`] dispatches on the label
-/// so adding a column is a one-line change here once a new theme field
-/// lands.
+/// that appears in the dashboard for each attention state, plus the
+/// config field name. [`theme_field`] dispatches on the label so adding
+/// a column is a one-line change here once a new theme field lands.
 const THEME_TABLE_COLUMNS: &[(&str, &str)] = &[
     ("●", "needs_input"),
     ("◐", "working"),
     ("○", "idle"),
     ("·", "unknown"),
-    ("⚒", "tool_use"),
-    ("↳", "tool_result_ok"),
-    ("↳", "tool_result_err"),
 ];
 
 fn theme_field(t: &Theme, label: &str) -> Option<Color> {
@@ -121,9 +117,6 @@ fn theme_field(t: &Theme, label: &str) -> Option<Color> {
         "working" => t.working,
         "idle" => t.idle,
         "unknown" => t.unknown,
-        "tool_use" => t.tool_use,
-        "tool_result_ok" => t.tool_result_ok,
-        "tool_result_err" => t.tool_result_err,
         _ => None,
     }
 }
@@ -370,20 +363,10 @@ fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
 }
 
 fn theme_override_count(t: &crate::config::ThemeConfig) -> usize {
-    [
-        &t.needs_input,
-        &t.working,
-        &t.idle,
-        &t.unknown,
-        &t.tool_use,
-        &t.tool_result_ok,
-        &t.tool_result_err,
-        &t.user_fg,
-        &t.assistant_fg,
-    ]
-    .iter()
-    .filter(|f| f.is_some())
-    .count()
+    [&t.needs_input, &t.working, &t.idle, &t.unknown]
+        .iter()
+        .filter(|f| f.is_some())
+        .count()
 }
 
 /// Print a compact one-screen reference of every config key. Lives at
@@ -446,10 +429,7 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
         out,
         "    preset = \"default\"           one of: {preset_list}"
     )?;
-    writeln!(
-        out,
-        "    needs_input / working / idle / unknown / tool_use / tool_result_ok / tool_result_err"
-    )?;
+    writeln!(out, "    needs_input / working / idle / unknown")?;
     writeln!(
         out,
         "                                 colour: \"red\" | \"bright_red\" | \"#RRGGBB\" | \"\""
@@ -619,18 +599,10 @@ mod tests {
     #[test]
     fn themes_shows_every_colourable_element_per_preset() {
         // Element labels are part of the contract — the user should be
-        // able to see needs_input / tool_result_ok / etc. by name so
-        // the swatch maps back to the config key without guessing.
+        // able to see needs_input / working / etc. by name so the
+        // swatch maps back to the config key without guessing.
         let out = run(|w| print_themes(w, false));
-        for field in [
-            "needs_input",
-            "working",
-            "idle",
-            "unknown",
-            "tool_use",
-            "tool_result_ok",
-            "tool_result_err",
-        ] {
+        for field in ["needs_input", "working", "idle", "unknown"] {
             assert!(out.contains(field), "missing element {field:?}: {out}");
         }
     }
@@ -702,16 +674,7 @@ mod tests {
     #[test]
     fn config_documents_every_theme_field() {
         let out = run(print_config_reference);
-        for field in [
-            "preset",
-            "needs_input",
-            "working",
-            "idle",
-            "unknown",
-            "tool_use",
-            "tool_result_ok",
-            "tool_result_err",
-        ] {
+        for field in ["preset", "needs_input", "working", "idle", "unknown"] {
             assert!(out.contains(field), "theme.{field} not documented:\n{out}");
         }
     }
@@ -928,7 +891,6 @@ mod tests {
             "[theme]",
             "[[tools]]",
             "needs_input",
-            "tool_result_ok",
         ] {
             assert!(out.contains(marker), "missing {marker:?} in help:\n{out}");
         }

@@ -280,22 +280,6 @@ pub struct ThemeConfig {
     pub idle: Option<String>,
     /// Colour of the `·` glyph for `Unknown` (no signal yet) sessions.
     pub unknown: Option<String>,
-    /// Colour of `⚒ Tool: …` lines in the preview pane.
-    pub tool_use: Option<String>,
-    /// Colour of `↳ ok` lines in the preview pane.
-    pub tool_result_ok: Option<String>,
-    /// Colour of `↳ error` lines in the preview pane.
-    pub tool_result_err: Option<String>,
-    /// Colour of `> …` user prompt lines in the preview pane. Default
-    /// (when absent) is the terminal's foreground; the bold modifier
-    /// still applies regardless of colour.
-    pub user_fg: Option<String>,
-    /// Colour of assistant prose lines in the preview pane. Default
-    /// (when absent) is the terminal's foreground. There is no longer
-    /// a dim modifier baked in — assistant prose was unreadable on
-    /// several common palettes; users who want a quieter assistant can
-    /// set this to e.g. `bright_black` themselves.
-    pub assistant_fg: Option<String>,
 }
 
 /// Resolved theme: each field is the parsed `ratatui::Color` or `None`
@@ -307,11 +291,6 @@ pub struct Theme {
     pub working: Option<Color>,
     pub idle: Option<Color>,
     pub unknown: Option<Color>,
-    pub tool_use: Option<Color>,
-    pub tool_result_ok: Option<Color>,
-    pub tool_result_err: Option<Color>,
-    pub user_fg: Option<Color>,
-    pub assistant_fg: Option<Color>,
 }
 
 impl Theme {
@@ -331,9 +310,8 @@ impl Theme {
         ]
     }
 
-    /// The "default" preset: matches the colour scheme that shipped
-    /// before presets existed. Cyan/green/red preview, attention
-    /// glyphs uncoloured. Used when `cfg.preset` is absent.
+    /// The "default" preset: attention glyphs uncoloured. Used when
+    /// `cfg.preset` is absent.
     #[must_use]
     pub fn preset_default() -> Self {
         Self {
@@ -341,17 +319,12 @@ impl Theme {
             working: None,
             idle: None,
             unknown: None,
-            tool_use: Some(Color::Cyan),
-            tool_result_ok: Some(Color::Green),
-            tool_result_err: Some(Color::Red),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
     /// Loud, high-contrast palette. Every attention glyph carries a
-    /// colour, preview switches to `bright_*` variants. For terminals
-    /// that render bright variants distinctly from the base — most do.
+    /// `bright_*` variant — for terminals that render brights
+    /// distinctly from the base, which is most modern terminals.
     #[must_use]
     pub fn preset_bright() -> Self {
         Self {
@@ -359,11 +332,6 @@ impl Theme {
             working: Some(Color::LightYellow),
             idle: Some(Color::DarkGray),
             unknown: Some(Color::Gray),
-            tool_use: Some(Color::LightCyan),
-            tool_result_ok: Some(Color::LightGreen),
-            tool_result_err: Some(Color::LightRed),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
@@ -386,11 +354,6 @@ impl Theme {
             working: Some(Color::Rgb(0xf4, 0xa7, 0x38)),
             idle: Some(Color::Rgb(0x8c, 0x6e, 0x54)),
             unknown: Some(Color::Rgb(0xa0, 0x87, 0x70)),
-            tool_use: Some(Color::Rgb(0xd1, 0xa3, 0x47)),
-            tool_result_ok: Some(Color::Rgb(0xb3, 0xa2, 0x28)),
-            tool_result_err: Some(Color::Rgb(0xcc, 0x3a, 0x20)),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
@@ -405,11 +368,6 @@ impl Theme {
             working: Some(Color::Rgb(0x6c, 0xb4, 0xd6)),
             idle: Some(Color::Rgb(0x47, 0x66, 0x80)),
             unknown: Some(Color::Rgb(0x5e, 0x7e, 0x94)),
-            tool_use: Some(Color::Rgb(0x39, 0xa3, 0xa3)),
-            tool_result_ok: Some(Color::Rgb(0x4c, 0xaa, 0x6c)),
-            tool_result_err: Some(Color::Rgb(0xe2, 0x6d, 0x75)),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
@@ -424,11 +382,6 @@ impl Theme {
             working: Some(Color::Rgb(0xb5, 0x89, 0x00)),     // yellow
             idle: Some(Color::Rgb(0x58, 0x6e, 0x75)),        // base01
             unknown: Some(Color::Rgb(0x58, 0x6e, 0x75)),
-            tool_use: Some(Color::Rgb(0x26, 0x8b, 0xd2)), // blue
-            tool_result_ok: Some(Color::Rgb(0x85, 0x99, 0x00)), // green
-            tool_result_err: Some(Color::Rgb(0xdc, 0x32, 0x2f)),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
@@ -442,11 +395,6 @@ impl Theme {
             working: Some(Color::Rgb(0xfa, 0xbd, 0x2f)),     // bright yellow
             idle: Some(Color::Rgb(0x92, 0x83, 0x74)),        // gray
             unknown: Some(Color::Rgb(0x92, 0x83, 0x74)),
-            tool_use: Some(Color::Rgb(0x8e, 0xc0, 0x7c)), // bright aqua
-            tool_result_ok: Some(Color::Rgb(0xb8, 0xbb, 0x26)), // bright green
-            tool_result_err: Some(Color::Rgb(0xfb, 0x49, 0x34)),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
@@ -459,11 +407,6 @@ impl Theme {
             working: Some(Color::Rgb(0xeb, 0xcb, 0x8b)),     // aurora yellow
             idle: Some(Color::Rgb(0x4c, 0x56, 0x6a)),        // polar night
             unknown: Some(Color::Rgb(0x4c, 0x56, 0x6a)),
-            tool_use: Some(Color::Rgb(0x88, 0xc0, 0xd0)), // frost cyan
-            tool_result_ok: Some(Color::Rgb(0xa3, 0xbe, 0x8c)), // aurora green
-            tool_result_err: Some(Color::Rgb(0xbf, 0x61, 0x6a)),
-            user_fg: None,
-            assistant_fg: None,
         }
     }
 
@@ -510,23 +453,6 @@ impl Theme {
             working: overlay("working", cfg.working.as_deref(), base.working)?,
             idle: overlay("idle", cfg.idle.as_deref(), base.idle)?,
             unknown: overlay("unknown", cfg.unknown.as_deref(), base.unknown)?,
-            tool_use: overlay("tool_use", cfg.tool_use.as_deref(), base.tool_use)?,
-            tool_result_ok: overlay(
-                "tool_result_ok",
-                cfg.tool_result_ok.as_deref(),
-                base.tool_result_ok,
-            )?,
-            tool_result_err: overlay(
-                "tool_result_err",
-                cfg.tool_result_err.as_deref(),
-                base.tool_result_err,
-            )?,
-            user_fg: overlay("user_fg", cfg.user_fg.as_deref(), base.user_fg)?,
-            assistant_fg: overlay(
-                "assistant_fg",
-                cfg.assistant_fg.as_deref(),
-                base.assistant_fg,
-            )?,
         })
     }
 }
@@ -1225,14 +1151,11 @@ sound = true
     }
 
     #[test]
-    fn theme_default_resolves_to_pre_m5_colours() {
-        // The default config preserves the colour scheme that shipped
-        // before M5: cyan tool calls, green ok, red error, no glyph
-        // colour. A bare `Config::default()` must reflect that.
+    fn theme_default_leaves_attention_glyphs_uncoloured() {
+        // The default preset keeps the attention glyphs at the
+        // terminal's default foreground — a bare `ThemeConfig::default()`
+        // must reflect that.
         let theme = Theme::from_config(&ThemeConfig::default()).expect("default theme parses");
-        assert_eq!(theme.tool_use, Some(Color::Cyan));
-        assert_eq!(theme.tool_result_ok, Some(Color::Green));
-        assert_eq!(theme.tool_result_err, Some(Color::Red));
         assert_eq!(theme.needs_input, None);
         assert_eq!(theme.working, None);
         assert_eq!(theme.idle, None);
@@ -1246,9 +1169,6 @@ sound = true
             working: Some("yellow".to_string()),
             idle: Some("gray".to_string()),
             unknown: Some("magenta".to_string()),
-            tool_use: Some("blue".to_string()),
-            tool_result_ok: Some("green".to_string()),
-            tool_result_err: Some("white".to_string()),
             ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
@@ -1256,9 +1176,6 @@ sound = true
         assert_eq!(theme.working, Some(Color::Yellow));
         assert_eq!(theme.idle, Some(Color::Gray));
         assert_eq!(theme.unknown, Some(Color::Magenta));
-        assert_eq!(theme.tool_use, Some(Color::Blue));
-        assert_eq!(theme.tool_result_ok, Some(Color::Green));
-        assert_eq!(theme.tool_result_err, Some(Color::White));
     }
 
     #[test]
@@ -1284,15 +1201,16 @@ sound = true
     #[test]
     fn theme_empty_string_and_default_keyword_both_yield_none_overriding_preset() {
         let cfg = ThemeConfig {
-            tool_use: Some(String::new()),
-            tool_result_ok: Some("default".to_string()),
-            tool_result_err: Some("DEFAULT".to_string()),
+            preset: Some("bright".to_string()),
+            needs_input: Some(String::new()),
+            working: Some("default".to_string()),
+            idle: Some("DEFAULT".to_string()),
             ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
-        assert_eq!(theme.tool_use, None);
-        assert_eq!(theme.tool_result_ok, None);
-        assert_eq!(theme.tool_result_err, None);
+        assert_eq!(theme.needs_input, None);
+        assert_eq!(theme.working, None);
+        assert_eq!(theme.idle, None);
     }
 
     #[test]
@@ -1324,7 +1242,6 @@ sound = true
         assert!(preset.working.is_some());
         assert!(preset.idle.is_some());
         assert!(preset.unknown.is_some());
-        assert!(preset.tool_use.is_some());
     }
 
     #[test]
@@ -1349,9 +1266,8 @@ sound = true
     #[test]
     fn theme_per_field_overrides_apply_on_top_of_preset() {
         // Start from `mono` (everything None) then override a single
-        // field. The other six fields stay None; only the overridden
-        // one carries a colour. Confirms layering, not just preset
-        // selection.
+        // field. The other fields stay None; only the overridden one
+        // carries a colour. Confirms layering, not just preset selection.
         let cfg = ThemeConfig {
             preset: Some("mono".to_string()),
             needs_input: Some("red".to_string()),
@@ -1360,22 +1276,22 @@ sound = true
         let theme = Theme::from_config(&cfg).expect("parse");
         assert_eq!(theme.needs_input, Some(Color::Red));
         assert_eq!(theme.working, None);
-        assert_eq!(theme.tool_use, None);
+        assert_eq!(theme.idle, None);
     }
 
     #[test]
     fn theme_explicit_empty_override_resets_preset_value_to_none() {
-        // `bright` preset gives every preview field a colour; setting
-        // tool_use to "" should clear it specifically.
+        // `bright` preset colours every attention glyph; setting one to
+        // "" should clear that specific glyph back to terminal default.
         let cfg = ThemeConfig {
             preset: Some("bright".to_string()),
-            tool_use: Some(String::new()),
+            needs_input: Some(String::new()),
             ..ThemeConfig::default()
         };
         let theme = Theme::from_config(&cfg).expect("parse");
-        assert_eq!(theme.tool_use, None);
+        assert_eq!(theme.needs_input, None);
         // Sibling fields still inherit from the bright preset.
-        assert_eq!(theme.tool_result_ok, Some(Color::LightGreen));
+        assert_eq!(theme.working, Some(Color::LightYellow));
     }
 
     #[test]
@@ -1403,28 +1319,6 @@ sound = true
                 theme.needs_input.is_some(),
                 "preset {name:?} leaves needs_input uncoloured — attention signal would vanish",
             );
-        }
-    }
-
-    #[test]
-    fn mono_is_the_only_fully_uncoloured_preset() {
-        for name in Theme::preset_names() {
-            let theme = Theme::preset(name).unwrap();
-            let all_none = theme.needs_input.is_none()
-                && theme.working.is_none()
-                && theme.idle.is_none()
-                && theme.unknown.is_none()
-                && theme.tool_use.is_none()
-                && theme.tool_result_ok.is_none()
-                && theme.tool_result_err.is_none();
-            if *name == "mono" {
-                assert!(all_none, "mono preset must be fully uncoloured");
-            } else {
-                assert!(
-                    !all_none,
-                    "preset {name:?} should not match mono's emptiness"
-                );
-            }
         }
     }
 
@@ -1479,16 +1373,16 @@ sound = true
             r##"
 [theme]
 needs_input = "red"
-tool_use = "#aabbcc"
+working = "#aabbcc"
 "##,
         )
         .expect("write");
         let cfg = Config::load_from(&path).expect("parse");
         let theme = Theme::from_config(&cfg.theme).expect("resolve");
         assert_eq!(theme.needs_input, Some(Color::Red));
-        assert_eq!(theme.tool_use, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
-        // Defaults still in place for un-overridden fields.
-        assert_eq!(theme.tool_result_ok, Some(Color::Green));
+        assert_eq!(theme.working, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
+        // Un-overridden field stays at the default preset value (None).
+        assert_eq!(theme.idle, None);
     }
 
     #[test]

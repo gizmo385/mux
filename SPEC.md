@@ -37,7 +37,6 @@ What agent-mux does, in user-observable terms.
 - **Spawn terminal in session cwd.** A keybind opens a new tmux window in the session's working directory, so the user can run shell commands alongside Claude Code without leaving agent-mux's mental model.
 - **Remote sessions (M2).** Sessions on configured SSH hosts appear in the same dashboard. Attaching opens an `ssh -t target tmux attach …` inside the embedded pane (or as a foreground subprocess with `--no-embed`) — same dispatch as local. Attention state for remote sessions is detected the same way as local: by watching the remote transcript file over the existing SSH connection. Post-M5: `n` against a remote-host repo creates the worktree on the remote and spawns `claude` there, surfacing the new session in the dashboard via the normal discovery pipeline.
 - **Attention notifications.** When a session moves from `working` or `idle` into `needs-input`, the dashboard updates and (eventually) the user receives an OS-level notification.
-- **Inline preview (M3).** Each session row shows the last few transcript entries — recent tool calls, the most recent assistant message — without requiring the user to attach.
 
 What agent-mux does not do.
 
@@ -52,7 +51,7 @@ Milestones are ordered. Each builds on the previous. The constraint behind the e
 **M0 — Local dashboard.**
 Goal: see and switch between local Claude Code conversations from one TUI.
 Scope: dashboard TUI in ratatui; session discovery from `~/.claude/projects/`; attention detection from local transcript tailing; tmux-based attach; spawn-terminal-in-cwd action.
-Out of scope for M0: session *creation* from inside agent-mux (user starts Claude Code the usual way), remote hosts, inline preview, configurable keybinds, themes.
+Out of scope for M0: session *creation* from inside agent-mux (user starts Claude Code the usual way), remote hosts, configurable keybinds, themes.
 
 **M1 — Session creation + worktree management.**
 Goal: spawn new Claude Code sessions from inside agent-mux, each in its own git worktree. This is the capability that turns the dashboard from a *catalog* into an *orchestrator* and is the defining differentiator from M0's purely-passive dashboard.
@@ -63,9 +62,8 @@ Out of scope for M1: diff viewing, merge/discard workflow, remote session creati
 Goal: same dashboard experience for sessions on SSH targets. (Spawning new sessions on remote hosts is post-M2.)
 Scope: host configuration file; SSH ControlMaster lifecycle; remote transcript polling; remote tmux attach via persistent SSH window.
 
-**M3 — Inline preview.**
-Goal: see recent transcript activity per session without entering. This is also the experiment that tells us whether richer chat rendering (Shape B/D) is worth pursuing. If reading a transcript line-by-line in the dashboard turns out to be the thing the user actually wants, that's signal to lean toward B.
-Scope: transcript renderer (parses Claude Code JSONL into compact display lines); preview pane or per-row preview; configuration for preview verbosity.
+**M3 — Inline preview** (shipped, then retired 2026-05-23).
+Originally: a `p`-toggled right-side pane showing recent transcript activity for the selected session — both a user-facing feature and the experiment that informed the Shape B pivot. The pivot succeeded: post-M5 embedded-pane attach combined with sub-second session switching closed the gap the preview was filling, and the preview's redundant readout was retired. The signal that the experiment surfaced — "see other sessions while interacting with one" — lives on in Shape B (see post-M5 below), not in a separate preview pane. Listed here for roadmap continuity; the JSONL transcript renderer is gone.
 
 **M4 — Attention notifications.**
 Goal: surface a session transitioning into `needs-input` even when agent-mux isn't on screen. Closes the promise in this document's Functionality section ("(eventually) the user receives an OS-level notification").

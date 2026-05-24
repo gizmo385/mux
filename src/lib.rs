@@ -7,6 +7,7 @@ pub mod dashboard;
 pub mod delete_worktree_modal;
 pub mod discovery;
 pub mod embedded_pty;
+pub mod favorites;
 pub mod hook_ingest;
 pub mod hook_install;
 pub mod host;

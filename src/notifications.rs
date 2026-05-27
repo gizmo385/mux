@@ -458,15 +458,36 @@ pub struct Notifier {
     dispatcher: Box<dyn Dispatcher>,
     state: HashMap<SessionId, SessionState>,
     config: NotificationsConfig,
+    /// Wall-clock moment this `Notifier` was constructed. Used by the
+    /// startup-replay gate in [`Self::on_attention_update`]: a
+    /// [`Transition`] whose `source_at` is older than this is dropped
+    /// without dispatch, so hook markers drained from disk on launch
+    /// don't fire a stack of OS toasts for events that predate the
+    /// run. Captured here (not [`Transition`]) because every call
+    /// site shares the same anchor — the lifetime of this `Notifier`.
+    created_at: SystemTime,
 }
 
 impl Notifier {
     #[must_use]
     pub fn new(dispatcher: Box<dyn Dispatcher>, config: NotificationsConfig) -> Self {
+        Self::with_created_at(dispatcher, config, SystemTime::now())
+    }
+
+    /// Like [`Self::new`] but lets the caller pin `created_at`. Tests
+    /// use this to drive the startup-replay gate deterministically;
+    /// production wires through [`Self::new`].
+    #[must_use]
+    pub fn with_created_at(
+        dispatcher: Box<dyn Dispatcher>,
+        config: NotificationsConfig,
+        created_at: SystemTime,
+    ) -> Self {
         Self {
             dispatcher,
             state: HashMap::new(),
             config,
+            created_at,
         }
     }
 
@@ -516,6 +537,21 @@ impl Notifier {
             return;
         }
         if t.prev == Attention::NeedsInput {
+            return;
+        }
+        // Startup-replay gate: a transition whose underlying signal
+        // pre-dates this `Notifier` is a replay of something that
+        // happened while agent-mux wasn't running (canonical case:
+        // the hook-marker startup sweep draining files written by
+        // claude before launch). The catalog state was already
+        // applied upstream so the row paints `NeedsInput` from frame
+        // one; only the toast is suppressed. Deliberately placed
+        // before the `enabled`/`disabled_hosts` and `actively_viewed`
+        // gates so a stale event can't stash a pending payload for
+        // belated dispatch either.
+        if let Some(source_at) = t.source_at
+            && source_at < self.created_at
+        {
             return;
         }
         if !self.config.enabled {
@@ -700,6 +736,23 @@ pub struct Transition<'a> {
     /// terminal without producing any new attention transition —
     /// closes the false-negative path 2026-05-24 dogfooding surfaced.
     pub actively_viewed: bool,
+    /// Wall-clock moment the underlying signal was produced — for
+    /// hook events this is the marker filename's millisecond prefix
+    /// (`received_at`); for heuristic transitions it's the transcript
+    /// file's mtime at the moment the event was produced (carried in
+    /// [`crate::watcher::AttentionUpdate::mtime`]).
+    ///
+    /// When `Some(t)` and `t < Notifier::created_at`, the notifier
+    /// drops the dispatch: the signal predates the current agent-mux
+    /// run, so a toast would be a replay of a pre-launch event. The
+    /// catalog state was already applied upstream, so rows still
+    /// paint `NeedsInput` from frame one — only the OS toast is
+    /// suppressed. When `None` (rare: a stat failure left the
+    /// producer without a timestamp), the gate is inactive — better
+    /// an over-fire than a silenced live transition. Suppression
+    /// skips the episodic-flag arm so a *future* live transition for
+    /// the same session still fires.
+    pub source_at: Option<SystemTime>,
 }
 
 #[cfg(test)]
@@ -907,6 +960,7 @@ mod tests {
                 host,
                 project,
                 actively_viewed: false,
+                source_at: None,
             },
             now,
         );
@@ -935,6 +989,7 @@ mod tests {
                 host,
                 project,
                 actively_viewed: true,
+                source_at: None,
             },
             now,
         );
@@ -1030,6 +1085,179 @@ mod tests {
             at(100),
         );
         assert!(rec.log.lock().unwrap().is_empty());
+    }
+
+    /// Helper: like `fire`, but with an explicit `source_at`. Used by
+    /// the startup-replay-gate tests below. Mirrors the production
+    /// wiring on the hook arm where `received_at` flows through to the
+    /// notifier as `source_at`.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_with_source_at(
+        n: &mut Notifier,
+        id: &SessionId,
+        prev: Attention,
+        new: Attention,
+        title: &str,
+        host: &HostId,
+        project: &Path,
+        now: SystemTime,
+        source_at: Option<SystemTime>,
+    ) {
+        n.on_attention_update(
+            &Transition {
+                id,
+                prev,
+                new,
+                title,
+                host,
+                project,
+                actively_viewed: false,
+                source_at,
+            },
+            now,
+        );
+    }
+
+    #[test]
+    fn startup_replay_gate_suppresses_dispatch_when_source_predates_notifier() {
+        // 2026-05-26 dogfooding: opening agent-mux with leftover hook
+        // markers on disk stacked an OS toast per marker as the
+        // startup sweep drained them. The fix gates dispatch on the
+        // event's `source_at`: a marker minted before the notifier
+        // was created is a replay, not a live event.
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        let mut n = Notifier::with_created_at(
+            Box::new(SharedRecorder(std::sync::Arc::clone(&rec))),
+            NotificationsConfig::default(),
+            at(100),
+        );
+        fire_with_source_at(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(101),
+            Some(at(50)),
+        );
+        assert!(
+            rec.log.lock().unwrap().is_empty(),
+            "stale-source transition should not dispatch",
+        );
+    }
+
+    #[test]
+    fn startup_replay_gate_lets_through_signals_at_or_after_notifier_creation() {
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        let mut n = Notifier::with_created_at(
+            Box::new(SharedRecorder(std::sync::Arc::clone(&rec))),
+            NotificationsConfig::default(),
+            at(100),
+        );
+        // Boundary: source_at == created_at is treated as live (the
+        // gate is strict-less-than, matching the "drained from disk"
+        // shape — a marker minted in the same millisecond agent-mux
+        // launched is almost certainly a live event the user wants).
+        fire_with_source_at(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(105),
+            Some(at(100)),
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn startup_replay_gate_does_not_arm_episodic_flag_so_later_live_event_still_fires() {
+        // The gate must drop the dispatch without marking the session
+        // as "already notified this episode" — otherwise the stale
+        // replay would silently mute the first *real* notification for
+        // the same session. This was the load-bearing reason to gate
+        // before payload construction *and* before the episodic-flag
+        // arm in `on_attention_update`.
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        let mut n = Notifier::with_created_at(
+            Box::new(SharedRecorder(std::sync::Arc::clone(&rec))),
+            NotificationsConfig::default(),
+            at(100),
+        );
+        // Stale replay (pre-startup hook marker).
+        fire_with_source_at(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(101),
+            Some(at(50)),
+        );
+        // The catalog's pinned state has the session at NeedsInput;
+        // a subsequent live hook event re-asserts NeedsInput from
+        // NeedsInput (no transition). Walk the session out of
+        // NeedsInput first (matching the real flow: assistant runs a
+        // tool → Working) so the next entry into NeedsInput is a
+        // genuine transition the notifier should fire on.
+        fire_with_source_at(
+            &mut n,
+            &sid("a"),
+            Attention::NeedsInput,
+            Attention::Working,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(110),
+            Some(at(110)),
+        );
+        fire_with_source_at(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(115),
+            Some(at(115)),
+        );
+        assert_eq!(
+            rec.log.lock().unwrap().len(),
+            1,
+            "live transition after a stale-replay drop must still dispatch",
+        );
+    }
+
+    #[test]
+    fn startup_replay_gate_is_inactive_when_source_at_is_none() {
+        // Heuristic call sites pass `source_at: None` (no timestamp
+        // available), and the existing behaviour — fire on transition
+        // — must be preserved.
+        let rec = std::sync::Arc::new(RecorderDispatcher::default());
+        let mut n = Notifier::with_created_at(
+            Box::new(SharedRecorder(std::sync::Arc::clone(&rec))),
+            NotificationsConfig::default(),
+            at(1_000),
+        );
+        fire_with_source_at(
+            &mut n,
+            &sid("a"),
+            Attention::Working,
+            Attention::NeedsInput,
+            "x",
+            &local(),
+            Path::new("/p"),
+            at(1_001),
+            None,
+        );
+        assert_eq!(rec.log.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1529,6 +1757,7 @@ mod tests {
                 host: &local(),
                 project: Path::new("/p"),
                 actively_viewed: true,
+                source_at: None,
             },
             at(0),
         );

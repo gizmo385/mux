@@ -28,13 +28,16 @@ pub struct AttentionUpdate {
     pub id: SessionId,
     pub attention: Attention,
     /// Transcript mtime captured at the moment the event was produced.
-    /// `None` when the producer couldn't stat the file (filesystem
-    /// hiccup, file vanished between event and stat) or when it ships
-    /// the initial-prime event whose mtime is the same as discovery's
-    /// — touching `last_activity` to the same value would be a no-op.
-    /// `Some(mtime)` flows when a fresh write was observed; the catalog
-    /// uses it to keep the "last activity" cell live across the lifetime
-    /// of an actively-running conversation.
+    /// `None` only when the producer couldn't stat the file
+    /// (filesystem hiccup, file vanished between event and stat) —
+    /// every prime, polled, and live-notify path now ships the file's
+    /// current mtime so the notifier's startup-replay gate (see
+    /// `Transition::source_at`) can recognise events derived from
+    /// bytes written before the current run began. The catalog also
+    /// uses it to keep the "last activity" cell live across a running
+    /// conversation; `touch_activity` is a no-op when the value
+    /// matches what's already stored, so the prime case (where the
+    /// mtime equals discovery's) costs nothing.
     pub mtime: Option<SystemTime>,
 }
 
@@ -164,13 +167,19 @@ impl TranscriptWatcher {
         }
 
         // Prime initial state so the UI shows real attention from frame one.
-        // mtime is `None` because the catalog already holds the
-        // discovery-time mtime — touching it here would be a no-op.
+        // `mtime` carries the file's current on-disk mtime so the
+        // notifier's startup-replay gate (see `Transition::source_at`)
+        // can recognise these events as "state derived from bytes
+        // written before agent-mux started" and suppress the toast.
+        // `touch_activity` is still a no-op here because the catalog
+        // already holds the discovery-time mtime — passing it through
+        // doesn't rewind the cell.
         for (id, path) in &initial {
+            let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
             let _ = event_tx.send(WatcherEvent::Attention(AttentionUpdate {
                 id: id.clone(),
                 attention: derive_attention(host.as_ref(), path),
-                mtime: None,
+                mtime,
             }));
         }
 

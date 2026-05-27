@@ -1435,7 +1435,25 @@ impl App {
                         self.catalog.touch_activity(&update.id, mtime);
                     }
                     if let Some(prev) = prev {
-                        self.fire_attention_notification(&update.id, prev, update.attention);
+                        // `update.mtime` flows through to the notifier
+                        // as `source_at` so the startup-replay gate
+                        // catches both the watcher's prime event and
+                        // the first tick of a remote poller — each
+                        // produces transitions derived from bytes
+                        // written before this run began, and a toast
+                        // for them would be a replay of pre-launch
+                        // state. Live notify-driven and live poll-tick
+                        // events carry a post-startup mtime and fire
+                        // normally. `None` (rare: stat failure)
+                        // disables the gate for that event so a
+                        // transient filesystem hiccup doesn't silently
+                        // mute a real transition.
+                        self.fire_attention_notification(
+                            &update.id,
+                            prev,
+                            update.attention,
+                            update.mtime,
+                        );
                     }
                 }
                 WatcherEvent::Hook { id, received_at } => {
@@ -1445,12 +1463,20 @@ impl App {
                     // permission prompt during a tool_use that the
                     // heuristic was reporting as Working). Pinning is
                     // handled inside apply_hook_event.
+                    //
+                    // `received_at` flows through to the notifier as
+                    // `source_at` so the startup-replay gate can drop
+                    // toasts for markers minted before this run began
+                    // — the catalog still applies the transition, but
+                    // a stack of pre-launch hook events doesn't fire
+                    // a stack of OS toasts at the user.
                     let prev = self.catalog.apply_hook_event(&id, received_at);
                     if let Some(prev) = prev {
                         self.fire_attention_notification(
                             &id,
                             prev,
                             agent_mux::session::Attention::NeedsInput,
+                            Some(received_at),
                         );
                     }
                 }
@@ -1489,7 +1515,20 @@ impl App {
     /// display labels resolved. Looked up here rather than in the
     /// notifier so the notifier stays decoupled from the catalog —
     /// it gets exactly the few `&str`/`&Path` it renders into the payload.
-    fn fire_attention_notification(&mut self, id: &SessionId, prev: Attention, new: Attention) {
+    ///
+    /// `source_at` is the wall-clock moment the underlying signal was
+    /// produced (e.g. a hook marker's `received_at`); the notifier's
+    /// startup-replay gate uses it to drop dispatches for signals that
+    /// pre-date the current run. `None` means "no timestamp known,
+    /// treat as live" — used by call sites without a source clock
+    /// (e.g. the heuristic path whose `mtime` is often unavailable).
+    fn fire_attention_notification(
+        &mut self,
+        id: &SessionId,
+        prev: Attention,
+        new: Attention,
+        source_at: Option<SystemTime>,
+    ) {
         let Some(session) = self.catalog.sessions().iter().find(|s| s.id == *id) else {
             return;
         };
@@ -1513,6 +1552,7 @@ impl App {
                 host: &host,
                 project: &project,
                 actively_viewed,
+                source_at,
             },
             SystemTime::now(),
         );

@@ -29,10 +29,10 @@ use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
 use agent_mux::config::{self, Config, Theme, ToolBinding};
 use agent_mux::dashboard::{
-    DisplayRow, Focus, SearchMode, SearchOutcome, SearchState, apply_fg, build_display_rows,
-    build_display_rows_filtered, first_session_index, is_pty_leader, matches_query,
-    next_host_index, next_project_index, next_session_index, prev_host_index, prev_project_index,
-    prev_session_index,
+    DisplayRow, Focus, SearchMode, SearchOutcome, SearchState, anchor_header_for_selection,
+    apply_fg, build_display_rows, build_display_rows_filtered, first_session_index, is_pty_leader,
+    matches_query, next_host_index, next_project_index, next_session_index, prev_host_index,
+    prev_project_index, prev_session_index,
 };
 use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
@@ -2635,6 +2635,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .block(sidebar_block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌ ");
+
+    // Pull the offset up to keep the selected row's context header
+    // visible. ratatui's `List` adjusts the offset only enough to keep
+    // the *selected* row visible, so without this nudge the project
+    // header above a long session list scrolls off and stays off until
+    // the cursor leaves the group. ratatui will still push the offset
+    // back down if the gap between anchor and selection is taller than
+    // the visible area — in that case "selected stays visible" wins
+    // over "header stays pinned".
+    if let Some(selected) = app.list_state.selected()
+        && let Some(anchor) = anchor_header_for_selection(&rows, selected)
+        && anchor < app.list_state.offset()
+    {
+        *app.list_state.offset_mut() = anchor;
+    }
 
     // Two layout modes for the main area:
     // 1. Embedded PTY active → compact sidebar + embedded terminal.

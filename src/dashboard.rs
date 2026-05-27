@@ -442,6 +442,34 @@ fn is_project_header(row: &DisplayRow) -> bool {
     matches!(row, DisplayRow::ProjectHeader(_))
 }
 
+/// Index of the closest preceding "context" header for the row at
+/// `selected` — the header the row visually sits under. Used by the
+/// draw loop to pin that header on screen as the user scrolls within a
+/// long group; ratatui's `List` only adjusts the offset enough to keep
+/// the *selected* row visible, so without this nudge the group's
+/// header scrolls off and stays off until the cursor leaves the group.
+///
+/// Returns `None` when `selected` is itself a header, when no matching
+/// header precedes it, or when `selected` is out of bounds. Only the
+/// closest preceding `ProjectHeader` is returned for sessions — the
+/// `HostHeader` further up is intentionally not pinned, since pinning
+/// both would burn two sidebar rows on context and the user's reported
+/// loss was specifically the project name.
+#[must_use]
+pub fn anchor_header_for_selection(rows: &[DisplayRow], selected: usize) -> Option<usize> {
+    let row = rows.get(selected)?;
+    let predicate: fn(&DisplayRow) -> bool = match row {
+        DisplayRow::SessionRow(_) => |r| matches!(r, DisplayRow::ProjectHeader(_)),
+        DisplayRow::FavoriteSessionRow(_) => |r| matches!(r, DisplayRow::FavoritesHeader),
+        DisplayRow::ToolRow(_) => |r| matches!(r, DisplayRow::ToolsHeader),
+        DisplayRow::HostHeader(_)
+        | DisplayRow::ProjectHeader(_)
+        | DisplayRow::ToolsHeader
+        | DisplayRow::FavoritesHeader => return None,
+    };
+    rows[..selected].iter().rposition(predicate)
+}
+
 fn is_host_header(row: &DisplayRow) -> bool {
     matches!(row, DisplayRow::HostHeader(_))
 }
@@ -868,6 +896,44 @@ mod tests {
     fn first_session_index_returns_none_for_header_only_input() {
         let rows = vec![DisplayRow::HostHeader(HostId("solo".into()))];
         assert_eq!(first_session_index(&rows), None);
+    }
+
+    #[test]
+    fn anchor_header_for_session_returns_closest_preceding_project_header() {
+        let s = vec![
+            session("a", "local", "/p1", 0),
+            session("b", "local", "/p2", 1),
+        ];
+        let rows = build_display_rows(&s);
+        // Layout: H:local(0) P:/p1(1) S:a(2) P:/p2(3) S:b(4)
+        // — both sessions anchor to their own project header.
+        assert_eq!(anchor_header_for_selection(&rows, 2), Some(1));
+        assert_eq!(anchor_header_for_selection(&rows, 4), Some(3));
+    }
+
+    #[test]
+    fn anchor_header_returns_none_for_headers_themselves() {
+        let s = vec![session("a", "local", "/p", 0)];
+        let rows = build_display_rows(&s);
+        // Layout: H:local(0) P:/p(1) S:a(2)
+        assert_eq!(anchor_header_for_selection(&rows, 0), None);
+        assert_eq!(anchor_header_for_selection(&rows, 1), None);
+    }
+
+    #[test]
+    fn anchor_header_for_favorite_session_returns_favorites_header() {
+        let s = vec![session("a", "local", "/p", 0)];
+        let rows = build_display_rows_filtered(&s, |_| true, |_| true);
+        // Layout: FH(0) F:a(1) H:local(2) P:/p(3) S:a(4)
+        assert_eq!(anchor_header_for_selection(&rows, 1), Some(0));
+        // The natural-group SessionRow still anchors to its ProjectHeader.
+        assert_eq!(anchor_header_for_selection(&rows, 4), Some(3));
+    }
+
+    #[test]
+    fn anchor_header_out_of_bounds_is_none() {
+        let rows: Vec<DisplayRow> = vec![];
+        assert_eq!(anchor_header_for_selection(&rows, 0), None);
     }
 
     // ------- next/prev_project_index, next/prev_host_index -------

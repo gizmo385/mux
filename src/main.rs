@@ -273,18 +273,36 @@ fn suspend_and_run(
     }
 }
 
-/// Captures *which copy* of a session the cursor sat on before an
-/// operation that may reshape `current_rows`. A favorited session
-/// appears twice in the row list (once in the pinned favorites
-/// group as [`DisplayRow::FavoriteSessionRow`], once in its natural
-/// host/project group as [`DisplayRow::SessionRow`]), and a re-seat
-/// that walked rows in iteration order would silently land on the
-/// favorites copy every time. `in_favorites = true` means the
-/// cursor was on the favorites-group copy.
+/// Captures what the cursor sat on before an operation that may
+/// reshape `current_rows`. Two variants because the dashboard list
+/// contains two structurally different selectable kinds:
+///
+/// - `Session` — a favorited session appears twice in the row list
+///   (once in the pinned favorites group as
+///   [`DisplayRow::FavoriteSessionRow`], once in its natural
+///   host/project group as [`DisplayRow::SessionRow`]). A re-seat
+///   that walked rows in iteration order would silently land on the
+///   favorites copy every time. `in_favorites = true` means the
+///   cursor was on the favorites-group copy.
+/// - `Tool` — a `[[tools]]` launch row. Anchored on the launch's
+///   `tmux_session` rather than its positional index in
+///   `ToolLaunchRegistry`, because pruning an earlier entry shifts
+///   later indices down; an index-based anchor would silently jump
+///   the cursor to a *different* tool that now occupies the old
+///   index.
+///
+/// Why this matters: `App::drain_updates` calls
+/// `reseat_selection_to(selected_anchor_for_reseat())` at the end of
+/// every drain tick (which fires on every watcher event — attention
+/// updates, new transcripts, live-pane polls land here constantly).
+/// Without a `Tool` variant, `selected_anchor_for_reseat` returns
+/// `None` whenever the cursor is on a tool row, and the fallback in
+/// `pick_reseat_target` lands selection on the first session row —
+/// making the Tools sidebar group effectively unreachable.
 #[derive(Debug, Clone)]
-struct SelectionAnchor {
-    id: SessionId,
-    in_favorites: bool,
+enum SelectionAnchor {
+    Session { id: SessionId, in_favorites: bool },
+    Tool { tmux_session: String },
 }
 
 struct App {
@@ -934,17 +952,21 @@ impl App {
         match rows.get(idx)? {
             DisplayRow::SessionRow(i) => {
                 let id = self.catalog.sessions().get(*i)?.id.clone();
-                Some(SelectionAnchor {
+                Some(SelectionAnchor::Session {
                     id,
                     in_favorites: false,
                 })
             }
             DisplayRow::FavoriteSessionRow(i) => {
                 let id = self.catalog.sessions().get(*i)?.id.clone();
-                Some(SelectionAnchor {
+                Some(SelectionAnchor::Session {
                     id,
                     in_favorites: true,
                 })
+            }
+            DisplayRow::ToolRow(i) => {
+                let tmux_session = self.tool_launches.launches().get(*i)?.tmux_session.clone();
+                Some(SelectionAnchor::Tool { tmux_session })
             }
             _ => None,
         }
@@ -957,7 +979,12 @@ impl App {
     /// `resolve_notification_title` lift-out pattern).
     fn reseat_selection_to(&mut self, prior: Option<&SelectionAnchor>) {
         let rows = self.current_rows();
-        let new_idx = pick_reseat_target(&rows, self.catalog.sessions(), prior);
+        let new_idx = pick_reseat_target(
+            &rows,
+            self.catalog.sessions(),
+            self.tool_launches.launches(),
+            prior,
+        );
         self.list_state.select(new_idx);
     }
 
@@ -3021,13 +3048,13 @@ fn resolve_notification_title<'a>(
 
 /// Pick the row index to land selection on after a catalog reshape.
 /// Pure helper lifted out of [`App::reseat_selection_to`] so the
-/// three-tier resolution gets unit tests against a hand-built row
-/// slice (matches the `compute_actively_viewed` /
+/// resolution gets unit tests against a hand-built row slice
+/// (matches the `compute_actively_viewed` /
 /// `resolve_notification_title` pattern; an App fixture would be
 /// heavy and would not exercise the interesting edge cases more
 /// crisply).
 ///
-/// Resolution order:
+/// Resolution order for a `Session` anchor:
 /// 1. Same session id *and* same copy kind (favorites vs natural) —
 ///    the cursor stays exactly where the user put it.
 /// 2. Same session id but the matching kind is gone (the user
@@ -3035,31 +3062,58 @@ fn resolve_notification_title<'a>(
 ///    Land on whichever copy survives.
 /// 3. Fall back to [`first_session_index`] (or `None` when the row
 ///    list has no session-bearing rows).
+///
+/// Resolution order for a `Tool` anchor:
+/// 1. Same `tmux_session` — the cursor stays on the same tool even
+///    if other tools were appended or removed and shifted indices.
+/// 2. Fall back to [`first_session_index`]. The Tools group is
+///    transient (entries vanish on tmux session death), so jumping
+///    back into the session list is the right move when the
+///    anchored tool is gone — there is no analogous "either kind"
+///    tier to try.
 #[must_use]
 fn pick_reseat_target(
     rows: &[DisplayRow],
     sessions: &[Session],
+    tool_launches: &[ToolLaunch],
     prior: Option<&SelectionAnchor>,
 ) -> Option<usize> {
     let matches_id = |i: usize, id: &SessionId| sessions.get(i).is_some_and(|s| s.id == *id);
-    if let Some(anchor) = prior {
-        let same_kind = rows.iter().position(|r| match r {
-            DisplayRow::SessionRow(i) if !anchor.in_favorites => matches_id(*i, &anchor.id),
-            DisplayRow::FavoriteSessionRow(i) if anchor.in_favorites => matches_id(*i, &anchor.id),
-            _ => false,
-        });
-        if same_kind.is_some() {
-            return same_kind;
-        }
-        let either_kind = rows.iter().position(|r| match r {
-            DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
-                matches_id(*i, &anchor.id)
+    let matches_tmux = |i: usize, name: &str| {
+        tool_launches
+            .get(i)
+            .is_some_and(|t| t.tmux_session == name)
+    };
+    match prior {
+        Some(SelectionAnchor::Session { id, in_favorites }) => {
+            let same_kind = rows.iter().position(|r| match r {
+                DisplayRow::SessionRow(i) if !*in_favorites => matches_id(*i, id),
+                DisplayRow::FavoriteSessionRow(i) if *in_favorites => matches_id(*i, id),
+                _ => false,
+            });
+            if same_kind.is_some() {
+                return same_kind;
             }
-            _ => false,
-        });
-        if either_kind.is_some() {
-            return either_kind;
+            let either_kind = rows.iter().position(|r| match r {
+                DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
+                    matches_id(*i, id)
+                }
+                _ => false,
+            });
+            if either_kind.is_some() {
+                return either_kind;
+            }
         }
+        Some(SelectionAnchor::Tool { tmux_session }) => {
+            let same_tool = rows.iter().position(|r| match r {
+                DisplayRow::ToolRow(i) => matches_tmux(*i, tmux_session),
+                _ => false,
+            });
+            if same_tool.is_some() {
+                return same_tool;
+            }
+        }
+        None => {}
     }
     first_session_index(rows)
 }
@@ -4272,10 +4326,26 @@ mod tests {
         }
     }
 
-    fn anchor(id: &str, in_favorites: bool) -> SelectionAnchor {
-        SelectionAnchor {
+    fn session_anchor(id: &str, in_favorites: bool) -> SelectionAnchor {
+        SelectionAnchor::Session {
             id: sid(id),
             in_favorites,
+        }
+    }
+
+    fn tool_anchor(tmux_session: &str) -> SelectionAnchor {
+        SelectionAnchor::Tool {
+            tmux_session: tmux_session.to_string(),
+        }
+    }
+
+    fn mock_tool(tmux_session: &str) -> ToolLaunch {
+        ToolLaunch {
+            name: "lazygit".to_string(),
+            host: HostId::local(),
+            tmux_session: tmux_session.to_string(),
+            project_dir: PathBuf::from("/p"),
+            launched_at: SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -4285,15 +4355,19 @@ mod tests {
         // on the *natural* copy. Re-seat must land on the natural
         // copy (row index 3), not the favorites copy (row index 1).
         let sessions = vec![mock_session("a"), mock_session("b")];
+        let tools: Vec<ToolLaunch> = vec![];
         let rows = vec![
             DisplayRow::FavoritesHeader,
             DisplayRow::FavoriteSessionRow(0),
-            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::HostHeader(HostId::local()),
             DisplayRow::SessionRow(0),
             DisplayRow::SessionRow(1),
         ];
-        let prior = anchor("a", false);
-        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(3));
+        let prior = session_anchor("a", false);
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(3)
+        );
     }
 
     #[test]
@@ -4302,14 +4376,18 @@ mod tests {
         // must land on the favorites copy, not silently jump to the
         // natural copy.
         let sessions = vec![mock_session("a")];
+        let tools: Vec<ToolLaunch> = vec![];
         let rows = vec![
             DisplayRow::FavoritesHeader,
             DisplayRow::FavoriteSessionRow(0),
-            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::HostHeader(HostId::local()),
             DisplayRow::SessionRow(0),
         ];
-        let prior = anchor("a", true);
-        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(1));
+        let prior = session_anchor("a", true);
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4319,13 +4397,17 @@ mod tests {
         // copy remains. Re-seat must land on the natural copy
         // rather than jumping to an unrelated session.
         let sessions = vec![mock_session("a"), mock_session("b")];
+        let tools: Vec<ToolLaunch> = vec![];
         let rows = vec![
-            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::HostHeader(HostId::local()),
             DisplayRow::SessionRow(0),
             DisplayRow::SessionRow(1),
         ];
-        let prior = anchor("a", true);
-        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(1));
+        let prior = session_anchor("a", true);
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4334,12 +4416,16 @@ mod tests {
         // a delete consumed it). Land on the first session-bearing
         // row — same fallback the pre-favorites re-seat used.
         let sessions = vec![mock_session("b")];
+        let tools: Vec<ToolLaunch> = vec![];
         let rows = vec![
-            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::HostHeader(HostId::local()),
             DisplayRow::SessionRow(0),
         ];
-        let prior = anchor("a-gone", false);
-        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), Some(1));
+        let prior = session_anchor("a-gone", false);
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4347,21 +4433,91 @@ mod tests {
         // Initial seed path: no prior selection, just land on the
         // first session-bearing row.
         let sessions = vec![mock_session("a")];
+        let tools: Vec<ToolLaunch> = vec![];
         let rows = vec![
-            DisplayRow::HostHeader(agent_mux::session::HostId::local()),
+            DisplayRow::HostHeader(HostId::local()),
             DisplayRow::SessionRow(0),
         ];
-        assert_eq!(pick_reseat_target(&rows, &sessions, None), Some(1));
+        assert_eq!(pick_reseat_target(&rows, &sessions, &tools, None), Some(1));
     }
 
     #[test]
     fn pick_reseat_target_returns_none_for_empty_session_list() {
         // Catalog drained to empty. Nothing to select.
         let sessions: Vec<Session> = vec![];
+        let tools: Vec<ToolLaunch> = vec![];
         let rows: Vec<DisplayRow> = vec![];
-        let prior = anchor("a-gone", false);
-        assert_eq!(pick_reseat_target(&rows, &sessions, Some(&prior)), None);
-        assert_eq!(pick_reseat_target(&rows, &sessions, None), None);
+        let prior = session_anchor("a-gone", false);
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            None
+        );
+        assert_eq!(pick_reseat_target(&rows, &sessions, &tools, None), None);
+    }
+
+    #[test]
+    fn pick_reseat_target_keeps_cursor_on_tool_row_across_reseat() {
+        // Regression for 2026-05-27: a watcher event mid-navigation
+        // (drain_updates fires on every attention update, new
+        // transcript, and live-pane poll) used to knock the cursor
+        // off the Tools sidebar group because `ToolRow` had no
+        // `SelectionAnchor` variant. With the `Tool { tmux_session }`
+        // anchor in place, re-seat lands back on the same tool row.
+        let sessions = vec![mock_session("s1")];
+        let tools = vec![mock_tool("agent-mux-tool-1")];
+        let rows = vec![
+            DisplayRow::ToolsHeader,
+            DisplayRow::ToolRow(0),
+            DisplayRow::HostHeader(HostId::local()),
+            DisplayRow::SessionRow(0),
+        ];
+        let prior = tool_anchor("agent-mux-tool-1");
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_reseat_target_finds_tool_by_tmux_session_after_sibling_removed() {
+        // Pins the choice of `tmux_session` (stable) over positional
+        // index (shifts on remove). The user was on "agent-mux-tool-2"
+        // at index 1; a sibling at index 0 was pruned; "tool-2" is
+        // now at index 0. The anchor must follow the tmux_session,
+        // not the old index, so the cursor stays on the same tool.
+        let sessions = vec![mock_session("s1")];
+        let tools = vec![mock_tool("agent-mux-tool-2")];
+        let rows = vec![
+            DisplayRow::ToolsHeader,
+            DisplayRow::ToolRow(0),
+            DisplayRow::HostHeader(HostId::local()),
+            DisplayRow::SessionRow(0),
+        ];
+        let prior = tool_anchor("agent-mux-tool-2");
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_reseat_target_falls_back_to_first_session_when_tool_gone() {
+        // The anchored tmux_session is no longer in the registry
+        // (tmux session died, the registry pruned it). The Tools
+        // group is transient and has no "either kind" fallback like
+        // sessions — drop selection back into the session list, same
+        // as the no-anchor path.
+        let sessions = vec![mock_session("s1")];
+        let tools: Vec<ToolLaunch> = vec![];
+        let rows = vec![
+            DisplayRow::HostHeader(HostId::local()),
+            DisplayRow::SessionRow(0),
+        ];
+        let prior = tool_anchor("agent-mux-tool-1");
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            Some(1)
+        );
     }
 
     // ---- compose_sidebar_title ----

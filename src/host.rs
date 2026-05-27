@@ -403,6 +403,49 @@ impl SshHost {
                 "ssh ControlMaster setup failed for {ssh_target} (exit {status})"
             )));
         }
+        // `-fN` returns 0 the moment the parent forks the backgrounded
+        // master — its exit status proves the fork happened, not that
+        // the master is actually listening on `control_path`. A
+        // ProxyCommand that doesn't survive the fork-to-background
+        // (some `coder ssh --stdio` setups, some jumphosts) makes the
+        // master die seconds after spawn; without a positive check
+        // here, every later `ssh -S <control_path>` would silently
+        // fall back to a fresh connection and the user would never see
+        // an error — they'd just pay full SSH cost on every poll tick
+        // and session switch, violating ARCHITECTURE.md's
+        // "session switching never blocks on I/O" property invisibly.
+        // `-O check` asks the master directly and exits non-zero when
+        // nothing is listening on the socket.
+        let check = Command::new(&ssh_binary)
+            .arg("-S")
+            .arg(&control_path)
+            .arg("-O")
+            .arg("check")
+            .arg(&ssh_target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !check.success() {
+            // Best-effort cleanup in case the master partially
+            // established. Mirrors Drop's shape; errors swallowed
+            // because the connect is failing either way.
+            let _ = Command::new(&ssh_binary)
+                .arg("-S")
+                .arg(&control_path)
+                .arg("-O")
+                .arg("exit")
+                .arg(&ssh_target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            return Err(io::Error::other(format!(
+                "ssh ControlMaster did not establish for {ssh_target} \
+                 (master spawned successfully but `-O check` failed: exit {check}). \
+                 Common cause: a ProxyCommand that does not sustain a backgrounded master."
+            )));
+        }
         Ok(Self {
             id,
             ssh_target,
@@ -1194,13 +1237,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ssh_host_lifecycle_invokes_connect_then_drop_with_matching_socket() {
-        // Pins three lifecycle contracts in one test. The ETXTBSY
+    fn ssh_host_lifecycle_invokes_connect_check_drop_with_matching_socket() {
+        // Pins four lifecycle contracts in one test. The ETXTBSY
         // race that originally forced the consolidation is now
         // absorbed by `connect_with_binary_retrying_etxtbsy`; the
         // test stays unified because each step builds on the previous
-        // (connect → drop → check the log), not because splitting it
-        // would re-trip the race:
+        // (connect → check → drop → inspect the log):
         //
         // 1. Connect uses `-fN -M`, `ControlPersist=600`, and
         //    `ConnectTimeout=5`. Losing any of these breaks the
@@ -1208,12 +1250,21 @@ mod tests {
         //    master, idle timeout for the SIGKILL-mid-sleep case,
         //    bounded startup latency for unreachable hosts).
         //
-        // 2. Drop runs `ssh -O exit`. Losing this strands remote
+        // 2. Connect runs `ssh -O check` after the `-fN -M` spawn
+        //    to confirm the master actually established. Without
+        //    this every later `ssh -S <sock>` would silently fall
+        //    back to a fresh connection when the master died (e.g.
+        //    a ProxyCommand that doesn't survive the fork) — paying
+        //    full SSH cost on every poll and violating the
+        //    "session switching never blocks on I/O" property.
+        //
+        // 3. Drop runs `ssh -O exit`. Losing this strands remote
         //    masters for ControlPersist's full 10-minute window
         //    after agent-mux quits.
         //
-        // 3. The `-S <path>` argument matches between connect and
-        //    teardown. Mismatched socket paths cause `-O exit` to
+        // 4. The `-S <path>` argument matches across connect, check,
+        //    and teardown. A mismatch makes `-O check` look for the
+        //    wrong master (false-positive failures) or `-O exit`
         //    silently no-op against the wrong (or missing) master.
         let tmp = TempDir::new().unwrap();
         let log = tmp.path().join("ssh-calls.log");
@@ -1232,8 +1283,8 @@ mod tests {
         let lines = read_log_lines(&log);
         assert_eq!(
             lines.len(),
-            2,
-            "expected connect + drop calls, got: {lines:?}"
+            3,
+            "expected connect + check + drop calls, got: {lines:?}"
         );
 
         // (1) Connect-time invariants.
@@ -1253,8 +1304,23 @@ mod tests {
         );
         assert!(connect.contains("devbox"), "target missing: {connect}");
 
-        // (2) Drop-time invariants.
-        let teardown = &lines[1];
+        // (2) Post-spawn check.
+        let check = &lines[1];
+        assert!(
+            check.contains("-O") && check.contains("check"),
+            "connect must verify the master with `-O check` after \
+             the `-fN -M` spawn — `-fN` exits 0 the moment it forks \
+             the background master, so without an explicit check a \
+             dead master goes undetected and every later operation \
+             silently degrades to per-command SSH. got: {check}"
+        );
+        assert!(
+            check.contains("devbox"),
+            "check must target the same host. got: {check}"
+        );
+
+        // (3) Drop-time invariants.
+        let teardown = &lines[2];
         assert!(
             teardown.contains("-O") && teardown.contains("exit"),
             "drop must run `-O exit`. got: {teardown}"
@@ -1264,7 +1330,7 @@ mod tests {
             "teardown must target the same host. got: {teardown}"
         );
 
-        // (3) Socket path matches between connect and drop.
+        // (4) Socket path matches across all three calls.
         let socket_path = control_socket_path(&HostId("devbox".into()));
         let socket_str = socket_path.to_string_lossy().into_owned();
         assert!(
@@ -1272,9 +1338,98 @@ mod tests {
             "connect omitted socket path: {connect}"
         );
         assert!(
+            check.contains(&socket_str),
+            "check omitted socket path: {check}"
+        );
+        assert!(
             teardown.contains(&socket_str),
             "drop omitted socket path: {teardown}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_connect_fails_when_master_does_not_establish_after_spawn() {
+        // Regression: pre-2026-05-27 `SshHost::connect` accepted
+        // `-fN -M` exit 0 as proof the master was up, but `-fN`
+        // returns 0 the moment the parent forks the backgrounded
+        // master — it doesn't say whether that backgrounded process
+        // then actually opened the control socket. Reproduced with
+        // a Coder ProxyCommand: master spawn returned 0, no socket
+        // ever appeared, every later `ssh -S <missing-sock>` fell
+        // back to a fresh proxy+handshake invisibly.
+        //
+        // Pin the verify-after-spawn behaviour: when `-O check`
+        // exits non-zero, `connect` must surface that as Err.
+        // Cleanup `-O exit` runs best-effort — its exit code is
+        // not consulted — but we assert it was attempted so a
+        // future refactor doesn't quietly drop it.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh_with_broken_master(&log);
+
+        let result =
+            connect_with_binary_retrying_etxtbsy(HostId("devbox".into()), "devbox".into(), mock);
+
+        let Err(err) = result else {
+            panic!("connect must fail when -O check rejects the master");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not establish") && msg.contains("devbox"),
+            "error must name the failure mode and the host. got: {msg}"
+        );
+
+        let lines = read_log_lines(&log);
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected spawn + check + cleanup-exit calls, got: {lines:?}"
+        );
+        assert!(lines[0].contains("-fN") && lines[0].contains("-M"));
+        assert!(
+            lines[1].contains("-O") && lines[1].contains("check"),
+            "second call must be `-O check`. got: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("-O") && lines[2].contains("exit"),
+            "third call must be the best-effort `-O exit` cleanup so \
+             a partially-established master isn't leaked when connect \
+             fails. got: {}",
+            lines[2]
+        );
+    }
+
+    /// Mock `ssh` that logs argv like [`write_executable_mock_ssh`] but
+    /// exits non-zero when invoked with `-O check`, simulating the
+    /// ProxyCommand-doesn't-survive-fork failure mode (`-fN -M` returns
+    /// 0, but no master is actually listening on the socket). Every
+    /// other invocation — including the best-effort `-O exit` cleanup
+    /// path — exits 0 so the test only sees `connect` itself fail.
+    #[cfg(unix)]
+    fn write_executable_mock_ssh_with_broken_master(log_path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = log_path.parent().expect("log path has parent");
+        let mock = dir.join("mock-ssh-broken-master");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+                 if [ \"$prev\" = \"-O\" ] && [ \"$arg\" = \"check\" ]; then\n\
+                     exit 1\n\
+                 fi\n\
+                 prev=\"$arg\"\n\
+             done\n\
+             exit 0\n",
+            log_path.display()
+        );
+        write_file(&mock, &script);
+        let mut perms = fs::metadata(&mock).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock, perms).unwrap();
+        mock
     }
 
     fn devbox() -> SshHost {

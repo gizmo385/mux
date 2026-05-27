@@ -159,6 +159,11 @@ impl TranscriptWatcher {
             }
             None => false,
         };
+        let projects_root = if has_recursive_root {
+            discovery_root.map(Path::to_path_buf)
+        } else {
+            None
+        };
 
         if !has_recursive_root {
             for (_, path) in &initial {
@@ -190,6 +195,7 @@ impl TranscriptWatcher {
         let targets_for_thread = Arc::clone(&targets);
         let event_tx_for_thread = event_tx.clone();
         let host_for_thread = Arc::clone(&host);
+        let projects_root_for_thread = projects_root;
         thread::spawn(move || {
             for res in notify_rx {
                 let Ok(event) = res else { continue };
@@ -200,6 +206,19 @@ impl TranscriptWatcher {
                 }
                 for path in event.paths {
                     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    // Drop transcripts nested deeper than `<root>/<bucket>/<file>.jsonl`.
+                    // Claude Code writes subagent (sidechain) transcripts at
+                    // `<bucket>/<parent-session-id>/subagents/agent-<id>.jsonl`,
+                    // which the recursive notify watch would otherwise surface
+                    // as standalone dashboard rows that flap on every write.
+                    // The local `Host::list_transcripts` enforces the same
+                    // depth-2 shape via `read_dir`, so both startup discovery
+                    // and live discovery filter identically.
+                    if let Some(root) = projects_root_for_thread.as_deref()
+                        && !is_top_level_transcript(&path, root)
+                    {
                         continue;
                     }
                     let known_id = targets_for_thread
@@ -527,6 +546,18 @@ fn poll_once(
     true
 }
 
+/// True iff `path` sits exactly one bucket below `projects_root` — i.e.
+/// `<projects_root>/<bucket>/<file>.jsonl`. Used by the local notify
+/// thread to drop sidechain transcripts Claude Code writes at
+/// `<bucket>/<parent-session-id>/subagents/agent-<id>.jsonl`; the bulk
+/// discovery path enforces the same shape via `read_dir` two levels deep,
+/// so both startup and live discovery filter identically.
+fn is_top_level_transcript(path: &Path, projects_root: &Path) -> bool {
+    path.parent()
+        .and_then(Path::parent)
+        .is_some_and(|p| p == projects_root)
+}
+
 /// Derive an attention state from the most recent meaningful JSONL entry in
 /// `transcript_path`. Reads only the last `TAIL_BYTES` of the file through
 /// `host`; the (possibly truncated) first line is discarded by virtue of
@@ -643,6 +674,44 @@ mod tests {
     fn empty_file_is_unknown() {
         let f = tempfile::NamedTempFile::new().unwrap();
         assert_eq!(derive_attention(&host(), f.path()), Attention::Unknown);
+    }
+
+    #[test]
+    fn is_top_level_transcript_accepts_depth_two_paths() {
+        let root = Path::new("/r/projects");
+        assert!(is_top_level_transcript(
+            Path::new("/r/projects/-foo/abc.jsonl"),
+            root
+        ));
+    }
+
+    #[test]
+    fn is_top_level_transcript_rejects_nested_subagent_paths() {
+        // The exact shape Claude Code writes for sidechain transcripts:
+        // <bucket>/<parent-session-id>/subagents/agent-<id>.jsonl.
+        // Without this filter the recursive notify watch would surface
+        // every subagent as a flapping standalone session.
+        let root = Path::new("/r/projects");
+        assert!(!is_top_level_transcript(
+            Path::new("/r/projects/-foo/parent-sess/subagents/agent-xyz.jsonl"),
+            root
+        ));
+    }
+
+    #[test]
+    fn is_top_level_transcript_rejects_root_or_above() {
+        let root = Path::new("/r/projects");
+        // Direct child of the root, not inside any bucket — shouldn't happen
+        // in practice but the predicate should still say no.
+        assert!(!is_top_level_transcript(
+            Path::new("/r/projects/loose.jsonl"),
+            root
+        ));
+        // Path entirely outside the root.
+        assert!(!is_top_level_transcript(
+            Path::new("/elsewhere/foo/bar.jsonl"),
+            root
+        ));
     }
 
     #[test]

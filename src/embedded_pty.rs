@@ -463,7 +463,16 @@ mod tests {
 
     #[test]
     fn spawn_propagates_zero_exit_status() {
-        let argv = vec!["/bin/true".to_string()];
+        // `/bin/sh -c 'exit 0'` rather than `/bin/true`: sandboxed test
+        // environments routinely lack `/bin/true` (and `/bin/false`),
+        // but `/bin/sh` is the same binary the rest of this file's
+        // tests already rely on. Same observable behaviour, broader
+        // portability.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ];
         let pty = EmbeddedPty::spawn(&argv, None, 24, 80).unwrap();
         let status = wait_for_exit(&pty, Duration::from_secs(3)).expect("Exited event");
         assert!(status.success(), "expected zero exit, got {status:?}");
@@ -471,7 +480,11 @@ mod tests {
 
     #[test]
     fn spawn_propagates_nonzero_exit_status() {
-        let argv = vec!["/bin/false".to_string()];
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 1".to_string(),
+        ];
         let pty = EmbeddedPty::spawn(&argv, None, 24, 80).unwrap();
         let status = wait_for_exit(&pty, Duration::from_secs(3)).expect("Exited event");
         assert!(!status.success(), "expected non-zero exit, got {status:?}");

@@ -1032,7 +1032,19 @@ fn user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
 }
 
-fn find_pane_local(session: &Session) -> Result<String, AttachError> {
+/// Resolve the local tmux pane (if any) that should serve as the
+/// attach target for `session`. Used both inside `PtyDriver::attach_local`
+/// and from the App's pre-attach parallel-resume gate, hence the
+/// `pub` visibility.
+///
+/// # Errors
+/// Returns `AttachError::NotFound` when `tmux list-panes -a` ran
+/// successfully but no pane matched the resolution rules in
+/// [`resolve_pane_target`]. Returns `AttachError::TmuxCommandFailed`
+/// when the `tmux` invocation itself failed (binary missing, exit
+/// non-zero, etc.) — the bare-terminal case where there's no local
+/// tmux server at all collapses to this.
+pub fn find_pane_local(session: &Session) -> Result<String, AttachError> {
     let output = Command::new("tmux")
         .args([
             "list-panes",
@@ -1092,6 +1104,56 @@ fn resolve_pane_target(tmux_output: &str, session: &Session) -> Option<String> {
     cwd_match
 }
 
+/// Returns true when at least one process is currently holding
+/// `transcript_path` open. Used as a pre-attach signal to catch the
+/// case where Claude is running outside agent-mux's reach (e.g. the
+/// user started `claude` in a bare terminal with no tmux) so the
+/// `tmux_resume_argv` fallback can prompt before spawning a parallel
+/// `claude --resume` against the same transcript file.
+///
+/// Implementation: `lsof -t -- <path>` and treat any non-empty line
+/// of stdout as a positive hit. Failure modes (`lsof` missing, exits
+/// non-zero with no matches, non-UTF-8 stdout) collapse to `false` —
+/// false negatives are the safe default for a confirmation gate. The
+/// worst case is the legacy silent-resume behaviour, which is the
+/// behaviour we already had before this gate existed.
+///
+/// `lsof` was chosen over `fuser` because the macOS dogfood box is
+/// the active surface and macOS ships `lsof` but not `fuser`. Linux
+/// and WSL also ship `lsof` in their typical package set; agent-mux's
+/// other userspace assumptions (`tmux`, `ssh`, `git`, `claude`) are
+/// already at that bar.
+#[must_use]
+pub fn probe_live_writer(transcript_path: &Path) -> bool {
+    let Ok(output) = Command::new("lsof")
+        .args(["-t", "--"])
+        .arg(transcript_path)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        // `lsof -t` exits non-zero when no process matches — the
+        // common "no live writer" case. Collapse to `false` rather
+        // than treating it as an error.
+        return false;
+    }
+    interpret_lsof_output(&output.stdout)
+}
+
+/// Pure parser for `lsof -t` stdout: one PID per line, no trailing
+/// metadata. Returns true if at least one non-empty line is present.
+/// Split out from [`probe_live_writer`] so the parsing edge cases
+/// (whitespace-only output, non-UTF-8 bytes) are unit-testable
+/// without spawning `lsof`.
+#[must_use]
+fn interpret_lsof_output(stdout: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    s.lines().any(|l| !l.trim().is_empty())
+}
+
 fn run_tmux(args: &[&str]) -> Result<(), AttachError> {
     let output = Command::new("tmux")
         .args(args)
@@ -1125,6 +1187,52 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
         }
+    }
+
+    #[test]
+    fn interpret_lsof_output_returns_true_for_single_pid() {
+        // One PID, trailing newline — the standard `lsof -t` shape.
+        assert!(interpret_lsof_output(b"12345\n"));
+    }
+
+    #[test]
+    fn interpret_lsof_output_returns_true_for_multiple_pids() {
+        // Multiple processes hold the file; `lsof -t` prints one per
+        // line. Any single hit is enough to gate the attach.
+        assert!(interpret_lsof_output(b"12345\n67890\n"));
+    }
+
+    #[test]
+    fn interpret_lsof_output_returns_true_without_trailing_newline() {
+        // Defensive against an `lsof` variant that omits the final
+        // newline on a single match — the line iterator still yields
+        // the PID, which still trips the predicate.
+        assert!(interpret_lsof_output(b"12345"));
+    }
+
+    #[test]
+    fn interpret_lsof_output_returns_false_for_empty_output() {
+        // The "no writers" case shouldn't trip the gate. Empty stdout
+        // is what we observe when `lsof` is called with exit 0 but no
+        // match (rare — typical no-match is exit 1, handled by the
+        // status check above) and the "lsof missing" path's empty
+        // child output (also rare, but harmless to handle).
+        assert!(!interpret_lsof_output(b""));
+    }
+
+    #[test]
+    fn interpret_lsof_output_returns_false_for_whitespace_only() {
+        // Whitespace-only lines must not trip the gate — protects
+        // against trailing-blank quirks from a future lsof variant.
+        assert!(!interpret_lsof_output(b"\n  \n\t\n"));
+    }
+
+    #[test]
+    fn interpret_lsof_output_returns_false_for_non_utf8() {
+        // Non-UTF-8 bytes shouldn't surface as a positive hit. lsof
+        // doesn't legitimately produce them, but the parser stays
+        // safe rather than `unwrap()`ing.
+        assert!(!interpret_lsof_output(&[0xFF, 0xFE]));
     }
 
     #[test]

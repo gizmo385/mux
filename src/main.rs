@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use agent_mux::attachment::{
     AttachOutcome, AttachmentDriver, EmbedSpec, PtyDriver, SuspendCommand, TmuxDriver,
+    find_pane_local, probe_live_writer,
 };
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
@@ -454,6 +455,30 @@ struct App {
     /// [`Self::route_rename_key`] rather than the normal action
     /// dispatch.
     rename: Option<RenameState>,
+    /// Armed confirmation for the parallel-resume gate. Set when the
+    /// user presses Enter on a session with no detectable tmux pane
+    /// AND `lsof` reports that another process is currently holding
+    /// the transcript file open (typically a `claude` running outside
+    /// agent-mux's reach — bare terminal, separate tmux server). A
+    /// second Enter on the same session id proceeds with the normal
+    /// `tmux_resume_argv` fallback; Esc clears the state. The point
+    /// is to avoid silently spawning a parallel `claude --resume`
+    /// against a transcript a live process is already writing to —
+    /// which races the original Claude and risks transcript
+    /// interleaving.
+    attach_confirm: Option<AttachConfirmState>,
+}
+
+/// Captures the session a parallel-resume confirmation is armed for.
+/// `session_id` is the disambiguator the second Enter checks against
+/// (so navigating to a different row then pressing Enter re-runs the
+/// gate for the new selection rather than confirming the old one).
+/// `project_dir` rides along purely for the footer message — the user
+/// reads it to confirm the warning is about the row they think it is.
+#[derive(Debug, Clone)]
+struct AttachConfirmState {
+    session_id: SessionId,
+    project_dir: PathBuf,
 }
 
 /// In-progress session-name rename. The target is captured at `r`
@@ -709,6 +734,7 @@ impl App {
             session_names: load_session_names_or_empty(),
             favorites: load_favorites_or_empty(),
             rename: None,
+            attach_confirm: None,
         })
     }
 
@@ -1616,12 +1642,54 @@ impl App {
     }
 
     fn attach_selected(&mut self) -> Option<SuspendCommand> {
-        let (result, session_id) = {
+        // Snapshot the session in a sub-scope so the immutable
+        // selected_session borrow ends before we mutate
+        // self.attach_confirm / dispatch through the driver.
+        let (session_clone, host) = {
             let session = self.selected_session()?;
             let host = self.hosts.get(&session.host)?.clone();
-            let id = session.id.clone();
-            (self.driver.attach(session, host.as_ref()), id)
+            (session.clone(), host)
         };
+        let session_id = session_clone.id.clone();
+
+        // Parallel-resume gate: when the host is local AND there's no
+        // tmux pane for the session (so the driver would fall through
+        // to `tmux_resume_argv` and spawn a brand-new `claude --resume`)
+        // AND `lsof` reports another process is currently holding the
+        // transcript file open (typically a Claude running outside
+        // agent-mux's reach), arm a one-shot confirmation and return
+        // without attaching. Second Enter on the same session id
+        // bypasses the gate — `already_armed` is the contract.
+        //
+        // Scope is local-only for the first cut. Remote sessions can
+        // race a parallel resume too, but the probe needs `lsof` on
+        // the remote and the dogfood signal is local-only. Filed in
+        // TODO as a follow-up if a remote dogfood case surfaces.
+        let already_armed = self
+            .attach_confirm
+            .as_ref()
+            .is_some_and(|s| s.session_id == session_id);
+        if should_gate_attach(
+            session_clone.host.is_local(),
+            find_pane_local(&session_clone).is_ok(),
+            probe_live_writer(&session_clone.transcript_path),
+            already_armed,
+        ) {
+            self.attach_confirm = Some(AttachConfirmState {
+                session_id: session_id.clone(),
+                project_dir: session_clone.project_dir.clone(),
+            });
+            // Clear stale status so the banner (which renders from
+            // attach_confirm) is the only attach-related signal.
+            self.status = None;
+            return None;
+        }
+        // Either no gate trips, or the user already confirmed. Drop
+        // the armed state before dispatching so a successful attach
+        // doesn't leave a stale banner behind.
+        self.attach_confirm = None;
+
+        let result = self.driver.attach(&session_clone, host.as_ref());
         match result {
             Ok(AttachOutcome::Done) => {
                 self.status = None;
@@ -2256,6 +2324,18 @@ enum ActionOutcome {
 /// line cap; pure dispatch with no terminal handoff (the caller
 /// invokes `suspend_and_run` for the `Suspend` variant).
 fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
+    // Parallel-resume gate: any keystroke that isn't an explicit
+    // Attach cancels an armed confirmation. The user reading the
+    // banner has three meaningful responses — press Enter again (the
+    // armed state is preserved into `attach_selected`, which sees
+    // `already_armed` and proceeds), press Esc (action = None →
+    // cleared here, no other side effect), or do literally anything
+    // else (the action runs as usual but the gate clears). The "one
+    // keystroke = one decision" model keeps the banner from
+    // outliving the user's attention.
+    if app.attach_confirm.is_some() && !matches!(action, Some(Action::Attach)) {
+        app.attach_confirm = None;
+    }
     let Some(action) = action else {
         return ActionOutcome::Continue;
     };
@@ -2731,6 +2811,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let footer_text = compose_footer(
         app.creating.as_ref(),
+        app.attach_confirm.as_ref(),
         app.status.as_deref(),
         app.catalog.is_empty(),
         app.in_tmux,
@@ -2809,6 +2890,7 @@ fn compose_search_bar(search: &SearchState, visible: usize) -> String {
 #[allow(clippy::too_many_arguments)]
 fn compose_footer(
     creating: Option<&CreatingSession>,
+    attach_confirm: Option<&AttachConfirmState>,
     status: Option<&str>,
     catalog_empty: bool,
     in_tmux: bool,
@@ -2826,6 +2908,17 @@ fn compose_footer(
     // while the user was inside the terminal).
     if let Some(c) = creating {
         return format!(" creating worktree for {:?} in {}… ", c.task, c.repo_name);
+    }
+    // Parallel-resume gate sits *above* status so a background event
+    // landing between arm-time and the user's next keystroke can't
+    // overwrite the warning. The banner is the dashboard's only
+    // affordance for this state — if the user misses it they'll spawn
+    // the parallel `claude --resume` they were trying to avoid.
+    if let Some(c) = attach_confirm {
+        return format!(
+            " ⚠  live claude detected for {}  ·  ⏎ spawn parallel resume anyway  ·  any other key cancels ",
+            c.project_dir.display()
+        );
     }
     if let Some(s) = status {
         return format!(" {s} ");
@@ -3116,6 +3209,45 @@ fn pick_reseat_target(
         None => {}
     }
     first_session_index(rows)
+}
+
+/// Pure decision for the parallel-resume confirmation gate.
+///
+/// `true` means [`App::attach_selected`] should arm the confirmation
+/// and refuse to attach this tick — the user will see a banner and
+/// can either press Enter again to proceed or any other key to
+/// cancel.
+///
+/// The gate trips when all four signals line up:
+/// - `host_is_local` — remote sessions are out of scope for the
+///   first cut (the probe would need `lsof` on the remote; filed as
+///   a follow-up in TODO).
+/// - `!pane_present` — there's a live tmux pane to attach to, so
+///   the driver isn't about to fall through to `tmux_resume_argv`.
+///   When a pane is present the attach is unambiguous and the gate
+///   doesn't trip.
+/// - `live_writer` — `lsof` reports another process holds the
+///   transcript file open. Without this signal we can't distinguish
+///   "user has no Claude running" (resume is the right thing) from
+///   "user has a Claude running outside our reach" (resume races).
+/// - `!already_armed` — the user already saw the banner on the
+///   previous Enter. Same-session re-fire proceeds.
+///
+/// Split out as a pure helper so the four-input truth table is
+/// unit-testable without `tmux` / `lsof` side effects.
+// Clippy's `fn_params_excessive_bools` defaults to 3 — collapsing
+// these into a struct or enums would obscure the truth-table shape
+// the helper exists to express. The naming carries enough context at
+// call sites that the boolean-trap concern doesn't apply.
+#[allow(clippy::fn_params_excessive_bools)]
+#[must_use]
+fn should_gate_attach(
+    host_is_local: bool,
+    pane_present: bool,
+    live_writer: bool,
+    already_armed: bool,
+) -> bool {
+    !already_armed && host_is_local && !pane_present && live_writer
 }
 
 /// Whether the embedded PTY should be resized to `proposed`. False for
@@ -3626,6 +3758,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -3640,6 +3773,7 @@ mod tests {
     #[test]
     fn footer_keybind_line_shows_in_tmux_return_hint() {
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3668,6 +3802,7 @@ mod tests {
             },
         ];
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3699,6 +3834,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -3717,6 +3853,7 @@ mod tests {
         // source (it doesn't have a separate visible affordance the way
         // `n: new` does via the modal it opens).
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3741,6 +3878,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -3757,6 +3895,7 @@ mod tests {
     #[test]
     fn footer_keybind_line_advertises_rename_and_favorite() {
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3776,6 +3915,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             false,
             0,
@@ -3793,6 +3933,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             true,
             true,
             0,
@@ -3806,8 +3947,68 @@ mod tests {
     }
 
     #[test]
+    fn footer_attach_confirm_banner_outranks_status() {
+        // The parallel-resume gate is the dashboard's only affordance
+        // for "do you really want to spawn a parallel claude" — a
+        // background event that lands between arm-time and the
+        // user's next keystroke must not paint over the warning.
+        let confirm = AttachConfirmState {
+            session_id: sid("abc"),
+            project_dir: PathBuf::from("/work/proj"),
+        };
+        let s = compose_footer(
+            None,
+            Some(&confirm),
+            Some("attach: boom"), // would normally win precedence
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            &no_empty_scans(),
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("live claude"), "got: {s}");
+        assert!(s.contains("/work/proj"), "got: {s}");
+        assert!(
+            !s.contains("attach: boom"),
+            "status must be suppressed: {s}"
+        );
+    }
+
+    #[test]
+    fn footer_creating_outranks_attach_confirm() {
+        // Creating is the most-urgent in-flight state; an in-progress
+        // worktree create must still surface even if a confirm
+        // happens to be armed (corner case but pins the precedence).
+        let confirm = AttachConfirmState {
+            session_id: sid("abc"),
+            project_dir: PathBuf::from("/work/proj"),
+        };
+        let creating = CreatingSession {
+            repo_name: "agent-mux".into(),
+            task: "refactor".into(),
+        };
+        let s = compose_footer(
+            Some(&creating),
+            Some(&confirm),
+            None,
+            false,
+            true,
+            0,
+            &no_connect_errors(),
+            &no_empty_scans(),
+            Focus::Sidebar,
+            &[],
+        );
+        assert!(s.contains("creating worktree"), "got: {s}");
+        assert!(!s.contains("live claude"), "got: {s}");
+    }
+
+    #[test]
     fn footer_status_takes_precedence_over_keybinds() {
         let s = compose_footer(
+            None,
             None,
             Some("attach: boom"),
             false,
@@ -3830,6 +4031,7 @@ mod tests {
         };
         let s = compose_footer(
             Some(&creating),
+            None,
             Some("ignored"),
             false,
             true,
@@ -3847,6 +4049,7 @@ mod tests {
     #[test]
     fn footer_keybind_line_appends_connecting_suffix_when_hosts_pending() {
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3869,6 +4072,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             true,
             true,
             1,
@@ -3884,6 +4088,7 @@ mod tests {
     #[test]
     fn footer_connecting_suffix_disappears_once_all_hosts_have_reported() {
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3909,6 +4114,7 @@ mod tests {
             vec![PathBuf::from("/home/gizmo/workspace")],
         )];
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -3942,6 +4148,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -3969,6 +4176,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -3985,6 +4193,7 @@ mod tests {
     fn footer_renders_connect_errors_as_sticky_line_when_no_status() {
         let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
         let s = compose_footer(
+            None,
             None,
             None,
             false,
@@ -4012,6 +4221,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -4030,6 +4240,7 @@ mod tests {
         // sticky connect-failure line.
         let errors = vec![(HostId("alpenglow".into()), "ssh exit 255".to_string())];
         let s = compose_footer(
+            None,
             None,
             Some("opened terminal in /x"),
             false,
@@ -4108,6 +4319,7 @@ mod tests {
         let s = compose_footer(
             None,
             None,
+            None,
             false,
             true,
             0,
@@ -4129,6 +4341,7 @@ mod tests {
         // precedence in Terminal focus — the user needs to see
         // those signals even mid-session.
         let s = compose_footer(
+            None,
             None,
             Some("attach: boom"),
             false,
@@ -4168,6 +4381,47 @@ mod tests {
         assert!(!should_resize_pty((24, 80), (0, 80)));
         assert!(!should_resize_pty((24, 80), (24, 0)));
         assert!(!should_resize_pty((24, 80), (0, 0)));
+    }
+
+    // ---- should_gate_attach ----
+
+    #[test]
+    fn should_gate_attach_trips_when_all_four_signals_align() {
+        // The dogfooded case: local host, no tmux pane to attach to,
+        // lsof reports a live writer, and we haven't already armed
+        // for this session. Exactly when the gate must trip.
+        assert!(should_gate_attach(true, false, true, false));
+    }
+
+    #[test]
+    fn should_gate_attach_skips_remote_hosts() {
+        // Remote sessions are out of scope for the first cut — the
+        // probe would need lsof on the remote. Stays false even when
+        // the other three signals would trip the local case.
+        assert!(!should_gate_attach(false, false, true, false));
+    }
+
+    #[test]
+    fn should_gate_attach_proceeds_when_pane_present() {
+        // A live tmux pane means the driver will attach to it
+        // directly; no parallel-resume risk. Gate stays clear even if
+        // lsof says someone has the transcript open (the pane is
+        // probably that "someone").
+        assert!(!should_gate_attach(true, true, true, false));
+    }
+
+    #[test]
+    fn should_gate_attach_proceeds_when_no_live_writer() {
+        // No process holds the transcript — the resume fallback is
+        // the right action. Gate stays clear.
+        assert!(!should_gate_attach(true, false, false, false));
+    }
+
+    #[test]
+    fn should_gate_attach_proceeds_when_already_armed() {
+        // Second Enter on the same session: user saw the banner and
+        // is confirming. Don't re-arm.
+        assert!(!should_gate_attach(true, false, true, true));
     }
 
     // ---- compute_actively_viewed ----

@@ -3172,11 +3172,8 @@ fn pick_reseat_target(
     prior: Option<&SelectionAnchor>,
 ) -> Option<usize> {
     let matches_id = |i: usize, id: &SessionId| sessions.get(i).is_some_and(|s| s.id == *id);
-    let matches_tmux = |i: usize, name: &str| {
-        tool_launches
-            .get(i)
-            .is_some_and(|t| t.tmux_session == name)
-    };
+    let matches_tmux =
+        |i: usize, name: &str| tool_launches.get(i).is_some_and(|t| t.tmux_session == name);
     match prior {
         Some(SelectionAnchor::Session { id, in_favorites }) => {
             let same_kind = rows.iter().position(|r| match r {
@@ -3188,9 +3185,7 @@ fn pick_reseat_target(
                 return same_kind;
             }
             let either_kind = rows.iter().position(|r| match r {
-                DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
-                    matches_id(*i, id)
-                }
+                DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => matches_id(*i, id),
                 _ => false,
             });
             if either_kind.is_some() {

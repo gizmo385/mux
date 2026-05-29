@@ -23,7 +23,9 @@ use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use portable_pty::{CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{
+    ChildKiller, CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use tui_term::widget::PseudoTerminal;
@@ -46,11 +48,27 @@ pub enum PtyEvent {
 
 /// One running pseudoterminal.
 ///
-/// Drop semantics: dropping `EmbeddedPty` drops `master`, which closes
-/// the pty; the child observes EOF on its stdin and SIGHUP on its
-/// controlling tty, exits; the reader thread sees EOF on its read, reaps
-/// the child, and returns. We deliberately do not `join` the reader on
-/// drop — a child that ignores SIGHUP must not stall app shutdown.
+/// Drop semantics: dropping `EmbeddedPty` sends SIGHUP to the child via
+/// the `ChildKiller` cloned at spawn time, sleeps briefly so the SIGHUP
+/// propagates and the slave fd closes, then drops the master + writer.
+///
+/// The SIGHUP-first step is load-bearing for one specific case:
+/// `portable_pty 0.9`'s `UnixMasterWriter::drop` reads the master's
+/// termios `VEOF` byte and writes `\n` followed by that byte (default
+/// `^D`) to the master before closing the writer's fd. The intent is
+/// to cleanly close stdin for a generic child. But agent-mux hosts
+/// `tmux attach` clients in this PTY — those forward stdin bytes to
+/// the inner tmux session's shell, which interprets `^D` as EOF and
+/// exits. The exiting shell terminates its window, the window's
+/// session closes (last window gone), and the entire tmux session is
+/// destroyed. Pre-emptively SIGHUP'ing the tmux client so the slave is
+/// already closed by the time the writer's destructor's `write_all`
+/// runs makes the EOT-write a no-op against a closed pipe.
+///
+/// The reader thread is still detached — a child that ignores SIGHUP
+/// must not stall app shutdown — but the short post-SIGHUP sleep gives
+/// well-behaved children (which `tmux attach` is) a window to exit
+/// cleanly before we drop the fds out from under them.
 pub struct EmbeddedPty {
     parser: Arc<RwLock<vt100::Parser>>,
     /// Held to keep the pty alive (drop closes it) and to service
@@ -59,6 +77,28 @@ pub struct EmbeddedPty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     events: mpsc::Receiver<PtyEvent>,
+    /// Cloned from the child at spawn time so the main thread can
+    /// SIGHUP the child on drop without owning the `Child` (which
+    /// lives in the reader thread, blocked on `child.wait()`).
+    killer: Box<dyn ChildKiller + Send + Sync>,
+}
+
+impl Drop for EmbeddedPty {
+    fn drop(&mut self) {
+        // SIGHUP the child first — see the struct doc-comment for the
+        // tmux-attach-EOT explanation. Failures here are best-effort:
+        // the child may already be dead, or the kill syscall may fail
+        // for kernel reasons. Either way we proceed with field drops.
+        let _ = self.killer.kill();
+        // Brief sleep so SIGHUP can propagate and the child closes its
+        // slave fd before portable-pty's `UnixMasterWriter::drop`
+        // writes `\n + EOT` to the master. 30ms is empirically enough
+        // on a loaded macOS dev box (validated via /tmp/agent-mux-repro
+        // 2026-05-29). Bounded sleep — even if SIGHUP delivery is
+        // delayed past 30ms the worst case is the original bug
+        // returning, not a stuck shutdown.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
 }
 
 impl EmbeddedPty {
@@ -109,6 +149,12 @@ impl EmbeddedPty {
         // master after the child exits.
         drop(pair.slave);
 
+        // Clone a signaller off the child *before* moving the child
+        // into the reader thread. The signaller wraps the child's
+        // PID and lets the `EmbeddedPty::drop` SIGHUP the child even
+        // while the reader thread holds `child.wait()`.
+        let killer = child.clone_killer();
+
         let mut reader = pair.master.try_clone_reader().map_err(map_pty_err)?;
         let writer = pair.master.take_writer().map_err(map_pty_err)?;
         let master = pair.master;
@@ -152,6 +198,7 @@ impl EmbeddedPty {
             master,
             writer,
             events: rx,
+            killer,
         })
     }
 
@@ -502,6 +549,109 @@ mod tests {
         let mut pty = EmbeddedPty::spawn(&argv, None, 24, 80).unwrap();
         pty.resize(40, 120).unwrap();
         pty.resize(10, 30).unwrap();
+    }
+
+    /// Regression: hosting `tmux attach -t <session>` in an
+    /// `EmbeddedPty` and dropping it must NOT terminate the underlying
+    /// tmux session. The bug (2026-05-29 dogfood, surfaced by the t-in-
+    /// tools ship): `portable_pty 0.9`'s `UnixMasterWriter::drop`
+    /// writes `\n` + termios `VEOF` (`^D`) to the master before
+    /// closing the writer's fd. `tmux attach` faithfully forwards
+    /// those bytes to the inner session's shell, which interprets
+    /// `^D` as EOF and exits — terminating the window, the session,
+    /// and (if it was the last session) the tmux server. The fix:
+    /// `EmbeddedPty::drop` SIGHUPs the child first via the
+    /// `ChildKiller` cloned at spawn time, so by the time the writer's
+    /// destructor runs the slave is already closed and the EOT-write
+    /// falls into a broken pipe.
+    #[test]
+    fn drop_preserves_tmux_session_when_hosting_an_attach_client() {
+        // Sandboxed tmux server via `-L <socket>` so we don't touch
+        // the user's default server (a `tmux kill-server` here would
+        // wipe every session the developer had open). Unique socket
+        // name per test run to avoid collisions if the test is invoked
+        // concurrently.
+        let socket = format!("agent-mux-test-{}", std::process::id());
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .output();
+
+        // Create a detached session running /bin/sh (which exits on
+        // EOF, mirroring zsh/bash behaviour for the failure mode the
+        // fix targets).
+        let out = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}",
+                "-c",
+                "/tmp",
+                "/bin/sh",
+            ])
+            .output()
+            .expect("tmux new-session");
+        if !out.status.success() {
+            // tmux may not be installed in the test environment.
+            // Skip rather than fail — every other test in this module
+            // is independent of tmux.
+            eprintln!("skipping drop_preserves_tmux_session: tmux unavailable");
+            return;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Sanity: session is alive immediately after creation.
+        let alive_before = std::process::Command::new("tmux")
+            .args(["-L", &socket, "has-session", "-t", &name])
+            .status()
+            .expect("has-session")
+            .success();
+        assert!(alive_before, "session should be alive after new-session -d");
+
+        // Host `tmux attach -t <name>` in an EmbeddedPty, hold briefly
+        // so the attach actually connects (tmux's stdout flush has a
+        // measurable lag on macOS), then drop.
+        {
+            let argv = vec![
+                "tmux".to_string(),
+                "-L".to_string(),
+                socket.clone(),
+                "attach".to_string(),
+                "-t".to_string(),
+                name.clone(),
+            ];
+            let _pty = EmbeddedPty::spawn(&argv, None, 24, 80).expect("attach");
+            thread::sleep(Duration::from_millis(200));
+            // _pty drops at end of scope. Drop semantics (SIGHUP + brief
+            // settle) should leave the session alive.
+        }
+
+        // Give the SIGHUP and slave-close another moment to settle on
+        // a loaded CI box, then assert the session is still there.
+        thread::sleep(Duration::from_millis(100));
+        let alive_after = std::process::Command::new("tmux")
+            .args(["-L", &socket, "has-session", "-t", &name])
+            .status()
+            .expect("has-session")
+            .success();
+
+        // Cleanup the sandbox server BEFORE the assert so a failed
+        // assertion doesn't leave a sandbox socket behind.
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .output();
+
+        assert!(
+            alive_after,
+            "tmux session must survive EmbeddedPty drop — \
+             portable-pty's UnixMasterWriter::drop sends \\n+EOT to \
+             the master, which tmux attach forwards as user input to \
+             the inner shell; if EmbeddedPty's drop doesn't SIGHUP \
+             the child first the shell exits and the session dies"
+        );
     }
 
     #[test]

@@ -577,19 +577,20 @@ impl AttachmentDriver for PtyDriver {
     }
 
     /// Open a shell at the session's cwd, hosted inside the embedded
-    /// PTY pane. Local: spawn `$SHELL` directly with `cwd` set on the
-    /// `EmbedSpec`. Remote: ssh-wrap a `sh -c 'cd <cwd> && exec
-    /// "$SHELL"'` recipe and embed the ssh argv. Either way, the
-    /// sidebar stays visible while the user works in the shell;
-    /// pressing Enter on a session row swaps the embed back to the
-    /// session attach.
+    /// PTY pane. Wraps `$SHELL` in a detached tmux session — same
+    /// shape as `spawn_tool_*_embed` — so the terminal survives PTY
+    /// swaps in the dashboard and surfaces in the Tools sidebar group
+    /// as a re-attachable row. Pressing Enter on a session row swaps
+    /// the embed back to the session attach without killing the
+    /// terminal; the user can navigate to its tools-group row to come
+    /// back.
     fn spawn_terminal(
         &self,
         session: &Session,
         host: &dyn Host,
     ) -> Result<AttachOutcome, AttachError> {
         if session.host.is_local() {
-            Ok(Self::spawn_terminal_local(session))
+            Self::spawn_terminal_local(session)
         } else {
             Self::spawn_terminal_remote_embed(session, host)
         }
@@ -661,37 +662,68 @@ impl PtyDriver {
         })
     }
 
-    /// Local terminal launch: run `$SHELL` directly in the embedded
-    /// PTY with cwd set to the session's `project_dir`. No tmux wrap
-    /// — the dashboard *is* the host for the new shell, sibling to
-    /// the sidebar.
-    fn spawn_terminal_local(session: &Session) -> AttachOutcome {
-        AttachOutcome::EmbedPty(EmbedSpec {
-            argv: vec![user_shell()],
-            cwd: Some(session.project_dir.clone()),
+    /// Local terminal launch: wrap `$SHELL` in a detached tmux session
+    /// at the session's `project_dir`, then attach via the embedded
+    /// pane. Same recipe as [`spawn_tool_local_embed`] — the user's
+    /// `t` keypress is the degenerate case of a tool launch (the
+    /// "tool" is the shell itself). `tmux_session` carries the
+    /// assigned name back so `App::spawn_terminal_selected` records
+    /// it in `ToolLaunchRegistry` and the Tools sidebar group renders
+    /// a re-attachable row.
+    fn spawn_terminal_local(session: &Session) -> Result<AttachOutcome, AttachError> {
+        let cwd_str = session.project_dir.to_string_lossy().into_owned();
+        let spawn_argv = tmux_new_detached_tool_argv(&cwd_str, &user_shell());
+        let (program, rest) = spawn_argv.split_first().expect("non-empty argv");
+        let stdout = run_for_stdout(Command::new(program).args(rest))?;
+        let session_name = stdout.trim().to_string();
+        if session_name.is_empty() {
+            return Err(AttachError::TmuxCommandFailed(
+                "tmux new-session returned empty session name".into(),
+            ));
+        }
+        Ok(AttachOutcome::EmbedPty(EmbedSpec {
+            argv: tmux_attach_argv(&session_name),
+            cwd: None,
             label: format!("terminal · {}", spawn_session_label(&session.project_dir)),
-            ..Default::default()
-        })
+            tmux_session: Some(session_name),
+        }))
     }
 
-    /// Remote terminal in embedded mode. Same `sh -c 'cd … && exec
-    /// "$SHELL"'` recipe `TmuxDriver::spawn_terminal_remote` uses,
-    /// wrapped in `Host::ssh_argv(tty=true, …)` and emitted as
-    /// `EmbedPty` so the result lands in the dashboard pane.
+    /// Remote terminal in embedded mode. Same shape as
+    /// [`spawn_tool_remote_embed`] with `exec "$SHELL"` as the joined
+    /// command — the remote tmux runs the trailing arg through
+    /// `/bin/sh -c`, so `$SHELL` expands against the *remote* user's
+    /// env. The detached remote tmux session keeps the shell alive
+    /// across PTY swaps so the user can navigate back to it via the
+    /// Tools sidebar row.
     fn spawn_terminal_remote_embed(
         session: &Session,
         host: &dyn Host,
     ) -> Result<AttachOutcome, AttachError> {
         let cwd = session.project_dir.to_string_lossy().into_owned();
-        let recipe = format!("cd {} && exec \"$SHELL\"", shell_single_quote(&cwd));
+        let spawn_cmd = tmux_new_detached_tool_argv(&cwd, "exec \"$SHELL\"");
+        let spawn_refs: Vec<&str> = spawn_cmd.iter().map(String::as_str).collect();
+        let spawn_argv = host
+            .ssh_argv(false, &spawn_refs)
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        let (program, rest) = spawn_argv.split_first().expect("non-empty ssh argv");
+        let stdout = run_for_stdout(Command::new(program).args(rest))?;
+        let session_name = stdout.trim().to_string();
+        if session_name.is_empty() {
+            return Err(AttachError::TmuxCommandFailed(
+                "remote tmux new-session returned empty session name".into(),
+            ));
+        }
+        let attach_cmd = tmux_attach_argv(&session_name);
+        let attach_refs: Vec<&str> = attach_cmd.iter().map(String::as_str).collect();
         let argv = host
-            .ssh_argv(true, &["sh", "-c", &recipe])
+            .ssh_argv(true, &attach_refs)
             .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
         Ok(AttachOutcome::EmbedPty(EmbedSpec {
             argv,
             cwd: None,
             label: format!("terminal · {}", spawn_session_label(&session.project_dir)),
-            ..Default::default()
+            tmux_session: Some(session_name),
         }))
     }
 
@@ -1824,41 +1856,35 @@ mod tests {
     }
 
     #[test]
-    fn pty_driver_spawn_terminal_local_embeds_user_shell_with_cwd() {
-        // Local `t` in embedded mode runs $SHELL directly in the
-        // dashboard pane with the session's cwd as the process working
-        // directory. No tmux wrap — the embed *is* the host.
-        let session = make_session(HostId::local(), "/work/proj");
-        let outcome = PtyDriver::new()
-            .spawn_terminal(&session, &LocalHost::new())
-            .expect("local spawn_terminal");
-        let AttachOutcome::EmbedPty(spec) = outcome else {
-            panic!("expected EmbedPty, got {outcome:?}");
-        };
-        assert_eq!(spec.argv, vec![user_shell()]);
-        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/work/proj")));
-        assert!(
-            spec.label.contains("terminal"),
-            "label should flag terminal kind: {}",
-            spec.label
-        );
-        assert!(spec.label.contains("proj"), "got: {}", spec.label);
-    }
-
-    #[test]
-    fn pty_driver_spawn_terminal_remote_embeds_ssh_recipe() {
-        // Remote `t` ssh's into the host with the same
-        // `sh -c 'cd … && exec "$SHELL"'` recipe `TmuxDriver` uses,
-        // but emits the ssh argv as `EmbedPty` so the result lands in
-        // the dashboard pane rather than a sibling local tmux window.
+    fn pty_driver_spawn_terminal_remote_invokes_detached_tmux_new_session() {
+        // Remote `t` wraps the remote shell in a detached tmux session
+        // (the recipe `spawn_tool_remote_embed` uses) so the terminal
+        // surfaces in the Tools sidebar group as a re-attachable row.
+        // The first ssh_argv call captures the spawn — `tty=false`
+        // because we only read the assigned session name back. tmux
+        // execs the trailing positional arg via `/bin/sh -c`, so
+        // `exec "$SHELL"` expands against the remote user's env.
         let host = FakeRemoteHost::new();
         let session = make_session(HostId("remote".into()), "/work/proj");
         let _ = PtyDriver::spawn_terminal_remote_embed(&session, &host);
         let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
-        assert!(tty, "interactive shell needs a tty");
+        assert!(
+            !tty,
+            "spawn capture does not need a tty (only the attach does)"
+        );
         assert_eq!(
             remote_cmd,
-            vec!["sh", "-c", "cd '/work/proj' && exec \"$SHELL\""]
+            vec![
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}",
+                "-c",
+                "/work/proj",
+                "exec \"$SHELL\"",
+            ]
         );
     }
 

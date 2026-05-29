@@ -31,6 +31,12 @@ pub enum ConfigError {
     /// binding. Surfaced loudly so the user can pick a different key
     /// instead of silently never seeing their tool fire.
     ToolKeyCollidesWithBuiltin(char),
+    /// A `[[tools]]` entry's `name` collides with a reserved label
+    /// that agent-mux uses for built-in tools-group rows (today: the
+    /// `t` terminal launch surfaces as `name = "terminal"`). Loud
+    /// rejection at config-load beats two indistinguishable rows in
+    /// the Tools sidebar group at runtime.
+    ReservedToolName(String),
     /// A theme field carried a string that isn't a recognised colour
     /// (named ANSI colour, `bright_*` variant, hex `#RRGGBB`, or empty
     /// for default). Loud failure beats silent fallback because the
@@ -88,6 +94,12 @@ impl std::fmt::Display for ConfigError {
                         .map(|c| format!("{c:?}"))
                         .collect::<Vec<_>>()
                         .join(", ")
+                )
+            }
+            Self::ReservedToolName(name) => {
+                write!(
+                    f,
+                    "tool name {name:?} is reserved (used by the built-in `t` terminal launch); pick a different `name`"
                 )
             }
             Self::InvalidColor { field, value } => {
@@ -657,10 +669,11 @@ impl Config {
     }
 }
 
-/// Cross-entry validation: every tool must have a unique key and must
-/// not shadow a built-in dashboard binding. Per-entry validation
-/// (single-char key, non-empty command) already happened during
-/// deserialize; this is the layer that needs the full vec in hand.
+/// Cross-entry validation: every tool must have a unique key, must
+/// not shadow a built-in dashboard binding, and must not claim a
+/// reserved `name`. Per-entry validation (single-char key, non-empty
+/// command) already happened during deserialize; this is the layer
+/// that needs the full vec in hand.
 fn validate_tool_keys(tools: &[ToolBinding]) -> Result<(), ConfigError> {
     let mut seen: std::collections::HashSet<char> = std::collections::HashSet::new();
     for t in tools {
@@ -670,9 +683,22 @@ fn validate_tool_keys(tools: &[ToolBinding]) -> Result<(), ConfigError> {
         if !seen.insert(t.key) {
             return Err(ConfigError::DuplicateToolKey(t.key));
         }
+        if let Some(name) = &t.name
+            && RESERVED_TOOL_NAMES
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(name))
+        {
+            return Err(ConfigError::ReservedToolName(name.clone()));
+        }
     }
     Ok(())
 }
+
+/// Tool-launch names agent-mux reserves for built-in rows in the
+/// Tools sidebar group. A user-configured `[[tools]] name = "…"` that
+/// matches one of these would render as a second indistinguishable
+/// row alongside the built-in launch.
+const RESERVED_TOOL_NAMES: &[&str] = &["terminal"];
 
 /// Paths agent-mux searches for `config.toml`, in priority order. The
 /// first existing entry is the one [`Config::load`] reads; if none
@@ -1599,6 +1625,54 @@ command = ["gitk"]
         let err = Config::load_from(&path).expect_err("should reject");
         assert!(
             matches!(err, ConfigError::DuplicateToolKey('g')),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_tool_name_terminal() {
+        // The built-in `t` keypress now surfaces in the Tools sidebar
+        // group with `name = "terminal"`. A user-configured tool with
+        // the same name would render as a second indistinguishable row
+        // there. Reject at config-load so the collision is loud.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "x"
+name = "terminal"
+command = ["zsh"]
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::ReservedToolName(ref s) if s == "terminal"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_tool_name_terminal_case_insensitive() {
+        // Case-insensitive match — `"Terminal"` collides with the
+        // built-in row just as `"terminal"` does.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[tools]]
+key = "x"
+name = "Terminal"
+command = ["zsh"]
+"#,
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::ReservedToolName(ref s) if s == "Terminal"),
             "got: {err:?}"
         );
     }

@@ -445,7 +445,7 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "    name = \"...\"                 optional launch label"
+        "    name = \"...\"                 optional launch label (not \"terminal\")"
     )?;
     writeln!(out)?;
     writeln!(

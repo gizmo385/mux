@@ -1902,8 +1902,12 @@ impl App {
             let session = self.selected_session()?;
             let host = self.hosts.get(&session.host)?.clone();
             let cwd = session.project_dir.clone();
-            let id = session.id.clone();
-            (self.driver.spawn_terminal(session, host.as_ref()), cwd, id)
+            let host_id = session.host.clone();
+            (
+                self.driver.spawn_terminal(session, host.as_ref()),
+                cwd,
+                host_id,
+            )
         };
         match result {
             (Ok(AttachOutcome::Done), cwd, _) => {
@@ -1914,14 +1918,29 @@ impl App {
                 self.status = None;
                 Some(cmd)
             }
-            (Ok(AttachOutcome::EmbedPty(spec)), _, id) => {
-                // Embed the shell in the dashboard pane. Synthetic
-                // SessionId prefixed `agent-mux-terminal:` so re-press
-                // refocuses (same id), but Enter on the source session
-                // row swaps cleanly back to the claude attach (different
-                // id → install_embedded drops + respawns).
-                let synthetic_id = SessionId(format!("agent-mux-terminal:{}", id.0));
-                self.install_embedded(&spec, synthetic_id);
+            (Ok(AttachOutcome::EmbedPty(spec)), cwd, host_id) => {
+                // Register the terminal in the Tools sidebar group so
+                // the user can navigate back to it directly instead of
+                // having to find the source session row and press `t`
+                // again. Same plumbing `[[tools]]` launches use — the
+                // PtyDriver wraps `$SHELL` in a detached tmux session
+                // and populates `tmux_session`; we record the assigned
+                // name so the registry can rebuild the EmbedSpec at
+                // re-attach time. Synthetic SessionId keys on the tmux
+                // session name so every `t` press creates a new tools
+                // row (matches the [[tools]] model where multiple
+                // launches stack as distinct rows).
+                if let Some(tmux_session) = spec.tmux_session.clone() {
+                    self.tool_launches.push(ToolLaunch {
+                        name: "terminal".to_string(),
+                        host: host_id,
+                        tmux_session: tmux_session.clone(),
+                        project_dir: cwd,
+                        launched_at: SystemTime::now(),
+                    });
+                    let synthetic_id = SessionId(format!("agent-mux-terminal:{tmux_session}"));
+                    self.install_embedded(&spec, synthetic_id);
+                }
                 None
             }
             (Err(e), _, _) => {

@@ -219,6 +219,24 @@ fn assemble_session(
     let task_title = task_toml_content
         .and_then(|raw| worktree::parse_task_metadata(raw).ok())
         .map(|m| m.task);
+    // Stillborn-transcript filter. A transcript with no `task.toml`
+    // task name, no `ai-title` entry, and no real first user message
+    // is the "/clear-and-walked-away" case: Claude Code creates the
+    // file immediately on `/clear` (a `<local-command-caveat>` /
+    // `<command-name>/clear</command-name>` envelope pair plus a
+    // `file-history-snapshot` and a `system` entry), but if the user
+    // never sends an actual prompt the transcript never accumulates
+    // anything to identify it by. Surfacing it as a row titled only
+    // by its session-id hash is pure clutter — the user can't even
+    // tell which conversation it represents. Holding the row back
+    // here keeps the dashboard clean; if the user does eventually
+    // type, the next watcher event re-fires `NewTranscript` and the
+    // session surfaces naturally with a meaningful title. Mirrors
+    // the discovery-boundary discipline the subagent path-shape
+    // filter follows: filter at ingestion, don't clean up after.
+    if task_title.is_none() && meta.ai_title.is_none() && meta.first_user_message.is_none() {
+        return None;
+    }
     let title = task_title.or(meta.ai_title).or(meta.first_user_message);
     let parent_repo = git_pointer_content.and_then(worktree::parse_parent_repo);
     Some(Session {
@@ -241,12 +259,16 @@ fn assemble_session(
 /// identically-shaped sessions.
 ///
 /// Returns `Ok(None)` for transcripts that aren't usable as live
-/// sessions: missing file stem (no derivable id), or a `project_dir`
-/// that isn't an existing directory on disk (the worktree was deleted,
-/// or the transcript predates having `cwd` metadata and we fell back to
-/// the `<unknown>` literal). Either way, the user can't attach to or
-/// resume such a session, so showing it in the dashboard would only
-/// generate failed-attach noise.
+/// sessions: missing file stem (no derivable id), a `project_dir`
+/// that isn't an existing directory on disk (the worktree was
+/// deleted, or the transcript predates having `cwd` metadata and we
+/// fell back to the `<unknown>` literal), or a transcript with no
+/// content-identifying signal yet — no task.toml task name, no
+/// `ai-title`, and no real user message (the post-`/clear`
+/// stillborn case; the watcher's next event re-fires `NewTranscript`
+/// once the user actually types). In any of those cases, the user
+/// can't attach to or meaningfully recognise the session, so showing
+/// it in the dashboard would only generate noise.
 ///
 /// # Errors
 /// Returns `io::Error` if the transcript cannot be read through the host.
@@ -459,7 +481,10 @@ mod tests {
         create_dir_all(&entry).unwrap();
         fs::write(
             entry.join("abc-123.jsonl"),
-            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
 
@@ -496,7 +521,10 @@ mod tests {
         create_dir_all(&entry).unwrap();
         fs::write(
             entry.join("wt.jsonl"),
-            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
 
@@ -525,7 +553,10 @@ mod tests {
         create_dir_all(&entry).unwrap();
         fs::write(
             entry.join("plain.jsonl"),
-            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
 
@@ -652,7 +683,13 @@ mod tests {
     }
 
     #[test]
-    fn title_is_none_when_no_signal() {
+    fn stillborn_transcript_with_no_signal_is_filtered() {
+        // A transcript with a cwd entry but no real user message, no
+        // ai-title, and no task.toml is the post-`/clear`-and-walked-
+        // away case. The session has nothing the user could recognise
+        // it by; surfacing it produces a row titled only by its
+        // session-id hash. Filter at the discovery boundary so the
+        // catalog never sees the row.
         let (_tmp, projects, cwd) = setup_with_real_cwd();
         let entry = projects.join("-real-cwd");
         create_dir_all(&entry).unwrap();
@@ -663,7 +700,92 @@ mod tests {
         .unwrap();
 
         let sessions = discover_local(&projects).unwrap();
-        assert!(sessions[0].title.is_none());
+        assert!(sessions.is_empty(), "got: {sessions:?}");
+    }
+
+    #[test]
+    fn realistic_post_clear_transcript_is_filtered() {
+        // The exact shape Claude Code writes to a fresh transcript when
+        // the user runs `/clear` and never types again: a
+        // file-history-snapshot, the local-command-caveat envelope, the
+        // command-name envelope, and a system entry. The two user
+        // entries are both slash-command envelopes (already filtered
+        // for the title fallback by `is_slash_command_envelope`), so
+        // `first_user_message` is None and the stillborn filter trips.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"file-history-snapshot\"}}\n\
+                 {{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"<local-command-caveat>caveat</local-command-caveat>\"}}\n\
+                 {{\"type\":\"user\",\"message\":\"<command-name>/clear</command-name>\"}}\n\
+                 {{\"type\":\"system\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert!(sessions.is_empty(), "got: {sessions:?}");
+    }
+
+    #[test]
+    fn task_toml_keeps_session_visible_with_no_user_message() {
+        // The agent-mux-spawned worktree case: a fresh session created
+        // via `n` has a `.agent-mux/task.toml` carrying the user's
+        // declared task name, but the transcript may have no user
+        // message yet (the user just spawned it and hasn't typed). The
+        // task.toml is itself a signal of user intent, so the session
+        // must surface — without it the user would spawn something
+        // from inside agent-mux and see no row appear.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj_dir = tmp.path().join("worktree");
+        let agent_mux_dir = proj_dir.join(".agent-mux");
+        create_dir_all(&agent_mux_dir).unwrap();
+        fs::write(
+            agent_mux_dir.join("task.toml"),
+            "task = \"refactor the parser\"\n\
+             base_branch = \"main\"\n\
+             created_at = 0\n",
+        )
+        .unwrap();
+
+        let projects = tmp.path().join("projects");
+        let entry = projects.join("-worktree");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", proj_dir.display()),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("refactor the parser"));
+    }
+
+    #[test]
+    fn build_session_also_applies_stillborn_filter() {
+        // The live-discovery path (NewTranscript → build_session) must
+        // apply the same filter as bulk startup discovery — otherwise a
+        // `/clear` mid-run would still leak a row that startup
+        // discovery would have filtered. The watcher's retry loop
+        // (silent drop on `Ok(None)`, re-emit on next Modify) then
+        // naturally surfaces the row once the user actually types.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        let path = entry.join("fresh.jsonl");
+        fs::write(
+            &path,
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+
+        let session = build_session(&LocalHost::new(), &path, SystemTime::now()).unwrap();
+        assert!(session.is_none(), "got: {session:?}");
     }
 
     #[test]
@@ -674,7 +796,10 @@ mod tests {
         fs::write(entry.join("memory"), "not a session").unwrap();
         fs::write(
             entry.join("real.jsonl"),
-            format!("{{\"cwd\":\"{}\"}}\n", cwd.display()),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
 
@@ -974,7 +1099,10 @@ mod tests {
         let path = entry.join("warm.jsonl");
         fs::write(
             &path,
-            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n",
+                cwd.display()
+            ),
         )
         .unwrap();
         let now = SystemTime::now();

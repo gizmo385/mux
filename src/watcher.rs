@@ -448,7 +448,7 @@ fn poll_hooks_once(host: &dyn Host, hooks_dir: &Path, tx: &Sender<WatcherEvent>)
     let Ok(contents) = host.read_many(&path_refs) else {
         return true;
     };
-    for (path, content_result) in marker_paths.iter().zip(contents.into_iter()) {
+    for (path, content_result) in marker_paths.iter().zip(contents) {
         let Ok(raw) = content_result else {
             // Per-path NotFound / read failure — leave the marker
             // for the next tick. (A removed-mid-tick file lands here

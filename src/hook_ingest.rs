@@ -290,8 +290,7 @@ fn persist_marker(
 
 fn unix_millis(t: SystemTime) -> u128 {
     t.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// Parse a marker file into a [`HookEvent`]. Used by the local

@@ -57,7 +57,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Sessions older than this are shown as Idle regardless of transcript
 /// content. M0 default; will become configurable in M5.
-const IDLE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
+const IDLE_THRESHOLD: Duration = Duration::from_hours(1);
 
 /// Event-loop tick. Bounds the latency between an attention update arriving
 /// in the channel and the dashboard re-rendering it.
@@ -3663,7 +3663,7 @@ mod tests {
             Attention::Idle,
             Attention::Unknown,
         ] {
-            let s = idle_session(Duration::from_secs(60), attn);
+            let s = idle_session(Duration::from_mins(1), attn);
             assert_eq!(
                 effective_attention(&s),
                 attn,
@@ -3677,7 +3677,7 @@ mod tests {
         // Past IDLE_THRESHOLD any non-Idle state collapses to Idle —
         // the row reads as "this hasn't moved in a while". Pins the
         // documented 1h boundary in `main.rs:IDLE_THRESHOLD`.
-        let beyond = IDLE_THRESHOLD + Duration::from_secs(60);
+        let beyond = IDLE_THRESHOLD + Duration::from_mins(1);
         for attn in [Attention::NeedsInput, Attention::Working] {
             let s = idle_session(beyond, attn);
             assert_eq!(effective_attention(&s), Attention::Idle);

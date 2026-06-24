@@ -23,7 +23,7 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
 /// `#m5 #config`). Local discovery applies the same filter for parity —
 /// the user's mental model of "old session" shouldn't shift based on
 /// whether the box happens to be local or remote.
-pub const DISCOVERY_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const DISCOVERY_MAX_AGE: Duration = Duration::from_hours(720);
 
 /// Discover sessions by listing `root` (typically `~/.claude/projects`)
 /// through the given `Host`. The same code path serves the local case and
@@ -1076,9 +1076,9 @@ mod tests {
         let now = SystemTime::now();
         // Age the transcript 60 days; cutoff at 30 days means it's
         // out — strictly older than the cutoff.
-        set_mtime(&path, now - Duration::from_secs(60 * 24 * 60 * 60));
+        set_mtime(&path, now - Duration::from_hours(1440));
 
-        let cutoff = now - Duration::from_secs(30 * 24 * 60 * 60);
+        let cutoff = now - Duration::from_hours(720);
         let sessions =
             discover_with_cutoff(&LocalHost::new(), &projects, cutoff).expect("discover");
         assert!(
@@ -1107,9 +1107,9 @@ mod tests {
         .unwrap();
         let now = SystemTime::now();
         // Age the transcript 5 days; cutoff at 30 days lets it through.
-        set_mtime(&path, now - Duration::from_secs(5 * 24 * 60 * 60));
+        set_mtime(&path, now - Duration::from_hours(120));
 
-        let cutoff = now - Duration::from_secs(30 * 24 * 60 * 60);
+        let cutoff = now - Duration::from_hours(720);
         let sessions =
             discover_with_cutoff(&LocalHost::new(), &projects, cutoff).expect("discover");
         assert_eq!(sessions.len(), 1);
@@ -1135,7 +1135,7 @@ mod tests {
         // scheduler slack on the SystemTime::now() comparison.
         set_mtime(
             &path,
-            SystemTime::now() - DISCOVERY_MAX_AGE - Duration::from_secs(60 * 60),
+            SystemTime::now() - DISCOVERY_MAX_AGE - Duration::from_hours(1),
         );
 
         let sessions = discover_local(&projects).expect("discover");

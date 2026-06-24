@@ -432,12 +432,10 @@ fn detect_default_backend() -> NotificationsBackend {
 /// (WSL2); both are detected.
 #[must_use]
 fn is_wsl() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| {
-            let lower = s.to_ascii_lowercase();
-            lower.contains("microsoft") || lower.contains("wsl")
-        })
-        .unwrap_or(false)
+    std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|s| {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("microsoft") || lower.contains("wsl")
+    })
 }
 
 #[derive(Debug, Clone, Default)]

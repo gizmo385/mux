@@ -4,7 +4,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::session::HostId;
 
@@ -372,13 +372,39 @@ pub struct SshHost {
     /// `#[cfg(test)]` constructor takes a different value so unit tests
     /// can exercise command construction without contacting a real host.
     ssh_binary: PathBuf,
-    /// Serialises [`SshHost::ensure_connected`] so the two background
-    /// pollers (transcript + pane) that share this `Arc<SshHost>` can't
-    /// race on re-spawning the master — without it, two threads both
-    /// seeing a dead master could each remove the socket file and spawn
-    /// a master, with one deleting the other's freshly-created socket.
-    reconnect_lock: Mutex<()>,
+    /// Guards [`SshHost::ensure_connected`]'s re-establishment. Two
+    /// roles: (1) *serialise* the re-spawn so the transcript and pane
+    /// pollers sharing this `Arc<SshHost>` can't both delete the socket
+    /// and spawn duelling masters; (2) hold the *backoff* state so a
+    /// master that can't be re-established (e.g. a proxy that won't
+    /// sustain `-fN -M`) isn't re-spawned every poll tick — each doomed
+    /// attempt costs a `ConnectTimeout`-bounded ssh, and unthrottled
+    /// they pile up into a visible storm of short-lived ssh processes.
+    reconnect: Mutex<ReconnectState>,
 }
+
+/// Backoff bookkeeping for [`SshHost::ensure_connected`], shared across
+/// the pollers via the `reconnect` mutex.
+#[derive(Default)]
+struct ReconnectState {
+    /// Consecutive failed re-spawns; `0` whenever the master is healthy.
+    fails: u32,
+    /// Earliest instant the next re-spawn may be attempted. `None` =
+    /// "attempt now" (healthy, or never failed).
+    next_attempt: Option<Instant>,
+}
+
+impl ReconnectState {
+    fn reset(&mut self) {
+        self.fails = 0;
+        self.next_attempt = None;
+    }
+}
+
+/// First backoff window after a failed re-spawn; doubles each further
+/// consecutive failure up to [`RECONNECT_BACKOFF_MAX`].
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(6);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_mins(1);
 
 impl SshHost {
     /// Open a `ControlMaster` connection to `ssh_target` and return a
@@ -406,7 +432,7 @@ impl SshHost {
             ssh_target,
             control_path,
             ssh_binary,
-            reconnect_lock: Mutex::new(()),
+            reconnect: Mutex::new(ReconnectState::default()),
         })
     }
 
@@ -782,36 +808,62 @@ impl Host for SshHost {
     }
 
     fn ensure_connected(&self) -> io::Result<bool> {
-        // Fast path: the master is alive (the overwhelmingly common
-        // case on every poll tick). One cheap local-socket probe, no
-        // lock, no network.
-        if Self::master_check(&self.ssh_binary, &self.control_path, &self.ssh_target) {
-            return Ok(false);
-        }
-        // The master is gone. Serialise re-establishment so the
-        // transcript and pane pollers — which share this `Arc<SshHost>`
-        // — don't both remove the socket and spawn duelling masters. A
+        // Cheap local-socket probe first (the common per-tick case).
+        let alive = Self::master_check(&self.ssh_binary, &self.control_path, &self.ssh_target);
+        // Lock guards both the re-spawn (serialised across the two
+        // pollers sharing this `Arc<SshHost>`) and the backoff state. A
         // poisoned lock just means a prior holder panicked mid-respawn;
-        // its data is `()`, so recover and carry on rather than cascade.
-        let _guard = self
-            .reconnect_lock
+        // recover its state and carry on rather than cascade.
+        let mut state = self
+            .reconnect
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Double-check under the lock: a sibling thread may have
-        // rebuilt the master while we were blocked acquiring it.
-        if Self::master_check(&self.ssh_binary, &self.control_path, &self.ssh_target) {
+        if alive {
+            state.reset();
             return Ok(false);
+        }
+        // Double-check under the lock: a sibling thread (or our own last
+        // attempt) may have rebuilt the master while we were probing /
+        // waiting on the lock.
+        if Self::master_check(&self.ssh_binary, &self.control_path, &self.ssh_target) {
+            state.reset();
+            return Ok(false);
+        }
+        // Backoff gate: if a recent re-spawn failed and we're still
+        // inside the wait window, report "down" *without* attempting
+        // another doomed `ssh -fN -M`. This is what keeps an
+        // unsustainable master from being hammered every poll tick by
+        // both pollers — the storm symptom dogfooding surfaced.
+        if let Some(next) = state.next_attempt
+            && Instant::now() < next
+        {
+            return Err(io::Error::other(format!(
+                "ssh master for {} is down; backing off reconnect",
+                self.ssh_target
+            )));
         }
         // A dead master can leave a stale socket file behind, and
         // `ssh -fN -M` refuses to create a master when the socket path
-        // already exists ("ControlSocket ... already exists, disabling
-        // multiplexing"). Remove it first so the re-spawn lands cleanly.
-        // Safe to delete here: we only reach this point with the master
-        // confirmed dead under the lock, so no live channel depends on
-        // the socket. NotFound is fine (nothing to clean up).
+        // already exists. Remove it first so the re-spawn lands cleanly.
+        // Safe under the lock with the master confirmed dead — no live
+        // channel depends on it. NotFound is fine.
         let _ = fs::remove_file(&self.control_path);
-        Self::spawn_master(&self.ssh_binary, &self.control_path, &self.ssh_target)?;
-        Ok(true)
+        match Self::spawn_master(&self.ssh_binary, &self.control_path, &self.ssh_target) {
+            Ok(()) => {
+                state.reset();
+                Ok(true)
+            }
+            Err(e) => {
+                // Grow the wait: 6s, 12s, 24s, 48s, capped at 60s. Shift
+                // is bounded so it can't overflow.
+                state.fails = state.fails.saturating_add(1);
+                let wait = RECONNECT_BACKOFF_BASE
+                    .saturating_mul(1u32 << (state.fails - 1).min(5))
+                    .min(RECONNECT_BACKOFF_MAX);
+                state.next_attempt = Some(Instant::now() + wait);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1570,7 +1622,7 @@ mod tests {
             ssh_target: "devbox".into(),
             control_path,
             ssh_binary,
-            reconnect_lock: Mutex::new(()),
+            reconnect: Mutex::new(ReconnectState::default()),
         }
     }
 
@@ -1680,6 +1732,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_ensure_connected_backs_off_repeated_respawns() {
+        // The storm fix: after a failed re-spawn, an *immediate* second
+        // call must NOT re-spawn again — it's inside the backoff window.
+        // Without this, an unsustainable master gets a fresh doomed
+        // `ssh -fN -M` from every poll tick (and from both pollers).
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh_with_broken_master(&log);
+        prime_mock_exec(&mock);
+        fs::write(&log, b"").unwrap();
+
+        let host = ssh_host_with(mock, tmp.path().join("ctrl.sock"));
+        assert!(host.ensure_connected().is_err(), "first attempt fails");
+        assert!(
+            host.ensure_connected().is_err(),
+            "second attempt also reports down"
+        );
+
+        let respawns = read_log_lines(&log)
+            .iter()
+            .filter(|l| l.contains("-fN") && l.contains("-M"))
+            .count();
+        assert_eq!(
+            respawns, 1,
+            "the second call within the backoff window must not re-spawn"
+        );
+    }
+
     #[test]
     fn local_host_ensure_connected_is_noop() {
         // Local hosts have no connection to heal; the trait default must
@@ -1694,7 +1776,7 @@ mod tests {
             ssh_target: "devbox".into(),
             control_path: PathBuf::from("/tmp/sock"),
             ssh_binary: PathBuf::from("ssh"),
-            reconnect_lock: Mutex::new(()),
+            reconnect: Mutex::new(ReconnectState::default()),
         }
     }
 

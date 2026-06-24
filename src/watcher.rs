@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
-use crate::attachment::list_live_panes;
+use crate::attachment::{LivePaneSnapshot, list_live_panes};
 use crate::host::Host;
 use crate::session::{Attention, HostId, SessionId};
 
@@ -426,7 +426,18 @@ impl TranscriptWatcher {
         thread::spawn(move || {
             let host_id = host.id().clone();
             loop {
-                let snap = list_live_panes(host.as_ref());
+                // Skip the (potentially `ConnectTimeout`-long) tmux query
+                // when the host's connection is down — `ensure_connected`
+                // shares the transcript poller's backoff, so a host whose
+                // master can't be re-established isn't hit with a fresh
+                // doomed `ssh tmux list-panes` every tick. While down,
+                // report an empty snapshot (every session's pane goes
+                // `Some(false)` — the user-visible reality) without the
+                // round-trip. No-op for local hosts.
+                let snap = match host.ensure_connected() {
+                    Ok(_) => list_live_panes(host.as_ref()),
+                    Err(_) => LivePaneSnapshot::default(),
+                };
                 if tx
                     .send(WatcherEvent::LivePanes {
                         host: host_id.clone(),

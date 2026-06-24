@@ -359,6 +359,13 @@ fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
             writeln!(out, "    - {} → {:?}{label}", t.key, t.command)?;
         }
     }
+    let cap = cfg.ui.sessions_per_project;
+    let cap_desc = if cap == 0 {
+        "0 (no cap)".to_string()
+    } else {
+        cap.to_string()
+    };
+    writeln!(out, "  ui: sessions_per_project={cap_desc}")?;
     Ok(())
 }
 
@@ -446,6 +453,15 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(
         out,
         "    name = \"...\"                 optional launch label (not \"terminal\")"
+    )?;
+    writeln!(out, "  [ui]")?;
+    writeln!(
+        out,
+        "    sessions_per_project = 5     max rows per project before `+ K more` (0 = no cap;"
+    )?;
+    writeln!(
+        out,
+        "                                 lifted while searching)"
     )?;
     writeln!(out)?;
     writeln!(

@@ -107,7 +107,13 @@ disabled_hosts = []     # host labels to silence entirely
 [theme]
 preset = "bright"
 needs_input = "#ff5555"    # override one field on top of the preset
+
+[ui]
+sessions_per_project = 5   # cap rows per project; the rest collapse behind
+                           # "+ K more". 0 = no cap. Lifted while searching.
 ```
+
+Each project in the sidebar shows at most `[ui] sessions_per_project` of its most-recent sessions (default 5); any extras collapse behind a dim `+ K more` line. The cap keeps tall two-line rows from letting a busy project flood the sidebar — and it's lifted whenever you open search (`/`), so filtering always shows every match. Favorited sessions are unaffected (they're pinned at the top regardless).
 
 The `n` keybind picks from repos found in `workspace_folders` (depth-1 scan). Top-level paths must be absolute; per-host `workspace_folders` accept tildes (the remote shell expands them against the remote user's home). Env-var expansion is not supported.
 

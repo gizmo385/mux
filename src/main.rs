@@ -891,17 +891,28 @@ impl App {
         // the favorite doesn't vanish. Recomputed each frame from the
         // store; cheap (the favorites set is a handful of pins).
         let placeholders = self.favorite_placeholders();
+        // Cap the natural tree's per-project rows behind a `+ K more`
+        // overflow. Lifted while a search is active (every match stays
+        // visible — search is the "show everything" path); `0` in config
+        // disables the cap entirely.
+        let searching = matches!(self.search.as_ref(), Some(s) if !s.query.is_empty());
+        let cap = match self.config.ui.sessions_per_project {
+            0 => None,
+            _ if searching => None,
+            n => Some(n),
+        };
         let session_rows = match self.search.as_ref() {
             Some(s) if !s.query.is_empty() => {
                 let q = s.query.to_lowercase();
                 build_display_rows_filtered(
                     sessions,
                     &placeholders,
+                    cap,
                     |i| matches_query(&sessions[i], &q),
                     is_favorite,
                 )
             }
-            _ => build_display_rows_filtered(sessions, &placeholders, |_| true, is_favorite),
+            _ => build_display_rows_filtered(sessions, &placeholders, cap, |_| true, is_favorite),
         };
         // Surface the Tools group above sessions when one or more
         // launches are running. Search filtering doesn't affect this
@@ -2768,6 +2779,7 @@ fn build_sidebar_items(
         .map(|row| match row {
             DisplayRow::HostHeader(host) => ListItem::new(format_host_header(host)),
             DisplayRow::ProjectHeader(path) => ListItem::new(format_project_header(path, home)),
+            DisplayRow::ProjectOverflow(hidden) => ListItem::new(format_project_overflow(*hidden)),
             DisplayRow::SessionRow(i) => {
                 let s = &sessions[*i];
                 let name_override = session_names.get(&s.host, &s.id);
@@ -3543,6 +3555,16 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
     // ~ prefix doesn't waste horizontal space.
     Line::from(Span::styled(
         format!("  {}", display_path(project, home)),
+        Style::new().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// Tail row of a capped project group: a dim `+ K more` at the session
+/// indent. Non-selectable — the hidden (older) sessions are reached via
+/// search (which lifts the cap) or by favoriting.
+fn format_project_overflow(hidden: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("    + {hidden} more"),
         Style::new().add_modifier(Modifier::DIM),
     ))
 }

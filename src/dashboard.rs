@@ -23,6 +23,12 @@ pub enum DisplayRow {
     HostHeader(HostId),
     ProjectHeader(PathBuf),
     SessionRow(usize),
+    /// Tail row of a project group whose session count exceeded the
+    /// per-project cap: carries how many sessions are hidden, rendered
+    /// as a dim `+ K more`. Non-selectable — the hidden (older)
+    /// sessions are reached via search (which lifts the cap) or by
+    /// favoriting. See `[ui] sessions_per_project`.
+    ProjectOverflow(usize),
     /// Header for the "Tools" group surfaced at the top of the
     /// sidebar when one or more `[[tools]]` launches are currently
     /// running. Omitted when `ToolLaunchRegistry::is_empty()`.
@@ -76,7 +82,7 @@ pub struct FavoritePlaceholder {
 /// when a new host is added.
 #[must_use]
 pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
-    build_display_rows_filtered(sessions, &[], |_| true, |_| false)
+    build_display_rows_filtered(sessions, &[], None, |_| true, |_| false)
 }
 
 /// Like [`build_display_rows`] but emits rows only for sessions where
@@ -115,10 +121,18 @@ pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
 /// favorite rows. They are passed in already search-filtered (the
 /// caller owns the placeholder list), so the group header appears when
 /// *either* a live favorite or a placeholder survives.
+///
+/// `cap` limits each project group (in the natural host → project tree
+/// only — not favorites) to its `n` most-recent sessions, appending a
+/// [`DisplayRow::ProjectOverflow`] carrying the hidden count. `None`
+/// shows every session. The caller passes `None` while a search is
+/// active (every match stays visible) and normalises a configured `0`
+/// to `None`, so `n` here is always ≥ 1.
 #[must_use]
 pub fn build_display_rows_filtered<F, G>(
     sessions: &[Session],
     placeholders: &[FavoritePlaceholder],
+    cap: Option<usize>,
     include: F,
     is_favorite: G,
 ) -> Vec<DisplayRow>
@@ -209,8 +223,19 @@ where
             rows.push(DisplayRow::ProjectHeader(project));
             session_idxs
                 .sort_by(|&a, &b| sessions[b].last_activity.cmp(&sessions[a].last_activity));
-            for i in session_idxs {
+            // Cap to the N most-recent; the rest collapse behind a
+            // `+ K more` overflow row. `cap == Some(0)` is normalised to
+            // "no cap" by the caller, so `n` here is always ≥ 1.
+            let total = session_idxs.len();
+            let shown = match cap {
+                Some(n) if n < total => n,
+                _ => total,
+            };
+            for &i in &session_idxs[..shown] {
                 rows.push(DisplayRow::SessionRow(i));
+            }
+            if shown < total {
+                rows.push(DisplayRow::ProjectOverflow(total - shown));
             }
         }
     }
@@ -504,6 +529,7 @@ pub fn anchor_header_for_selection(rows: &[DisplayRow], selected: usize) -> Opti
         DisplayRow::ToolRow(_) => |r| matches!(r, DisplayRow::ToolsHeader),
         DisplayRow::HostHeader(_)
         | DisplayRow::ProjectHeader(_)
+        | DisplayRow::ProjectOverflow(_)
         | DisplayRow::ToolsHeader
         | DisplayRow::FavoritesHeader => return None,
     };
@@ -621,7 +647,7 @@ mod tests {
     where
         G: Fn(usize) -> bool,
     {
-        build_display_rows_filtered(sessions, &[], |_| true, is_favorite)
+        build_display_rows_filtered(sessions, &[], None, |_| true, is_favorite)
             .into_iter()
             .map(|r| match r {
                 DisplayRow::HostHeader(host) => format!("H:{host}"),
@@ -632,6 +658,7 @@ mod tests {
                 DisplayRow::FavoritesHeader => "FH".to_string(),
                 DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
                 DisplayRow::FavoritePlaceholderRow(i) => format!("FP:{i}"),
+                DisplayRow::ProjectOverflow(n) => format!("OV:{n}"),
             })
             .collect()
     }
@@ -846,6 +873,7 @@ mod tests {
         let rows = build_display_rows_filtered(
             &s,
             &[],
+            None,
             |i| matches_query(&s[i], q),
             |_| true, // both favorited
         );
@@ -870,7 +898,7 @@ mod tests {
             session("c", "local", "/p", 10),
         ];
         let favs = std::collections::HashSet::from([1usize]);
-        let rows = build_display_rows_filtered(&s, &[], |_| true, |i| favs.contains(&i));
+        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |i| favs.contains(&i));
         let favorite_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {
@@ -893,7 +921,8 @@ mod tests {
             title: Some("Remote work".into()),
         }];
         let favs = std::collections::HashSet::from([0usize]);
-        let rows = build_display_rows_filtered(&s, &placeholders, |_| true, |i| favs.contains(&i));
+        let rows =
+            build_display_rows_filtered(&s, &placeholders, None, |_| true, |i| favs.contains(&i));
         assert_eq!(rows[0], DisplayRow::FavoritesHeader);
         assert_eq!(rows[1], DisplayRow::FavoriteSessionRow(0));
         assert_eq!(rows[2], DisplayRow::FavoritePlaceholderRow(0));
@@ -910,7 +939,7 @@ mod tests {
             id: SessionId("gone".into()),
             title: None,
         }];
-        let rows = build_display_rows_filtered(&s, &placeholders, |_| true, |_| false);
+        let rows = build_display_rows_filtered(&s, &placeholders, None, |_| true, |_| false);
         assert_eq!(rows[0], DisplayRow::FavoritesHeader);
         assert_eq!(rows[1], DisplayRow::FavoritePlaceholderRow(0));
     }
@@ -920,8 +949,70 @@ mod tests {
         // Guard the empty case: an empty favorites set and no
         // placeholders must not emit a bare `── favorites ──` header.
         let s = vec![session("a", "local", "/p", 0)];
-        let rows = build_display_rows_filtered(&s, &[], |_| true, |_| false);
+        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |_| false);
         assert!(!rows.contains(&DisplayRow::FavoritesHeader));
+    }
+
+    #[test]
+    fn project_cap_truncates_to_most_recent_and_emits_overflow() {
+        // Four sessions in one project, cap 2 → the two most-recent
+        // SessionRows plus a `ProjectOverflow(2)` for the hidden rest.
+        // (4th arg is "seconds ago": smaller = more recent.)
+        let s = vec![
+            session("a", "local", "/p", 40),
+            session("b", "local", "/p", 30),
+            session("c", "local", "/p", 20),
+            session("d", "local", "/p", 10),
+        ];
+        let rows = build_display_rows_filtered(&s, &[], Some(2), |_| true, |_| false);
+        let shown: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::SessionRow(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, vec![3, 2], "the two most-recent (d, c) survive");
+        assert!(
+            rows.contains(&DisplayRow::ProjectOverflow(2)),
+            "the other two collapse behind +2 more"
+        );
+    }
+
+    #[test]
+    fn project_cap_none_shows_all_without_overflow() {
+        let s = vec![
+            session("a", "local", "/p", 30),
+            session("b", "local", "/p", 20),
+            session("c", "local", "/p", 10),
+        ];
+        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |_| false);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, DisplayRow::SessionRow(_)))
+                .count(),
+            3
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, DisplayRow::ProjectOverflow(_)))
+        );
+    }
+
+    #[test]
+    fn project_cap_at_or_above_count_emits_no_overflow() {
+        let s = vec![
+            session("a", "local", "/p", 20),
+            session("b", "local", "/p", 10),
+        ];
+        let rows = build_display_rows_filtered(&s, &[], Some(5), |_| true, |_| false);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, DisplayRow::ProjectOverflow(_))),
+            "cap ≥ count must not emit an overflow row"
+        );
     }
 
     #[test]
@@ -1011,7 +1102,7 @@ mod tests {
     #[test]
     fn anchor_header_for_favorite_session_returns_favorites_header() {
         let s = vec![session("a", "local", "/p", 0)];
-        let rows = build_display_rows_filtered(&s, &[], |_| true, |_| true);
+        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |_| true);
         // Layout: FH(0) F:a(1) H:local(2) P:/p(3) S:a(4)
         assert_eq!(anchor_header_for_selection(&rows, 1), Some(0));
         // The natural-group SessionRow still anchors to its ProjectHeader.
@@ -1170,6 +1261,7 @@ mod tests {
         build_display_rows_filtered(
             sessions,
             &[],
+            None,
             |i| matches_query(&sessions[i], &q),
             |_| false,
         )
@@ -1183,6 +1275,7 @@ mod tests {
             DisplayRow::FavoritesHeader => "FH".to_string(),
             DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
             DisplayRow::FavoritePlaceholderRow(i) => format!("FP:{i}"),
+            DisplayRow::ProjectOverflow(n) => format!("OV:{n}"),
         })
         .collect()
     }
@@ -1236,7 +1329,8 @@ mod tests {
             session_with_title("b", "local", "/p", 1, Some("keep me")),
         ];
         let q = "keep";
-        let rows = build_display_rows_filtered(&s, &[], |i| matches_query(&s[i], q), |_| false);
+        let rows =
+            build_display_rows_filtered(&s, &[], None, |i| matches_query(&s[i], q), |_| false);
         let session_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {

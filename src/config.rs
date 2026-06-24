@@ -191,6 +191,36 @@ pub struct Config {
     /// same dispatch family.
     #[serde(default)]
     pub tools: Vec<ToolBinding>,
+    /// Sidebar presentation knobs (`[ui]`).
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// `[ui]` section — sidebar presentation tuning.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Maximum session rows shown per project in the natural host →
+    /// project tree before the remainder collapses behind a dim
+    /// `+ K more` line (the project's most-recent sessions win). `0`
+    /// disables the cap. The cap is always lifted while a search filter
+    /// is active — when narrowing, the user wants every match visible,
+    /// so search doubles as the "show everything" escape hatch. Does
+    /// not affect the pinned favorites group or the tools group.
+    pub sessions_per_project: usize,
+}
+
+/// Default per-project row cap. Tall two-line rows make a busy project
+/// flood the sidebar; capping the natural tree to the few most-recent
+/// keeps it scannable while search / favorites reach the rest.
+pub const DEFAULT_SESSIONS_PER_PROJECT: usize = 5;
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            sessions_per_project: DEFAULT_SESSIONS_PER_PROJECT,
+        }
+    }
 }
 
 /// One user-configured tool keybind. Construction via [`Deserialize`]
@@ -794,6 +824,29 @@ mod tests {
         fs::write(&path, "").expect("write");
         let cfg = Config::load_from(&path).expect("empty toml is ok");
         assert!(cfg.workspace_folders.is_empty());
+    }
+
+    #[test]
+    fn ui_config_defaults_to_the_per_project_cap_constant() {
+        // An absent `[ui]` section yields the documented default cap,
+        // and an absent file does too (whole config defaults).
+        assert_eq!(
+            UiConfig::default().sessions_per_project,
+            DEFAULT_SESSIONS_PER_PROJECT
+        );
+        assert_eq!(
+            Config::default().ui.sessions_per_project,
+            DEFAULT_SESSIONS_PER_PROJECT
+        );
+    }
+
+    #[test]
+    fn load_from_parses_ui_sessions_per_project() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[ui]\nsessions_per_project = 3\n").expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert_eq!(cfg.ui.sessions_per_project, 3);
     }
 
     #[test]

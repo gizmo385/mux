@@ -2979,7 +2979,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .border_style(sidebar_border_style(app));
     let list = List::new(items)
         .block(sidebar_block)
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        // A background highlight rather than REVERSED: REVERSED inverts
+        // fg/bg, which turned the dim second line into low-contrast dark
+        // text on a light bar. A dark-grey background keeps every span's
+        // own colour/weight (titles, the coloured state word, the dim
+        // detail) legible, and the `▌` bar still marks the row.
+        .highlight_style(Style::new().bg(ratatui::style::Color::Indexed(238)))
         .highlight_symbol("▌ ");
 
     // Pull the offset up to keep the selected row's context header
@@ -3554,7 +3559,7 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
     // group context rather than a focal row. Home-shortened so the
     // ~ prefix doesn't waste horizontal space.
     Line::from(Span::styled(
-        format!("  {}", display_path(project, home)),
+        format!(" {}", display_path(project, home)),
         Style::new().add_modifier(Modifier::DIM),
     ))
 }
@@ -3564,7 +3569,7 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
 /// search (which lifts the cap) or by favoriting.
 fn format_project_overflow(hidden: usize) -> Line<'static> {
     Line::from(Span::styled(
-        format!("    + {hidden} more"),
+        format!("  + {hidden} more"),
         Style::new().add_modifier(Modifier::DIM),
     ))
 }
@@ -3581,11 +3586,10 @@ fn format_favorites_header() -> Line<'static> {
 }
 
 /// Render a favorited session that isn't in the live catalog as a
-/// dimmed "unconfirmed" placeholder. Mirrors the favorites-group shape
-/// of [`format_session_row`] (indent, star, glyph, title, host label)
-/// but the whole line is dimmed, the glyph is the neutral unknown
-/// marker, and the age cell is a `⋯` — there's no live attention or
-/// activity to show yet, only the user's intent to keep this pinned.
+/// dimmed "unconfirmed" one-line placeholder: `★ <title>  unconfirmed ·
+/// [host]`. The whole line is dim and the word "unconfirmed" stands in
+/// for the live state we don't have yet — there's no activity or
+/// attention to show, only the user's intent to keep this pinned.
 fn format_favorite_placeholder_row(ph: &FavoritePlaceholder) -> Line<'static> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let label = ph.title.clone().unwrap_or_else(|| {
@@ -3598,15 +3602,11 @@ fn format_favorite_placeholder_row(ph: &FavoritePlaceholder) -> Line<'static> {
         format!("({suffix})")
     });
     Line::from(vec![
-        Span::raw("  "),
-        Span::styled("★ ", dim),
-        Span::styled(attention_glyph(Attention::Unknown).to_string(), dim),
         Span::raw(" "),
+        Span::styled("★ ", dim),
         Span::styled(label, dim),
-        Span::raw("  "),
-        Span::styled("⋯", dim),
-        Span::raw("  "),
-        Span::styled(format!("[{}]", ph.host), dim),
+        Span::styled("  unconfirmed", dim),
+        Span::styled(format!("  · [{}]", ph.host), dim),
     ])
 }
 
@@ -3645,50 +3645,34 @@ fn format_session_row(
 ) -> Vec<Line<'static>> {
     let attention = effective_attention(session);
     // A hook-confirmed blocking prompt (permission / elicitation) reads
-    // as a distinct glyph so "answer me" looks different from a finished
-    // turn ("done"). Gated on the session actually reading NeedsInput,
-    // so a stale flag — or the idle overlay demoting the state after an
-    // hour — never mis-renders. Colour stays the needs_input colour
-    // (attention is NeedsInput here); a dedicated `[theme.blocked]` is
-    // filed in TODO.
+    // as the word "blocked" instead of "done", so "answer me" is
+    // distinct from a finished turn. Gated on the session actually
+    // reading NeedsInput, so a stale flag — or the idle overlay
+    // demoting the state after an hour — never mis-renders.
     let blocked = session.blocking_prompt && attention == Attention::NeedsInput;
-    let glyph = if blocked {
-        BLOCKED_GLYPH
-    } else {
-        attention_glyph(attention)
-    };
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let glyph_style = apply_fg(Style::new(), attention_color(attention, theme));
-    // Dim the entire title when the pane poller has confirmed no
-    // live tmux pane matches this session — Enter is going to be a
-    // multi-second auto-resume rather than a fast switch, and the
-    // dimming pre-mentally-models that cost. `None` (poller hasn't
-    // reported for this host yet) renders at normal weight so a
-    // remote whose first pane poll is still in flight doesn't flash
-    // dim then bright.
+    // Dim the title when the pane poller has confirmed no live tmux
+    // pane matches — Enter will be a multi-second auto-resume, not a
+    // fast switch. `None` (poller hasn't reported yet) stays normal
+    // weight so a remote's first frame doesn't flash dim then bright.
     let title_dim = matches!(session.has_live_pane, Some(false));
     let title_style = if title_dim { dim } else { Style::new() };
 
-    // Indent depth: 2 spaces inside the favorites group (one level
-    // under `── favorites ──`), 4 spaces in the natural host/project
-    // tree (two levels under the host header + project header).
-    let indent = if in_favorites_group { "  " } else { "    " };
+    // Shallow indent — 1 space in the favorites group, 2 in the natural
+    // host → project tree — so titles get the width. There's no glyph
+    // column: the attention signal lives in the coloured state word on
+    // line 2, not a symbol on line 1.
+    let indent = if in_favorites_group { " " } else { "  " };
 
-    // ---- Line 1: (★) glyph + title ----
+    // ---- Line 1: (★) title ----
     let mut l1 = vec![Span::raw(indent)];
-    // ★ glyph appears on *both* copies of a favorited session — the
-    // user reads "this is one of my pinned ones" the same way
-    // regardless of which copy they're looking at. Dim styling keeps
-    // it out of the attention-glyph's hierarchy.
+    // ★ marks a favorited session on *both* copies (pinned + natural).
     if is_favorite {
         l1.push(Span::styled("★ ", dim));
     }
-    l1.push(Span::styled(glyph, glyph_style));
-    l1.push(Span::raw(" "));
     // User overrides take precedence over both `aiTitle` and the
     // task-toml-derived title (the 2026-05-21 rename feature). A
-    // newly-arriving AI title does *not* clobber the override — once
-    // the user named something, they meant it.
+    // newly-arriving AI title does *not* clobber the override.
     if let Some(name) = name_override {
         l1.push(Span::styled(name.to_string(), title_style));
     } else if let Some(title) = &session.title {
@@ -3703,28 +3687,46 @@ fn format_session_row(
         l1.push(Span::styled(format!("({suffix})"), dim));
     }
 
-    // ---- Line 2 (dim): state, time-in-state, running <total> (· host) ----
-    // The whole status line is dim — the glyph on line 1 already
-    // carries the attention colour, so the detail line stays calm.
-    let mut status = attention_word(attention, blocked).to_string();
+    // ---- Line 2: coloured state word + dim detail ----
+    // The state word carries the attention signal: bold + the themed
+    // attention colour when the session wants the user (blocked / done),
+    // dim when it doesn't (working / idle). The word reads on any theme;
+    // colour is the at-a-glance enhancement where the user has themed it
+    // — so the signal survives the default uncoloured preset via weight.
+    let needs_user = attention == Attention::NeedsInput;
+    let word_base = if needs_user {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let word_style = apply_fg(word_base, attention_color(attention, theme));
+    let state = attention_word(attention, blocked);
+
+    // Dim detail after the state word: time-in-state, then the task's
+    // age ("<n> old" — the worktree's creation age, *not* active
+    // runtime, so an old worktree reads as old rather than "running"),
+    // then the host label in the host-spanning favorites group.
+    let mut detail = String::new();
     if let Some(in_state) = session.attention_entered_at.and_then(compact_elapsed) {
-        status.push(' ');
-        status.push_str(&in_state);
+        detail.push(' ');
+        detail.push_str(&in_state);
     }
     if let Some(total) = session.started_at.and_then(compact_elapsed) {
-        status.push_str(" · running ");
-        status.push_str(&total);
+        detail.push_str(" · ");
+        detail.push_str(&total);
+        detail.push_str(" old");
     }
-    // The favorites group spans hosts (recency-desc across all hosts),
-    // so the host label — carried by the `── local ──` header in the
-    // natural tree — goes inline here instead.
     if in_favorites_group {
-        status.push_str(" · [");
-        status.push_str(session.host.as_str());
-        status.push(']');
+        detail.push_str(" · [");
+        detail.push_str(session.host.as_str());
+        detail.push(']');
     }
-    // Status nests one column past line 1's glyph.
-    let l2 = vec![Span::raw(format!("{indent}  ")), Span::styled(status, dim)];
+
+    let l2 = vec![
+        Span::raw(format!("{indent}  ")),
+        Span::styled(state.to_string(), word_style),
+        Span::styled(detail, dim),
+    ];
 
     vec![Line::from(l1), Line::from(l2)]
 }
@@ -3751,21 +3753,6 @@ fn effective_attention(session: &Session) -> Attention {
     }
     session.attention
 }
-
-fn attention_glyph(a: Attention) -> &'static str {
-    match a {
-        Attention::NeedsInput => "●",
-        Attention::Working => "◐",
-        Attention::Idle => "○",
-        Attention::Unknown => "·",
-    }
-}
-
-/// Glyph for a session whose `NeedsInput` is a hook-confirmed blocking
-/// prompt (permission / elicitation) — the agent is waiting on a
-/// specific answer. Distinct from the plain `NeedsInput` `●` ("done /
-/// waiting") so the two read apart at a glance. See `Session::blocking_prompt`.
-const BLOCKED_GLYPH: &str = "◆";
 
 /// Human word for a session's display state, shown on the sidebar's
 /// second line. A hook-confirmed blocking prompt reads as `blocked`
@@ -5298,11 +5285,17 @@ mod tests {
         );
         assert!(l2.contains("working"), "line 2 names the state: {l2:?}");
         assert!(l2.contains("18m"), "line 2 shows time-in-state: {l2:?}");
-        assert!(l2.contains("running 45m"), "line 2 shows total age: {l2:?}");
+        assert!(l2.contains("45m old"), "line 2 shows total age: {l2:?}");
+        // The title carries no glyph any more — the coloured state word
+        // is the attention signal.
+        assert!(
+            !l1.contains('●') && !l1.contains('◆'),
+            "line 1 is title-only, no glyph: {l1:?}"
+        );
     }
 
     #[test]
-    fn format_session_row_blocked_uses_diamond_and_word() {
+    fn format_session_row_blocked_says_blocked_not_done() {
         let now = SystemTime::now();
         let mut s = mock_session("abc");
         s.title = Some("deploy".into());
@@ -5311,10 +5304,12 @@ mod tests {
         s.last_activity = now;
         s.attention_entered_at = Some(now - Duration::from_mins(2));
         let lines = format_session_row(&s, &Theme::default(), None, false, false);
-        let l1 = line_text(&lines[0]);
         let l2 = line_text(&lines[1]);
-        assert!(l1.contains(BLOCKED_GLYPH), "blocked row uses ◆: {l1:?}");
         assert!(l2.contains("blocked"), "line 2 says blocked: {l2:?}");
+        assert!(
+            !l2.contains("done"),
+            "blocked must not read as done: {l2:?}"
+        );
     }
 
     #[test]
@@ -5329,8 +5324,8 @@ mod tests {
         let l2 = line_text(&format_session_row(&s, &Theme::default(), None, false, false)[1]);
         assert!(l2.contains("done"), "still names the state: {l2:?}");
         assert!(
-            !l2.contains("running"),
-            "no total without a start time: {l2:?}"
+            !l2.contains(" old"),
+            "no total-age cell without a start time: {l2:?}"
         );
     }
 

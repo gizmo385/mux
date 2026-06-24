@@ -8,6 +8,24 @@ use crate::host::Host;
 
 const METADATA_PATH: &str = ".agent-mux/task.toml";
 
+/// Relative path of the gitignore agent-mux drops inside its own
+/// metadata directory. A `*` pattern ignores everything in `.agent-mux/`
+/// (including this gitignore itself), so the task-metadata file we write
+/// can never be swept into the user's repo by a `git add .` / `git add
+/// -A` — neither the user's hand nor an agent running git on their
+/// behalf. Kept inside the dir rather than appended to the worktree's
+/// `.git/info/exclude` deliberately: the per-worktree gitignore needs no
+/// read-modify-write of a file shared across a repo's worktrees (so no
+/// race on concurrent creates), and it rides the same `Host::write_file`
+/// path as the metadata, working identically on local and remote
+/// worktrees.
+const GITIGNORE_PATH: &str = ".agent-mux/.gitignore";
+
+const GITIGNORE_CONTENT: &str = "# Written by agent-mux. This directory holds per-session task\n\
+    # metadata and is intentionally excluded from version control so it\n\
+    # can't be accidentally committed into your repository.\n\
+    *\n";
+
 #[derive(Debug)]
 pub enum WorktreeError {
     NotARepo(PathBuf),
@@ -139,14 +157,16 @@ impl WorktreeManager {
         force: bool,
     ) -> Result<(), WorktreeError> {
         // Pre-clean agent-mux's own metadata directory. Every
-        // agent-mux-created worktree carries an untracked
-        // `.agent-mux/task.toml` written at create-time; without
-        // this step, `git worktree remove` would treat that file
-        // as a dirty worktree and refuse without `--force`. By
-        // removing the file we own first, git's safety net only
-        // trips on *actual* user work — preserving the modal's
+        // agent-mux-created worktree carries a `.agent-mux/` dir (the
+        // per-session `task.toml` plus a gitignore that keeps it out of
+        // `git add`). Removing the dir we own first means git's safety
+        // net only trips on *actual* user work — preserving the modal's
         // distinction between "clean delete" (default Enter) and
-        // "force delete" (`f` then Enter).
+        // "force delete" (`f` then Enter). Still load-bearing for
+        // worktrees created before the gitignore shipped: their
+        // `task.toml` is untracked, not ignored, and `git worktree
+        // remove` would treat it as a dirty worktree and refuse without
+        // `--force`.
         //
         // Best-effort: a missing `.agent-mux/` or a transient rm
         // failure just means git decides for itself, surfacing the
@@ -266,6 +286,12 @@ fn write_task_metadata(
     }
     let serialized = toml::to_string(meta).map_err(WorktreeError::TomlSerialize)?;
     host.write_file(&worktree.join(METADATA_PATH), &serialized)?;
+    // Drop a gitignore alongside so neither `git add .` nor an agent
+    // running git can sweep this metadata into the user's repo — a real
+    // dogfooding annoyance (stray `.agent-mux/task.toml` commits the
+    // user then had to back out). See `GITIGNORE_PATH` for why it lives
+    // in the dir rather than in `.git/info/exclude`.
+    host.write_file(&worktree.join(GITIGNORE_PATH), GITIGNORE_CONTENT)?;
     Ok(())
 }
 
@@ -507,6 +533,52 @@ mod tests {
         assert_eq!(meta.task, "refactor parser");
         assert_eq!(meta.base_branch, "main");
         assert!(meta.created_at > 0);
+    }
+
+    #[test]
+    fn create_keeps_task_metadata_out_of_git() {
+        // The dogfooding pain this fixes: `.agent-mux/task.toml` used to
+        // be an untracked file that `git add .` (or an agent running it)
+        // would sweep into the user's repo, which they then had to back
+        // out. The gitignore agent-mux drops in the dir must make the
+        // whole `.agent-mux/` invisible to git — while a real user file
+        // in the same worktree still shows up, proving we ignore only
+        // our own dir, not the worktree at large.
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("proj");
+        fs::create_dir(&repo).expect("mkdir proj");
+        init_repo(&repo);
+
+        let host = LocalHost::new();
+        let path = WorktreeManager::new()
+            .create(&host, &repo, "main", "refactor parser")
+            .expect("create worktree");
+
+        assert!(
+            path.join(METADATA_PATH).is_file(),
+            "task.toml should be written"
+        );
+        assert!(
+            path.join(GITIGNORE_PATH).is_file(),
+            "a gitignore should be written into .agent-mux/"
+        );
+
+        // A real user edit alongside our metadata.
+        fs::write(path.join("user-work.txt"), "edit").expect("user file");
+
+        // `--untracked-files=all` lists untracked files but, by design,
+        // not git-ignored ones — so a clean run shows the user file and
+        // nothing under `.agent-mux/`.
+        let status =
+            run_git_directly_capture(&path, &["status", "--porcelain", "--untracked-files=all"]);
+        assert!(
+            !status.contains(".agent-mux"),
+            "agent-mux metadata must be git-ignored, got status:\n{status}"
+        );
+        assert!(
+            status.contains("user-work.txt"),
+            "real user files must still surface (we ignore only .agent-mux/), got:\n{status}"
+        );
     }
 
     #[test]

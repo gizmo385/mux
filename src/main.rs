@@ -2985,7 +2985,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         // own colour/weight (titles, the coloured state word, the dim
         // detail) legible, and the `▌` bar still marks the row.
         .highlight_style(Style::new().bg(ratatui::style::Color::Indexed(238)))
-        .highlight_symbol("▌ ");
+        // One-column bar (was "▌ "): the background highlight is the
+        // primary selection cue now, so the gutter only needs a thin
+        // edge — reclaiming a column keeps session titles flush-left.
+        .highlight_symbol("▌");
 
     // Pull the offset up to keep the selected row's context header
     // visible. ratatui's `List` adjusts the offset only enough to keep
@@ -3559,7 +3562,7 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
     // group context rather than a focal row. Home-shortened so the
     // ~ prefix doesn't waste horizontal space.
     Line::from(Span::styled(
-        format!(" {}", display_path(project, home)),
+        display_path(project, home),
         Style::new().add_modifier(Modifier::DIM),
     ))
 }
@@ -3569,7 +3572,7 @@ fn format_project_header(project: &Path, home: Option<&Path>) -> Line<'static> {
 /// search (which lifts the cap) or by favoriting.
 fn format_project_overflow(hidden: usize) -> Line<'static> {
     Line::from(Span::styled(
-        format!("  + {hidden} more"),
+        format!("+ {hidden} more"),
         Style::new().add_modifier(Modifier::DIM),
     ))
 }
@@ -3602,7 +3605,6 @@ fn format_favorite_placeholder_row(ph: &FavoritePlaceholder) -> Line<'static> {
         format!("({suffix})")
     });
     Line::from(vec![
-        Span::raw(" "),
         Span::styled("★ ", dim),
         Span::styled(label, dim),
         Span::styled("  unconfirmed", dim),
@@ -3658,14 +3660,15 @@ fn format_session_row(
     let title_dim = matches!(session.has_live_pane, Some(false));
     let title_style = if title_dim { dim } else { Style::new() };
 
-    // Shallow indent — 1 space in the favorites group, 2 in the natural
-    // host → project tree — so titles get the width. There's no glyph
-    // column: the attention signal lives in the coloured state word on
-    // line 2, not a symbol on line 1.
-    let indent = if in_favorites_group { " " } else { "  " };
+    // Session titles sit flush-left (no per-row indent): the `──host──`
+    // / dim-project headers above carry the grouping, the coloured state
+    // word carries attention, and the list's selection gutter already
+    // offsets everything — so titles get the full width. Line 2's status
+    // nests by two columns to bind the two lines into one visual row.
+    // (`in_favorites_group` still steers the inline `[host]` suffix.)
 
     // ---- Line 1: (★) title ----
-    let mut l1 = vec![Span::raw(indent)];
+    let mut l1: Vec<Span<'static>> = Vec::new();
     // ★ marks a favorited session on *both* copies (pinned + natural).
     if is_favorite {
         l1.push(Span::styled("★ ", dim));
@@ -3723,7 +3726,7 @@ fn format_session_row(
     }
 
     let l2 = vec![
-        Span::raw(format!("{indent}  ")),
+        Span::raw("  "),
         Span::styled(state.to_string(), word_style),
         Span::styled(detail, dim),
     ];

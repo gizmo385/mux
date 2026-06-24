@@ -13,6 +13,7 @@ pub mod hook_install;
 pub mod host;
 pub mod new_session_modal;
 pub mod notifications;
+pub mod quickswitcher;
 pub mod repo;
 pub mod session;
 pub mod session_names;

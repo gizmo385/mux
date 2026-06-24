@@ -48,6 +48,7 @@ use agent_mux::favorites::{
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
 use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
+use agent_mux::quickswitcher::{QuickSwitcher, SwitchEntry, SwitchOutcome, SwitchTarget};
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
 use agent_mux::session_names::{SessionNameStore, default_store_path};
@@ -345,6 +346,12 @@ struct App {
     /// so the at-most-one invariant is upheld at the call sites with
     /// no shared `take()` plumbing to refactor.
     delete_modal: Option<DeleteWorktreeModal>,
+    /// Open quickswitcher (`Ctrl-P`). A sibling of `modal` /
+    /// `delete_modal` — at most one overlay is up at a time, enforced by
+    /// the open-time guard in `open_quickswitcher`. Holds only its own
+    /// query + selection; on Enter it yields a [`SwitchTarget`] that the
+    /// run loop re-seats the sidebar cursor onto and attaches.
+    quickswitcher: Option<QuickSwitcher>,
     create_tx: Sender<NewSessionResult>,
     create_rx: Receiver<NewSessionResult>,
     creating: Option<CreatingSession>,
@@ -719,6 +726,7 @@ impl App {
             registry,
             modal: None,
             delete_modal: None,
+            quickswitcher: None,
             create_tx,
             create_rx,
             delete_tx,
@@ -1290,6 +1298,119 @@ impl App {
         }
     }
 
+    /// Open the quickswitcher (`Ctrl-P`). No-op if another overlay is
+    /// already up — keeps the at-most-one-overlay invariant the modal
+    /// siblings share. Snapshots the current jump targets at open time;
+    /// the modal filters that snapshot in memory and never touches the
+    /// catalog, so it honours "switching never blocks on I/O."
+    fn open_quickswitcher(&mut self) {
+        if self.modal.is_some() || self.delete_modal.is_some() || self.quickswitcher.is_some() {
+            return;
+        }
+        let entries = self.quickswitch_entries();
+        if entries.is_empty() {
+            self.status = Some("nothing to switch to yet".to_string());
+            return;
+        }
+        self.quickswitcher = Some(QuickSwitcher::new(entries));
+        self.status = None;
+    }
+
+    /// Route a key to the open quickswitcher. Returns an
+    /// [`ActionOutcome`] because a `Pick` attaches immediately, and the
+    /// non-embedded attach path may hand back a [`SuspendCommand`] the
+    /// run loop must execute (same as a manual Enter). Esc / no-match
+    /// Enter just close or keep the modal with no outcome.
+    fn handle_quickswitcher_key(&mut self, key: KeyEvent) -> ActionOutcome {
+        let Some(mut sw) = self.quickswitcher.take() else {
+            return ActionOutcome::Continue;
+        };
+        match sw.handle_key(key) {
+            SwitchOutcome::Handled => {
+                self.quickswitcher = Some(sw);
+                ActionOutcome::Continue
+            }
+            // Modal dropped (not re-stored) on Cancel and Pick.
+            SwitchOutcome::Cancel => ActionOutcome::Continue,
+            SwitchOutcome::Pick(target) => {
+                // Re-seat the sidebar cursor onto the chosen row, then
+                // run the exact attach path a manual Enter would — the
+                // switcher is a selection layer over the one attach
+                // flow, not a parallel one.
+                let anchor = switch_target_anchor(target);
+                self.reseat_selection_to(Some(&anchor));
+                self.attach_under_cursor()
+            }
+        }
+    }
+
+    /// Build the quickswitcher's candidate set: every live session
+    /// (recency-ordered, most-recent first), every running tool launch,
+    /// and every offline favorite (placeholder). Flat and de-duplicated
+    /// — a favorited session appears once here even though it renders
+    /// twice in the sidebar. The `haystack` folds title + project + host
+    /// so a query can hit any of them.
+    fn quickswitch_entries(&self) -> Vec<SwitchEntry> {
+        let mut entries = Vec::new();
+
+        // Tool launches first — short-lived panes the user often bounces
+        // back to mid-task.
+        for launch in self.tool_launches.launches() {
+            let project = project_basename(&launch.project_dir);
+            entries.push(SwitchEntry {
+                label: launch.name.clone(),
+                context: format!("{project}  ·  {}", launch.host.as_str()),
+                haystack: format!("{} {project} {}", launch.name, launch.host.as_str())
+                    .to_lowercase(),
+                target: SwitchTarget::Tool {
+                    tmux_session: launch.tmux_session.clone(),
+                },
+            });
+        }
+
+        // Live sessions, most-recently-active first so the unfiltered
+        // view opens on the likeliest target.
+        let mut sessions: Vec<&Session> = self.catalog.sessions().iter().collect();
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
+        for s in sessions {
+            let name_override = self.session_names.get(&s.host, &s.id);
+            let label = quickswitch_label(name_override, s.title.as_deref(), &s.id);
+            let project = project_basename(&s.project_dir);
+            entries.push(SwitchEntry {
+                label: label.clone(),
+                context: format!("{project}  ·  {}", s.host.as_str()),
+                haystack: format!("{label} {project} {}", s.host.as_str()).to_lowercase(),
+                target: SwitchTarget::Session {
+                    id: s.id.clone(),
+                    in_favorites: self.favorites.contains(&s.host, &s.id),
+                },
+            });
+        }
+
+        // Offline favorites — pinned but their host isn't live this
+        // frame. Picking one re-seats onto its placeholder row and
+        // surfaces "waiting for host" rather than attaching. Note these
+        // inherit any *active sidebar search* filter (via
+        // `favorite_placeholders`) while the live sessions above don't —
+        // a benign asymmetry, since the switcher's own query re-filters
+        // everything the moment the user types, and the placeholder set
+        // is a handful of offline pins.
+        for ph in self.favorite_placeholders() {
+            let label = quickswitch_label(None, ph.title.as_deref(), &ph.id);
+            entries.push(SwitchEntry {
+                label: label.clone(),
+                context: format!("{}  ·  offline", ph.host.as_str()),
+                haystack: format!("{label} {}", ph.host.as_str()).to_lowercase(),
+                target: SwitchTarget::Placeholder {
+                    host: ph.host,
+                    id: ph.id,
+                },
+            });
+        }
+
+        entries
+    }
+
     /// Skip `git worktree add` and spawn claude directly in the picked
     /// repo's root. Reuses the create-channel pipeline so `drain_creates`
     /// handles the spawn the same way it does for worktree-backed
@@ -1784,6 +1905,35 @@ impl App {
             .track_new_transcript(host_id, id, transcript_path)
         {
             self.status = Some(format!("watch new transcript: {e}"));
+        }
+    }
+
+    /// Attach to whatever the sidebar cursor is on, resolving the row
+    /// kind: a tool row re-attaches its tmux session; a favorite
+    /// placeholder (no live session yet) surfaces "waiting for host"
+    /// rather than a silent no-op; anything else routes through the
+    /// session attach path. Shared by the `Enter` dispatch and the
+    /// quickswitcher's immediate-attach `Pick` so both behave
+    /// identically.
+    fn attach_under_cursor(&mut self) -> ActionOutcome {
+        if let Some(tool_idx) = self.selected_tool_index() {
+            match self.attach_tool(tool_idx) {
+                Some(cmd) => ActionOutcome::Suspend(cmd),
+                None => ActionOutcome::Continue,
+            }
+        } else if let Some(ph) = self.selected_placeholder() {
+            // A favorite whose live session isn't in the catalog yet —
+            // nothing to attach to. Say so instead of a silent no-op;
+            // the row becomes attachable once its host connects and
+            // discovery surfaces the session.
+            let title = ph.title.clone().unwrap_or_else(|| ph.id.0.clone());
+            self.status = Some(format!("{title}: waiting for host {}", ph.host));
+            ActionOutcome::Continue
+        } else {
+            match self.attach_selected() {
+                Some(cmd) => ActionOutcome::Suspend(cmd),
+                None => ActionOutcome::Continue,
+            }
         }
     }
 
@@ -2394,6 +2544,22 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 app.handle_delete_modal_key(key);
                 continue;
             }
+            // Quickswitcher owns the keyboard while open. Routed through
+            // ActionOutcome (not a bare handler) because a `Pick`
+            // attaches immediately and the non-embedded path may return
+            // a SuspendCommand the loop must run — same as Enter below.
+            if app.quickswitcher.is_some() {
+                match app.handle_quickswitcher_key(key) {
+                    ActionOutcome::Quit => return Ok(()),
+                    ActionOutcome::Continue => {}
+                    ActionOutcome::Suspend(cmd) => {
+                        if let Some(err) = suspend_and_run(terminal, &cmd, app.embedded_mode)? {
+                            app.status = Some(err);
+                        }
+                    }
+                }
+                continue;
+            }
             // Rename overlay owns the keyboard while open — characters
             // append to the buffer, Backspace pops, Enter commits, Esc
             // cancels. Comes before the search routes for the same
@@ -2545,30 +2711,10 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.prev_host();
             ActionOutcome::Continue
         }
-        Action::Attach => {
-            // Enter on a tool row re-attaches the embedded pane to
-            // that tool's tmux session instead of routing through the
-            // session-attach path (the catalog has no Session for a
-            // tool launch).
-            if let Some(tool_idx) = app.selected_tool_index() {
-                match app.attach_tool(tool_idx) {
-                    Some(cmd) => ActionOutcome::Suspend(cmd),
-                    None => ActionOutcome::Continue,
-                }
-            } else if let Some(ph) = app.selected_placeholder() {
-                // A favorite whose live session isn't in the catalog
-                // yet — nothing to attach to. Say so instead of a
-                // silent no-op; the row becomes attachable once its
-                // host connects and discovery surfaces the session.
-                let title = ph.title.clone().unwrap_or_else(|| ph.id.0.clone());
-                app.status = Some(format!("{title}: waiting for host {}", ph.host));
-                ActionOutcome::Continue
-            } else {
-                match app.attach_selected() {
-                    Some(cmd) => ActionOutcome::Suspend(cmd),
-                    None => ActionOutcome::Continue,
-                }
-            }
+        Action::Attach => app.attach_under_cursor(),
+        Action::OpenQuickSwitcher => {
+            app.open_quickswitcher();
+            ActionOutcome::Continue
         }
         Action::SpawnTerminal => match app.spawn_terminal_selected() {
             Some(cmd) => ActionOutcome::Suspend(cmd),
@@ -2629,6 +2775,8 @@ enum Action {
     /// `N` — pick a repo, spawn claude in its root, no worktree.
     NewSessionNoWorktree,
     OpenSearch,
+    /// `Ctrl-P` — open the quickswitcher fuzzy-jump modal.
+    OpenQuickSwitcher,
     DeleteWorktree,
     /// `r` — open the inline rename overlay for the selected session.
     RenameSession,
@@ -2652,6 +2800,7 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
         return match key.code {
             KeyCode::Char('j') => Some(Action::NextHost),
             KeyCode::Char('k') => Some(Action::PrevHost),
+            KeyCode::Char('p') => Some(Action::OpenQuickSwitcher),
             _ => None,
         };
     }
@@ -3046,6 +3195,9 @@ fn draw_modal_overlay(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     }
     if let Some(modal) = app.delete_modal.as_ref() {
         modal.draw(frame);
+    }
+    if let Some(sw) = app.quickswitcher.as_mut() {
+        sw.draw(frame);
     }
 }
 
@@ -3636,6 +3788,47 @@ fn placeholder_matches_query(
         return true;
     }
     host.as_str().to_lowercase().contains(query_lower) || id.0.to_lowercase().contains(query_lower)
+}
+
+/// Map a quickswitcher [`SwitchTarget`] onto the sidebar's
+/// [`SelectionAnchor`] so the cursor can be re-seated onto the matching
+/// row before attaching. A 1:1 translation — the switcher's target
+/// kinds mirror the selectable row kinds.
+fn switch_target_anchor(target: SwitchTarget) -> SelectionAnchor {
+    match target {
+        SwitchTarget::Session { id, in_favorites } => SelectionAnchor::Session { id, in_favorites },
+        SwitchTarget::Tool { tmux_session } => SelectionAnchor::Tool { tmux_session },
+        SwitchTarget::Placeholder { host, id } => SelectionAnchor::FavoritePlaceholder { host, id },
+    }
+}
+
+/// The last path component of a project dir, for the quickswitcher's dim
+/// context line. Falls back to the full lossy path when there's no final
+/// component (e.g. a bare root).
+fn project_basename(dir: &Path) -> String {
+    dir.file_name().map_or_else(
+        || dir.to_string_lossy().into_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// The display title for a quickswitcher row, mirroring the sidebar's
+/// precedence: a user rename wins, then the `aiTitle` / task title, then
+/// a short id suffix in parentheses for a still-untitled session.
+fn quickswitch_label(name_override: Option<&str>, title: Option<&str>, id: &SessionId) -> String {
+    if let Some(name) = name_override {
+        return name.to_string();
+    }
+    if let Some(title) = title {
+        return title.to_string();
+    }
+    let s = &id.0;
+    let suffix = if s.len() > 6 {
+        &s[s.len() - 6..]
+    } else {
+        s.as_str()
+    };
+    format!("({suffix})")
 }
 
 fn format_session_row(
@@ -5244,6 +5437,23 @@ mod tests {
         // `blocked` only applies to NeedsInput — a stray flag on
         // another state must not relabel it.
         assert_eq!(attention_word(Attention::Working, true), "working");
+    }
+
+    #[test]
+    fn quickswitch_label_follows_override_then_title_then_id_suffix() {
+        let id = SessionId("abcdef0123456789".to_string());
+        // Override wins over everything.
+        assert_eq!(
+            quickswitch_label(Some("my rename"), Some("ai title"), &id),
+            "my rename"
+        );
+        // Then the session/ai title.
+        assert_eq!(quickswitch_label(None, Some("ai title"), &id), "ai title");
+        // Then the last-6 id suffix in parens for an untitled session.
+        assert_eq!(quickswitch_label(None, None, &id), "(456789)");
+        // Short ids aren't sliced out of bounds.
+        let short = SessionId("ab".to_string());
+        assert_eq!(quickswitch_label(None, None, &short), "(ab)");
     }
 
     #[test]

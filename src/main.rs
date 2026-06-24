@@ -30,10 +30,10 @@ use agent_mux::catalog::SessionCatalog;
 use agent_mux::cli;
 use agent_mux::config::{self, Config, Theme, ToolBinding};
 use agent_mux::dashboard::{
-    DisplayRow, Focus, SearchMode, SearchOutcome, SearchState, anchor_header_for_selection,
-    apply_fg, build_display_rows, build_display_rows_filtered, first_session_index, is_pty_leader,
-    matches_query, next_host_index, next_project_index, next_session_index, prev_host_index,
-    prev_project_index, prev_session_index,
+    DisplayRow, FavoritePlaceholder, Focus, SearchMode, SearchOutcome, SearchState,
+    anchor_header_for_selection, apply_fg, build_display_rows, build_display_rows_filtered,
+    first_session_index, is_pty_leader, matches_query, next_host_index, next_project_index,
+    next_session_index, prev_host_index, prev_project_index, prev_session_index,
 };
 use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
@@ -42,7 +42,9 @@ use agent_mux::discovery::{build_session, claude_projects_dir, discover};
 use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
 };
-use agent_mux::favorites::{FavoritesStore, default_store_path as favorites_default_store_path};
+use agent_mux::favorites::{
+    FavoriteMeta, FavoritesStore, default_store_path as favorites_default_store_path,
+};
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
 use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
@@ -291,19 +293,25 @@ fn suspend_and_run(
 ///   later indices down; an index-based anchor would silently jump
 ///   the cursor to a *different* tool that now occupies the old
 ///   index.
+/// - `FavoritePlaceholder` — a favorited session not yet in the live
+///   catalog (host still connecting, or offline), rendered as a dimmed
+///   placeholder. Anchored on `(host, id)` so when the live session
+///   arrives the cursor follows it onto the real favorite row, and
+///   until then stays on the placeholder across drains.
 ///
 /// Why this matters: `App::drain_updates` calls
 /// `reseat_selection_to(selected_anchor_for_reseat())` at the end of
 /// every drain tick (which fires on every watcher event — attention
 /// updates, new transcripts, live-pane polls land here constantly).
-/// Without a `Tool` variant, `selected_anchor_for_reseat` returns
-/// `None` whenever the cursor is on a tool row, and the fallback in
+/// Without a variant for the selected row kind,
+/// `selected_anchor_for_reseat` returns `None`, and the fallback in
 /// `pick_reseat_target` lands selection on the first session row —
-/// making the Tools sidebar group effectively unreachable.
+/// making that sidebar group effectively unreachable.
 #[derive(Debug, Clone)]
 enum SelectionAnchor {
     Session { id: SessionId, in_favorites: bool },
     Tool { tmux_session: String },
+    FavoritePlaceholder { host: HostId, id: SessionId },
 }
 
 struct App {
@@ -773,17 +781,15 @@ impl App {
     /// natural-tree copy when toggling from there (rather than
     /// silently jumping to the new favorites copy).
     fn toggle_favorite_selected(&mut self) {
-        let Some(session) = self.selected_session() else {
+        // Works on a live session (either copy) *or* a placeholder row
+        // — so a favorite whose session is permanently gone (the row is
+        // stuck as a placeholder) is one keystroke from dismissed,
+        // rather than only editable by hand in favorites.json.
+        let Some((host, id, title, meta)) = self.selected_favorite_target() else {
             return;
         };
-        let host = session.host.clone();
-        let id = session.id.clone();
-        let title = session
-            .title
-            .clone()
-            .unwrap_or_else(|| session.id.0.clone());
         let prior = self.selected_anchor_for_reseat();
-        let now_favorited = self.favorites.toggle(&host, &id);
+        let now_favorited = self.favorites.toggle(&host, &id, meta);
         self.reseat_selection_to(prior.as_ref());
         self.status = Some(format!(
             "{}: {title}",
@@ -793,6 +799,39 @@ impl App {
                 "unfavorited"
             }
         ));
+    }
+
+    /// Resolve the `(host, id, display title, metadata)` for the
+    /// selected row when it's something the favorite keybind can act on
+    /// — a live session (either the natural or favorites copy) or a
+    /// favorite placeholder. `None` for headers and tool rows. The
+    /// metadata seeds [`FavoritesStore::toggle`] when *adding* a
+    /// favorite (so it can render as a placeholder immediately if its
+    /// session later drops out); it's ignored on removal.
+    fn selected_favorite_target(&self) -> Option<(HostId, SessionId, String, FavoriteMeta)> {
+        let idx = self.list_state.selected()?;
+        let rows = self.current_rows();
+        match rows.get(idx)? {
+            DisplayRow::SessionRow(i) | DisplayRow::FavoriteSessionRow(i) => {
+                let s = self.catalog.sessions().get(*i)?;
+                let title = s.title.clone().unwrap_or_else(|| s.id.0.clone());
+                let meta = FavoriteMeta {
+                    title: s.title.clone(),
+                    project_dir: Some(s.project_dir.clone()),
+                };
+                Some((s.host.clone(), s.id.clone(), title, meta))
+            }
+            DisplayRow::FavoritePlaceholderRow(i) => {
+                let ph = self.favorite_placeholders().into_iter().nth(*i)?;
+                let title = ph.title.clone().unwrap_or_else(|| ph.id.0.clone());
+                let meta = FavoriteMeta {
+                    title: ph.title,
+                    project_dir: None,
+                };
+                Some((ph.host, ph.id, title, meta))
+            }
+            _ => None,
+        }
     }
 
     /// Route a key while the rename overlay is active. Returns
@@ -847,16 +886,22 @@ impl App {
                 .get(i)
                 .is_some_and(|s| self.favorites.contains(&s.host, &s.id))
         };
+        // Placeholder rows for favorites whose live session isn't in
+        // the catalog right now (host still connecting, or offline) so
+        // the favorite doesn't vanish. Recomputed each frame from the
+        // store; cheap (the favorites set is a handful of pins).
+        let placeholders = self.favorite_placeholders();
         let session_rows = match self.search.as_ref() {
             Some(s) if !s.query.is_empty() => {
                 let q = s.query.to_lowercase();
                 build_display_rows_filtered(
                     sessions,
+                    &placeholders,
                     |i| matches_query(&sessions[i], &q),
                     is_favorite,
                 )
             }
-            _ => build_display_rows_filtered(sessions, |_| true, is_favorite),
+            _ => build_display_rows_filtered(sessions, &placeholders, |_| true, is_favorite),
         };
         // Surface the Tools group above sessions when one or more
         // launches are running. Search filtering doesn't affect this
@@ -873,6 +918,44 @@ impl App {
         }
         rows.extend(session_rows);
         rows
+    }
+
+    /// Placeholder rows for favorited sessions that aren't in the live
+    /// catalog this frame (their host is still connecting, or is
+    /// offline), so the pinned favorites group renders them as dimmed
+    /// "unconfirmed" rows instead of letting the favorite vanish.
+    /// Search-filtered to match the live-favorite behaviour.
+    ///
+    /// Recomputed wherever the row list or selection is resolved — the
+    /// favorites set is tiny (a handful of pins) so the per-frame walk
+    /// is cheap, and recomputation keeps the placeholder indices
+    /// consistent without threading a stored slice through `&self`.
+    fn favorite_placeholders(&self) -> Vec<FavoritePlaceholder> {
+        let sessions = self.catalog.sessions();
+        let query = self
+            .search
+            .as_ref()
+            .filter(|s| !s.query.is_empty())
+            .map(|s| s.query.to_lowercase());
+        let mut out = Vec::new();
+        for (host, id, meta) in self.favorites.entries() {
+            // Live this frame → already rendered as a real
+            // FavoriteSessionRow; don't double it as a placeholder.
+            if sessions.iter().any(|s| s.host == host && s.id == id) {
+                continue;
+            }
+            if let Some(q) = &query
+                && !placeholder_matches_query(&host, &id, meta, q)
+            {
+                continue;
+            }
+            out.push(FavoritePlaceholder {
+                host,
+                id,
+                title: meta.title.clone(),
+            });
+        }
+        out
     }
 
     /// Open the search bar in Editing mode. If a filter is already
@@ -994,6 +1077,13 @@ impl App {
                 let tmux_session = self.tool_launches.launches().get(*i)?.tmux_session.clone();
                 Some(SelectionAnchor::Tool { tmux_session })
             }
+            DisplayRow::FavoritePlaceholderRow(i) => {
+                let ph = self.favorite_placeholders().into_iter().nth(*i)?;
+                Some(SelectionAnchor::FavoritePlaceholder {
+                    host: ph.host,
+                    id: ph.id,
+                })
+            }
             _ => None,
         }
     }
@@ -1005,10 +1095,12 @@ impl App {
     /// `resolve_notification_title` lift-out pattern).
     fn reseat_selection_to(&mut self, prior: Option<&SelectionAnchor>) {
         let rows = self.current_rows();
+        let placeholders = self.favorite_placeholders();
         let new_idx = pick_reseat_target(
             &rows,
             self.catalog.sessions(),
             self.tool_launches.launches(),
+            &placeholders,
             prior,
         );
         self.list_state.select(new_idx);
@@ -1097,6 +1189,10 @@ impl App {
                 }
             }
         }
+        // A live discovery (Ready) overlays fresh titles onto favorited
+        // sessions; capture them so a later disappearance renders an
+        // up-to-date placeholder rather than a stale or bare one.
+        self.refresh_favorite_metadata();
     }
 
     /// Drain finished remote workspace scans into the registry. Each
@@ -1449,6 +1545,35 @@ impl App {
         self.reseat_selection_to(prior.as_ref());
     }
 
+    /// Keep the `FavoritesStore`'s cached metadata fresh from the live
+    /// catalog, so a favorite's placeholder (rendered when its session
+    /// later drops out of the catalog) shows the real current title
+    /// rather than a stale one or a bare id. Collects the updates first
+    /// to release the catalog borrow before mutating the store;
+    /// `record_meta` no-ops (no disk write) when nothing changed, so
+    /// this stays cheap to call on every catalog drain.
+    fn refresh_favorite_metadata(&mut self) {
+        let updates: Vec<(HostId, SessionId, FavoriteMeta)> = self
+            .catalog
+            .sessions()
+            .iter()
+            .filter(|s| self.favorites.contains(&s.host, &s.id))
+            .map(|s| {
+                (
+                    s.host.clone(),
+                    s.id.clone(),
+                    FavoriteMeta {
+                        title: s.title.clone(),
+                        project_dir: Some(s.project_dir.clone()),
+                    },
+                )
+            })
+            .collect();
+        for (host, id, meta) in updates {
+            self.favorites.record_meta(&host, &id, meta);
+        }
+    }
+
     fn drain_updates(&mut self) {
         // `build_display_rows` orders projects by `max(last_activity)
         // desc`, so any attention update / new transcript / hook event
@@ -1561,6 +1686,7 @@ impl App {
                 }
             }
         }
+        self.refresh_favorite_metadata();
         self.reseat_selection_to(prior.as_ref());
     }
 
@@ -2152,6 +2278,21 @@ impl App {
             None
         }
     }
+
+    /// The favorite placeholder under the cursor, if any. Used by the
+    /// Enter dispatcher to surface "this favorite isn't loaded yet"
+    /// rather than silently no-op (a placeholder has no live `Session`
+    /// to attach to).
+    fn selected_placeholder(&self) -> Option<FavoritePlaceholder> {
+        let idx = self.list_state.selected()?;
+        let rows = self.current_rows();
+        match rows.get(idx)? {
+            DisplayRow::FavoritePlaceholderRow(i) => {
+                self.favorite_placeholders().into_iter().nth(*i)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
@@ -2394,6 +2535,14 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
                     Some(cmd) => ActionOutcome::Suspend(cmd),
                     None => ActionOutcome::Continue,
                 }
+            } else if let Some(ph) = app.selected_placeholder() {
+                // A favorite whose live session isn't in the catalog
+                // yet — nothing to attach to. Say so instead of a
+                // silent no-op; the row becomes attachable once its
+                // host connects and discovery surfaces the session.
+                let title = ph.title.clone().unwrap_or_else(|| ph.id.0.clone());
+                app.status = Some(format!("{title}: waiting for host {}", ph.host));
+                ActionOutcome::Continue
             } else {
                 match app.attach_selected() {
                     Some(cmd) => ActionOutcome::Suspend(cmd),
@@ -2591,10 +2740,15 @@ enum LeaderChordTransition {
 /// the top-level draw function past the lint cap. Takes individual
 /// fields (rather than `&App`) so the returned items don't tie up a
 /// borrow of the whole `App`, which would conflict with the
-/// subsequent `&mut app.list_state` render call.
+/// subsequent `&mut app.list_state` render call — which is also why we
+/// allow the arg count: each field is a distinct, separately-borrowed
+/// piece of render state, and bundling them into a struct would just
+/// move the borrow split elsewhere without reducing it.
+#[allow(clippy::too_many_arguments)]
 fn build_sidebar_items(
     rows: &[DisplayRow],
     sessions: &[Session],
+    placeholders: &[FavoritePlaceholder],
     home: Option<&Path>,
     theme: &Theme,
     tool_launches: &[ToolLaunch],
@@ -2625,6 +2779,9 @@ fn build_sidebar_items(
                 // round-tripping through the store (which would also
                 // be correct but reads as a tautology).
                 ListItem::new(format_session_row(s, theme, name_override, true, true))
+            }
+            DisplayRow::FavoritePlaceholderRow(i) => {
+                ListItem::new(format_favorite_placeholder_row(&placeholders[*i]))
             }
             DisplayRow::ToolsHeader => ListItem::new(format_tools_header()),
             DisplayRow::ToolRow(i) => ListItem::new(format_tool_row(&tool_launches[*i])),
@@ -2779,6 +2936,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(header, layout[0]);
 
     let rows = app.current_rows();
+    let placeholders = app.favorite_placeholders();
     let visible_sessions = rows
         .iter()
         .filter(|r| matches!(r, DisplayRow::SessionRow(_)))
@@ -2787,6 +2945,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let items = build_sidebar_items(
         &rows,
         app.catalog.sessions(),
+        &placeholders,
         app.home.as_deref(),
         &app.theme,
         app.tool_launches.launches(),
@@ -3188,6 +3347,7 @@ fn pick_reseat_target(
     rows: &[DisplayRow],
     sessions: &[Session],
     tool_launches: &[ToolLaunch],
+    placeholders: &[FavoritePlaceholder],
     prior: Option<&SelectionAnchor>,
 ) -> Option<usize> {
     let matches_id = |i: usize, id: &SessionId| sessions.get(i).is_some_and(|s| s.id == *id);
@@ -3218,6 +3378,32 @@ fn pick_reseat_target(
             });
             if same_tool.is_some() {
                 return same_tool;
+            }
+        }
+        Some(SelectionAnchor::FavoritePlaceholder { host, id }) => {
+            // The favorite may have gone live since the anchor was
+            // captured — follow it onto its real row (favorites copy
+            // or natural copy) so the cursor rides the transition from
+            // placeholder to confirmed. host *and* id must match (the
+            // same id can exist on two hosts).
+            let live = rows.iter().position(|r| match r {
+                DisplayRow::FavoriteSessionRow(i) | DisplayRow::SessionRow(i) => sessions
+                    .get(*i)
+                    .is_some_and(|s| &s.host == host && &s.id == id),
+                _ => false,
+            });
+            if live.is_some() {
+                return live;
+            }
+            // Still a placeholder — stay on it.
+            let same_placeholder = rows.iter().position(|r| match r {
+                DisplayRow::FavoritePlaceholderRow(i) => placeholders
+                    .get(*i)
+                    .is_some_and(|p| &p.host == host && &p.id == id),
+                _ => false,
+            });
+            if same_placeholder.is_some() {
+                return same_placeholder;
             }
         }
         None => {}
@@ -3361,6 +3547,62 @@ fn format_favorites_header() -> Line<'static> {
         "── favorites ──".to_string(),
         Style::new().add_modifier(Modifier::BOLD),
     ))
+}
+
+/// Render a favorited session that isn't in the live catalog as a
+/// dimmed "unconfirmed" placeholder. Mirrors the favorites-group shape
+/// of [`format_session_row`] (indent, star, glyph, title, host label)
+/// but the whole line is dimmed, the glyph is the neutral unknown
+/// marker, and the age cell is a `⋯` — there's no live attention or
+/// activity to show yet, only the user's intent to keep this pinned.
+fn format_favorite_placeholder_row(ph: &FavoritePlaceholder) -> Line<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let label = ph.title.clone().unwrap_or_else(|| {
+        let id = &ph.id.0;
+        let suffix = if id.len() > 6 {
+            &id[id.len() - 6..]
+        } else {
+            id.as_str()
+        };
+        format!("({suffix})")
+    });
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("★ ", dim),
+        Span::styled(attention_glyph(Attention::Unknown).to_string(), dim),
+        Span::raw(" "),
+        Span::styled(label, dim),
+        Span::raw("  "),
+        Span::styled("⋯", dim),
+        Span::raw("  "),
+        Span::styled(format!("[{}]", ph.host), dim),
+    ])
+}
+
+/// Search predicate for a favorite placeholder, mirroring
+/// [`matches_query`] for live sessions: matches the cached title, the
+/// cached project dir, the host label, or the session id (so a
+/// placeholder stays findable even before a title has been cached).
+fn placeholder_matches_query(
+    host: &HostId,
+    id: &SessionId,
+    meta: &FavoriteMeta,
+    query_lower: &str,
+) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    if let Some(title) = meta.title.as_deref()
+        && title.to_lowercase().contains(query_lower)
+    {
+        return true;
+    }
+    if let Some(dir) = meta.project_dir.as_deref()
+        && dir.to_string_lossy().to_lowercase().contains(query_lower)
+    {
+        return true;
+    }
+    host.as_str().to_lowercase().contains(query_lower) || id.0.to_lowercase().contains(query_lower)
 }
 
 fn format_session_row(
@@ -4594,10 +4836,31 @@ mod tests {
         }
     }
 
+    fn mock_session_on(id_str: &str, host_label: &str) -> Session {
+        let mut s = mock_session(id_str);
+        s.host = HostId(host_label.to_string());
+        s
+    }
+
     fn session_anchor(id: &str, in_favorites: bool) -> SelectionAnchor {
         SelectionAnchor::Session {
             id: sid(id),
             in_favorites,
+        }
+    }
+
+    fn placeholder_anchor(host_label: &str, id: &str) -> SelectionAnchor {
+        SelectionAnchor::FavoritePlaceholder {
+            host: HostId(host_label.to_string()),
+            id: sid(id),
+        }
+    }
+
+    fn mock_placeholder(host_label: &str, id: &str) -> FavoritePlaceholder {
+        FavoritePlaceholder {
+            host: HostId(host_label.to_string()),
+            id: sid(id),
+            title: None,
         }
     }
 
@@ -4633,7 +4896,7 @@ mod tests {
         ];
         let prior = session_anchor("a", false);
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(3)
         );
     }
@@ -4653,7 +4916,7 @@ mod tests {
         ];
         let prior = session_anchor("a", true);
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(1)
         );
     }
@@ -4673,7 +4936,7 @@ mod tests {
         ];
         let prior = session_anchor("a", true);
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(1)
         );
     }
@@ -4691,7 +4954,7 @@ mod tests {
         ];
         let prior = session_anchor("a-gone", false);
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(1)
         );
     }
@@ -4706,7 +4969,10 @@ mod tests {
             DisplayRow::HostHeader(HostId::local()),
             DisplayRow::SessionRow(0),
         ];
-        assert_eq!(pick_reseat_target(&rows, &sessions, &tools, None), Some(1));
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, &[], None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4717,10 +4983,13 @@ mod tests {
         let rows: Vec<DisplayRow> = vec![];
         let prior = session_anchor("a-gone", false);
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             None
         );
-        assert_eq!(pick_reseat_target(&rows, &sessions, &tools, None), None);
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, &[], None),
+            None
+        );
     }
 
     #[test]
@@ -4741,7 +5010,7 @@ mod tests {
         ];
         let prior = tool_anchor("agent-mux-tool-1");
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(1)
         );
     }
@@ -4763,7 +5032,7 @@ mod tests {
         ];
         let prior = tool_anchor("agent-mux-tool-2");
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(1)
         );
     }
@@ -4783,9 +5052,91 @@ mod tests {
         ];
         let prior = tool_anchor("agent-mux-tool-1");
         assert_eq!(
-            pick_reseat_target(&rows, &sessions, &tools, Some(&prior)),
+            pick_reseat_target(&rows, &sessions, &tools, &[], Some(&prior)),
             Some(1)
         );
+    }
+
+    #[test]
+    fn pick_reseat_target_keeps_cursor_on_favorite_placeholder() {
+        // The favorite is still offline (its session isn't in the
+        // catalog), so the cursor must stay on its placeholder row
+        // across a re-seat rather than dropping back into the sessions.
+        let sessions: Vec<Session> = vec![];
+        let tools: Vec<ToolLaunch> = vec![];
+        let placeholders = vec![mock_placeholder("alpenglow", "gone")];
+        let rows = vec![
+            DisplayRow::FavoritesHeader,
+            DisplayRow::FavoritePlaceholderRow(0),
+        ];
+        let prior = placeholder_anchor("alpenglow", "gone");
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, &placeholders, Some(&prior)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_reseat_target_follows_favorite_placeholder_onto_live_row() {
+        // The favorite's session finally arrived via discovery (now a
+        // real FavoriteSessionRow); the cursor must follow it off the
+        // placeholder onto the confirmed row so the user lands on it.
+        let sessions = vec![mock_session_on("gone", "alpenglow")];
+        let tools: Vec<ToolLaunch> = vec![];
+        let placeholders: Vec<FavoritePlaceholder> = vec![];
+        let rows = vec![
+            DisplayRow::FavoritesHeader,
+            DisplayRow::FavoriteSessionRow(0),
+        ];
+        let prior = placeholder_anchor("alpenglow", "gone");
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, &placeholders, Some(&prior)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_reseat_target_disambiguates_placeholder_by_host() {
+        // Same id on two hosts: a placeholder anchored to `alpenglow`
+        // must NOT follow a `local` live row that happens to share the
+        // id — it's a different session. Cursor stays on the
+        // placeholder.
+        let sessions = vec![mock_session_on("dup", "local")];
+        let tools: Vec<ToolLaunch> = vec![];
+        let placeholders = vec![mock_placeholder("alpenglow", "dup")];
+        let rows = vec![
+            DisplayRow::HostHeader(HostId::local()),
+            DisplayRow::SessionRow(0),
+            DisplayRow::FavoritesHeader,
+            DisplayRow::FavoritePlaceholderRow(0),
+        ];
+        let prior = placeholder_anchor("alpenglow", "dup");
+        assert_eq!(
+            pick_reseat_target(&rows, &sessions, &tools, &placeholders, Some(&prior)),
+            Some(3)
+        );
+    }
+
+    // ---- placeholder_matches_query ----
+
+    #[test]
+    fn placeholder_matches_query_checks_title_project_host_and_id() {
+        let host = HostId("alpenglow".into());
+        let id = sid("abc123def");
+        let meta = FavoriteMeta {
+            title: Some("Deploy pipeline".into()),
+            project_dir: Some(std::path::PathBuf::from("/srv/app")),
+        };
+        assert!(placeholder_matches_query(&host, &id, &meta, "deploy"));
+        assert!(placeholder_matches_query(&host, &id, &meta, "alpen"));
+        assert!(placeholder_matches_query(&host, &id, &meta, "/srv"));
+        assert!(placeholder_matches_query(&host, &id, &meta, "abc123"));
+        assert!(!placeholder_matches_query(&host, &id, &meta, "zzz"));
+        // A placeholder with no cached title yet is still findable by
+        // its id (mirrors the id-suffix the row renders).
+        let bare = FavoriteMeta::default();
+        assert!(placeholder_matches_query(&host, &id, &bare, "abc123"));
+        assert!(!placeholder_matches_query(&host, &id, &bare, "deploy"));
     }
 
     // ---- compose_sidebar_title ----

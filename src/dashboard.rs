@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 
-use crate::session::{HostId, Session};
+use crate::session::{HostId, Session, SessionId};
 
 /// One row in the dashboard list. Headers are unselectable; the
 /// selection model lives in main.rs and skips past `HostHeader` and
@@ -42,6 +42,27 @@ pub enum DisplayRow {
     /// which copy the user is on via `(SessionId, in_favorites: bool)`
     /// and prefers the matching kind on re-seat.
     FavoriteSessionRow(usize),
+    /// Index into the `placeholders` slice for a favorited session that
+    /// isn't in the live catalog yet — rendered as a dimmed
+    /// "unconfirmed" row inside the favorites group so a favorite
+    /// doesn't vanish while its host is still connecting (or is
+    /// offline). Replaced by a [`Self::FavoriteSessionRow`] once
+    /// discovery surfaces the real session. See [`FavoritePlaceholder`].
+    FavoritePlaceholderRow(usize),
+}
+
+/// A favorited session that isn't currently present in the live
+/// catalog. Built from the `FavoritesStore`'s cached metadata so the
+/// pinned favorites group can render the row even before (or without)
+/// the live session — decoupling favorites visibility from catalog
+/// presence. `main.rs` recomputes the placeholder list each frame from
+/// the store; the index in [`DisplayRow::FavoritePlaceholderRow`] is
+/// into that per-frame slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FavoritePlaceholder {
+    pub host: HostId,
+    pub id: SessionId,
+    pub title: Option<String>,
 }
 
 /// Group `sessions` by host (local first, SSH hosts alphabetical),
@@ -55,7 +76,7 @@ pub enum DisplayRow {
 /// when a new host is added.
 #[must_use]
 pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
-    build_display_rows_filtered(sessions, |_| true, |_| false)
+    build_display_rows_filtered(sessions, &[], |_| true, |_| false)
 }
 
 /// Like [`build_display_rows`] but emits rows only for sessions where
@@ -87,9 +108,17 @@ pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
 /// surprises users more than it helps; the favorites group simply
 /// shrinks (possibly to empty, taking its header with it) under a
 /// narrow query.
+///
+/// `placeholders` are favorited sessions with no live catalog entry
+/// (host still connecting, or offline); each becomes a
+/// [`DisplayRow::FavoritePlaceholderRow`] appended after the live
+/// favorite rows. They are passed in already search-filtered (the
+/// caller owns the placeholder list), so the group header appears when
+/// *either* a live favorite or a placeholder survives.
 #[must_use]
 pub fn build_display_rows_filtered<F, G>(
     sessions: &[Session],
+    placeholders: &[FavoritePlaceholder],
     include: F,
     is_favorite: G,
 ) -> Vec<DisplayRow>
@@ -99,21 +128,26 @@ where
 {
     let mut rows = Vec::new();
 
-    // Pinned favorites group first. Recency desc across all favorited
-    // sessions; the `is_favorite` predicate also passes through
-    // `include` so the search filter applies symmetrically (per the
-    // spec's resolved "favorites obey the filter" decision).
+    // Pinned favorites group first. Live favorites (recency desc across
+    // all hosts) lead, then the placeholder rows for favorites whose
+    // session isn't in the catalog yet. The `is_favorite` predicate
+    // passes through `include` so the search filter applies
+    // symmetrically (per the spec's resolved "favorites obey the
+    // filter" decision); placeholders arrive pre-filtered.
     let mut favorite_idxs: Vec<usize> = sessions
         .iter()
         .enumerate()
         .filter(|(i, _)| include(*i) && is_favorite(*i))
         .map(|(i, _)| i)
         .collect();
-    if !favorite_idxs.is_empty() {
-        favorite_idxs.sort_by(|&a, &b| sessions[b].last_activity.cmp(&sessions[a].last_activity));
+    favorite_idxs.sort_by(|&a, &b| sessions[b].last_activity.cmp(&sessions[a].last_activity));
+    if !favorite_idxs.is_empty() || !placeholders.is_empty() {
         rows.push(DisplayRow::FavoritesHeader);
         for i in favorite_idxs {
             rows.push(DisplayRow::FavoriteSessionRow(i));
+        }
+        for i in 0..placeholders.len() {
+            rows.push(DisplayRow::FavoritePlaceholderRow(i));
         }
     }
 
@@ -374,14 +408,18 @@ fn walk_session_index(current: Option<usize>, rows: &[DisplayRow], step: isize) 
 
 /// Whether `row` accepts selection / Enter dispatch. Today: sessions
 /// (in either the pinned favorites group or the natural host/project
-/// group) and tool launches. Headers (host, project, tools,
-/// favorites) are skipped by j/k navigation so the cursor never lands
-/// on a non-actionable line.
+/// group), favorite placeholders (so the user can land on one to
+/// dismiss it with the favorite keybind), and tool launches. Headers
+/// (host, project, tools, favorites) are skipped by j/k navigation so
+/// the cursor never lands on a non-actionable line.
 #[must_use]
 fn is_selectable(row: &DisplayRow) -> bool {
     matches!(
         row,
-        DisplayRow::SessionRow(_) | DisplayRow::FavoriteSessionRow(_) | DisplayRow::ToolRow(_)
+        DisplayRow::SessionRow(_)
+            | DisplayRow::FavoriteSessionRow(_)
+            | DisplayRow::FavoritePlaceholderRow(_)
+            | DisplayRow::ToolRow(_)
     )
 }
 
@@ -460,7 +498,9 @@ pub fn anchor_header_for_selection(rows: &[DisplayRow], selected: usize) -> Opti
     let row = rows.get(selected)?;
     let predicate: fn(&DisplayRow) -> bool = match row {
         DisplayRow::SessionRow(_) => |r| matches!(r, DisplayRow::ProjectHeader(_)),
-        DisplayRow::FavoriteSessionRow(_) => |r| matches!(r, DisplayRow::FavoritesHeader),
+        DisplayRow::FavoriteSessionRow(_) | DisplayRow::FavoritePlaceholderRow(_) => {
+            |r| matches!(r, DisplayRow::FavoritesHeader)
+        }
         DisplayRow::ToolRow(_) => |r| matches!(r, DisplayRow::ToolsHeader),
         DisplayRow::HostHeader(_)
         | DisplayRow::ProjectHeader(_)
@@ -578,7 +618,7 @@ mod tests {
     where
         G: Fn(usize) -> bool,
     {
-        build_display_rows_filtered(sessions, |_| true, is_favorite)
+        build_display_rows_filtered(sessions, &[], |_| true, is_favorite)
             .into_iter()
             .map(|r| match r {
                 DisplayRow::HostHeader(host) => format!("H:{host}"),
@@ -588,6 +628,7 @@ mod tests {
                 DisplayRow::ToolRow(i) => format!("T:{i}"),
                 DisplayRow::FavoritesHeader => "FH".to_string(),
                 DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
+                DisplayRow::FavoritePlaceholderRow(i) => format!("FP:{i}"),
             })
             .collect()
     }
@@ -801,6 +842,7 @@ mod tests {
         let q = "keep";
         let rows = build_display_rows_filtered(
             &s,
+            &[],
             |i| matches_query(&s[i], q),
             |_| true, // both favorited
         );
@@ -825,7 +867,7 @@ mod tests {
             session("c", "local", "/p", 10),
         ];
         let favs = std::collections::HashSet::from([1usize]);
-        let rows = build_display_rows_filtered(&s, |_| true, |i| favs.contains(&i));
+        let rows = build_display_rows_filtered(&s, &[], |_| true, |i| favs.contains(&i));
         let favorite_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {
@@ -834,6 +876,49 @@ mod tests {
             })
             .collect();
         assert_eq!(favorite_rows, vec![1]);
+    }
+
+    #[test]
+    fn favorites_group_appends_placeholders_after_live_favorites() {
+        // A favorited session that's live renders as a normal favorite
+        // row; a favorited session with no live catalog entry renders
+        // as a placeholder appended after it — so neither vanishes.
+        let s = vec![session("a", "local", "/p", 0)];
+        let placeholders = vec![FavoritePlaceholder {
+            host: HostId("alpenglow".into()),
+            id: SessionId("gone".into()),
+            title: Some("Remote work".into()),
+        }];
+        let favs = std::collections::HashSet::from([0usize]);
+        let rows = build_display_rows_filtered(&s, &placeholders, |_| true, |i| favs.contains(&i));
+        assert_eq!(rows[0], DisplayRow::FavoritesHeader);
+        assert_eq!(rows[1], DisplayRow::FavoriteSessionRow(0));
+        assert_eq!(rows[2], DisplayRow::FavoritePlaceholderRow(0));
+    }
+
+    #[test]
+    fn favorites_header_appears_when_only_placeholders_exist() {
+        // No live favorites at all, just one offline favorite. The
+        // group (header + placeholder) must still render rather than
+        // letting the favorite disappear until its host reconnects.
+        let s = vec![session("a", "local", "/p", 0)];
+        let placeholders = vec![FavoritePlaceholder {
+            host: HostId("alpenglow".into()),
+            id: SessionId("gone".into()),
+            title: None,
+        }];
+        let rows = build_display_rows_filtered(&s, &placeholders, |_| true, |_| false);
+        assert_eq!(rows[0], DisplayRow::FavoritesHeader);
+        assert_eq!(rows[1], DisplayRow::FavoritePlaceholderRow(0));
+    }
+
+    #[test]
+    fn no_favorites_and_no_placeholders_produces_no_favorites_header() {
+        // Guard the empty case: an empty favorites set and no
+        // placeholders must not emit a bare `── favorites ──` header.
+        let s = vec![session("a", "local", "/p", 0)];
+        let rows = build_display_rows_filtered(&s, &[], |_| true, |_| false);
+        assert!(!rows.contains(&DisplayRow::FavoritesHeader));
     }
 
     #[test]
@@ -923,7 +1008,7 @@ mod tests {
     #[test]
     fn anchor_header_for_favorite_session_returns_favorites_header() {
         let s = vec![session("a", "local", "/p", 0)];
-        let rows = build_display_rows_filtered(&s, |_| true, |_| true);
+        let rows = build_display_rows_filtered(&s, &[], |_| true, |_| true);
         // Layout: FH(0) F:a(1) H:local(2) P:/p(3) S:a(4)
         assert_eq!(anchor_header_for_selection(&rows, 1), Some(0));
         // The natural-group SessionRow still anchors to its ProjectHeader.
@@ -1079,18 +1164,24 @@ mod tests {
 
     fn filtered_layout(sessions: &[Session], query: &str) -> Vec<String> {
         let q = query.to_lowercase();
-        build_display_rows_filtered(sessions, |i| matches_query(&sessions[i], &q), |_| false)
-            .into_iter()
-            .map(|r| match r {
-                DisplayRow::HostHeader(host) => format!("H:{host}"),
-                DisplayRow::ProjectHeader(path) => format!("P:{}", path.display()),
-                DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
-                DisplayRow::ToolsHeader => "TH:tools".to_string(),
-                DisplayRow::ToolRow(i) => format!("T:{i}"),
-                DisplayRow::FavoritesHeader => "FH".to_string(),
-                DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
-            })
-            .collect()
+        build_display_rows_filtered(
+            sessions,
+            &[],
+            |i| matches_query(&sessions[i], &q),
+            |_| false,
+        )
+        .into_iter()
+        .map(|r| match r {
+            DisplayRow::HostHeader(host) => format!("H:{host}"),
+            DisplayRow::ProjectHeader(path) => format!("P:{}", path.display()),
+            DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
+            DisplayRow::ToolsHeader => "TH:tools".to_string(),
+            DisplayRow::ToolRow(i) => format!("T:{i}"),
+            DisplayRow::FavoritesHeader => "FH".to_string(),
+            DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
+            DisplayRow::FavoritePlaceholderRow(i) => format!("FP:{i}"),
+        })
+        .collect()
     }
 
     #[test]
@@ -1142,7 +1233,7 @@ mod tests {
             session_with_title("b", "local", "/p", 1, Some("keep me")),
         ];
         let q = "keep";
-        let rows = build_display_rows_filtered(&s, |i| matches_query(&s[i], q), |_| false);
+        let rows = build_display_rows_filtered(&s, &[], |i| matches_query(&s[i], q), |_| false);
         let session_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {

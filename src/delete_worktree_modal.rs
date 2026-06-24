@@ -203,6 +203,7 @@ mod tests {
             parent_repo: Some(PathBuf::from("/work/proj")),
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 

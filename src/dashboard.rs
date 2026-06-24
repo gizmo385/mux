@@ -599,6 +599,7 @@ mod tests {
             parent_repo: parent_repo.map(PathBuf::from),
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 

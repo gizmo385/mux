@@ -4,7 +4,7 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Features
 
-- **One dashboard for every Claude Code session you have running** — locally and on any SSH-reachable host you've configured. Sessions group by host, then by project. Each row shows live attention state (● needs-input, ◐ working, ○ idle), title, and time since last activity.
+- **One dashboard for every Claude Code session you have running** — locally and on any SSH-reachable host you've configured. Sessions group by host, then by project. Each row shows live attention state (◆ blocked on a prompt, ● needs-input/done, ◐ working, ○ idle), title, and time since last activity. The ◆ blocked glyph distinguishes "the agent is waiting on your answer to a permission/elicitation prompt" from a plain ● "finished its turn" — it requires the `Notification` hook (below), since the transcript alone can't tell the two apart.
 - **Attach without leaving the dashboard.** Pressing Enter hosts the active session inside an embedded terminal pane next to the sidebar: you see tmux + Claude Code on the right, the live session list on the left, and the sidebar keeps updating other sessions' attention state while you work. `--no-embed` reverts to the legacy "take over the whole terminal" behaviour for users who prefer it.
 - **Create new sessions from inside the dashboard.** Press `n` to pick a repo, name a task, and pick a base branch — agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/`, writes task metadata, and launches `claude` inside it. Press `N` instead to skip the worktree step and open `claude` straight in the repo root (for quick exploratory chats where a fresh worktree would just be in the way). Either way, the new session lands in the embedded pane next to the sidebar, not a fullscreen handoff. Works equally for local and remote-host repos.
 - **Search / filter** the session list by title, project, or host with `/`.
@@ -143,7 +143,7 @@ agent-mux install-hooks
 
 That edits `~/.claude/settings.json` to register `agent-mux hook` as a Notification handler, pointing at the binary that ran the command (resolved via `current_exe()`). It's idempotent — re-running it is a no-op when the entry is already there, and it updates the path in place if you've moved or reinstalled the binary. Your existing settings (theme, permissions, other hook types) are preserved; a one-time backup lands at `~/.claude/settings.json.bak` before the first write. Use `--dry-run` to preview the change without writing.
 
-Behind the scenes: the hook command writes a marker file under `<Claude Code transcripts root>/.agent-mux-hooks/` (typically `~/.claude/projects/.agent-mux-hooks/`); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification.
+Behind the scenes: the hook command writes a marker file under `<Claude Code transcripts root>/.agent-mux-hooks/` (typically `~/.claude/projects/.agent-mux-hooks/`); the running dashboard watches that directory and forces the affected session into `NeedsInput`, firing a notification. The hook's `notification_type` also drives the ◆ blocked glyph: `permission_prompt` and `elicitation_dialog` render as ◆ ("answer me"), while an idle nudge and the transcript heuristic stay ● ("done"). Both fire the same notification.
 
 To verify your wiring without waiting for a real permission prompt: run `agent-mux notify-test` to confirm the dispatcher fires end-to-end, then trigger any permission prompt in a Claude Code session and watch the dashboard.
 

@@ -96,4 +96,21 @@ pub struct Session {
     /// Not serialized into the disk cache: the hook signal is
     /// ephemeral and the cache only seeds first-frame display.
     pub hook_pinned: Option<SystemTime>,
+    /// Whether the session's current `NeedsInput` is a Claude Code
+    /// *blocking prompt* — a permission request or an elicitation
+    /// dialog where the agent is actively waiting on the user's answer
+    /// — as opposed to simply having finished its turn ("done"). Set by
+    /// the `Notification`-hook ingest (only `permission_prompt` /
+    /// `elicitation_dialog` flip it true; `idle_prompt` and the
+    /// transcript heuristic leave it false), and cleared the moment the
+    /// heuristic re-applies (transcript progressed past the prompt). The
+    /// sidebar renders a distinct glyph when this is set *and* the
+    /// session reads `NeedsInput`, so the user can tell "answer me" from
+    /// "done" at a glance.
+    ///
+    /// Only meaningful while `attention == NeedsInput`; the display
+    /// gates on that, so a stale `true` left over after the state moved
+    /// on never mis-renders. Ephemeral like `hook_pinned`: not
+    /// serialized into the disk cache (the live hook re-establishes it).
+    pub blocking_prompt: bool,
 }

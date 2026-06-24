@@ -147,6 +147,7 @@ impl CachedSession {
             // would be stale before the user could read it.
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 }
@@ -207,6 +208,7 @@ mod tests {
             parent_repo: Some(PathBuf::from(format!("/repos/{id}"))),
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 

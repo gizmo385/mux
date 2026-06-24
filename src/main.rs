@@ -1634,13 +1634,20 @@ impl App {
                         );
                     }
                 }
-                WatcherEvent::Hook { id, received_at } => {
+                WatcherEvent::Hook {
+                    id,
+                    received_at,
+                    blocking_prompt,
+                } => {
                     // A Claude Code Notification hook fired for `id`.
                     // Force NeedsInput regardless of what the
                     // heuristic last derived (the typical case is a
                     // permission prompt during a tool_use that the
-                    // heuristic was reporting as Working). Pinning is
-                    // handled inside apply_hook_event.
+                    // heuristic was reporting as Working). `blocking_prompt`
+                    // distinguishes a permission/elicitation prompt from
+                    // an idle nudge for the sidebar glyph; the
+                    // notification fires for both. Pinning is handled
+                    // inside apply_hook_event.
                     //
                     // `received_at` flows through to the notifier as
                     // `source_at` so the startup-replay gate can drop
@@ -1648,7 +1655,9 @@ impl App {
                     // — the catalog still applies the transition, but
                     // a stack of pre-launch hook events doesn't fire
                     // a stack of OS toasts at the user.
-                    let prev = self.catalog.apply_hook_event(&id, received_at);
+                    let prev = self
+                        .catalog
+                        .apply_hook_event(&id, blocking_prompt, received_at);
                     if let Some(prev) = prev {
                         self.fire_attention_notification(
                             &id,
@@ -3613,7 +3622,19 @@ fn format_session_row(
     in_favorites_group: bool,
 ) -> Line<'static> {
     let attention = effective_attention(session);
-    let glyph = attention_glyph(attention);
+    // A hook-confirmed blocking prompt (permission / elicitation) reads
+    // as a distinct glyph so "answer me" looks different from a finished
+    // turn ("done"). Gated on the session actually reading NeedsInput,
+    // so a stale flag — or the idle overlay demoting the state after an
+    // hour — never mis-renders. Colour stays the needs_input colour
+    // (attention is NeedsInput here); a dedicated `[theme.blocked]` is
+    // filed in TODO.
+    let blocked = session.blocking_prompt && attention == Attention::NeedsInput;
+    let glyph = if blocked {
+        BLOCKED_GLYPH
+    } else {
+        attention_glyph(attention)
+    };
     let age = humanize_elapsed(session.last_activity);
     let dim = Style::new().add_modifier(Modifier::DIM);
     let glyph_style = apply_fg(Style::new(), attention_color(attention, theme));
@@ -3705,6 +3726,12 @@ fn attention_glyph(a: Attention) -> &'static str {
         Attention::Unknown => "·",
     }
 }
+
+/// Glyph for a session whose `NeedsInput` is a hook-confirmed blocking
+/// prompt (permission / elicitation) — the agent is waiting on a
+/// specific answer. Distinct from the plain `NeedsInput` `●` ("done /
+/// waiting") so the two read apart at a glance. See `Session::blocking_prompt`.
+const BLOCKED_GLYPH: &str = "◆";
 
 fn display_path(path: &Path, home: Option<&Path>) -> String {
     if let Some(h) = home
@@ -3891,6 +3918,7 @@ mod tests {
             parent_repo: None,
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 
@@ -4833,6 +4861,7 @@ mod tests {
             parent_repo: None,
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 

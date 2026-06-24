@@ -85,6 +85,12 @@ impl SessionCatalog {
                 }
                 let previous = session.attention;
                 session.attention = attention;
+                // The heuristic is transcript-truth and can never mean
+                // "blocking prompt" (a transcript-derived NeedsInput is
+                // a finished turn, i.e. "done"). Any prior blocking
+                // prompt is resolved once the transcript moves past it,
+                // so clear the flag whenever the heuristic applies.
+                session.blocking_prompt = false;
                 return Some(previous);
             }
         }
@@ -99,6 +105,15 @@ impl SessionCatalog {
     /// [`SessionCatalog::update_attention`] so the caller can fire a
     /// notifier transition.
     ///
+    /// `blocking_prompt` distinguishes a permission/elicitation prompt
+    /// (the agent is actively waiting on an answer — `true`) from an
+    /// idle nudge (`false`); it drives the sidebar's "answer me" vs
+    /// "done" glyph but not the notification, which fires for both. The
+    /// flag is overwritten on every hook event (a later `idle_prompt`
+    /// for a session that was permission-blocked downgrades it) and
+    /// cleared by [`SessionCatalog::apply_heuristic_attention`] once the
+    /// transcript progresses.
+    ///
     /// Idempotent across rapid repeat hook events: each call just
     /// re-pins the timestamp and re-asserts `NeedsInput`; the
     /// notifier's episodic-flag suppression collapses the duplicate
@@ -106,12 +121,14 @@ impl SessionCatalog {
     pub fn apply_hook_event(
         &mut self,
         id: &SessionId,
+        blocking_prompt: bool,
         received_at: SystemTime,
     ) -> Option<Attention> {
         for session in &mut self.sessions {
             if session.id == *id {
                 let previous = session.attention;
                 session.attention = Attention::NeedsInput;
+                session.blocking_prompt = blocking_prompt;
                 session.hook_pinned = Some(received_at);
                 return Some(previous);
             }
@@ -248,6 +265,7 @@ mod tests {
             parent_repo: None,
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 
@@ -507,7 +525,7 @@ mod tests {
         let mut s = session("a");
         s.attention = Attention::Working;
         c.add(s);
-        let prev = c.apply_hook_event(&SessionId("a".into()), at(100));
+        let prev = c.apply_hook_event(&SessionId("a".into()), false, at(100));
         assert_eq!(prev, Some(Attention::Working));
         let s = &c.sessions()[0];
         assert_eq!(s.attention, Attention::NeedsInput);
@@ -518,7 +536,7 @@ mod tests {
     fn apply_hook_event_returns_none_for_unknown_session() {
         let mut c = SessionCatalog::new();
         assert!(
-            c.apply_hook_event(&SessionId("ghost".into()), at(0))
+            c.apply_hook_event(&SessionId("ghost".into()), false, at(0))
                 .is_none()
         );
     }
@@ -531,7 +549,7 @@ mod tests {
         // but we want to stay in NeedsInput.
         let mut c = SessionCatalog::new();
         c.add(session("a"));
-        c.apply_hook_event(&SessionId("a".into()), at(10));
+        c.apply_hook_event(&SessionId("a".into()), false, at(10));
         let prev =
             c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(8)));
         assert_eq!(prev, None, "stale heuristic update must be suppressed");
@@ -548,7 +566,7 @@ mod tests {
         // heuristic is authoritative again.
         let mut c = SessionCatalog::new();
         c.add(session("a"));
-        c.apply_hook_event(&SessionId("a".into()), at(10));
+        c.apply_hook_event(&SessionId("a".into()), false, at(10));
         let prev =
             c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(20)));
         assert_eq!(prev, Some(Attention::NeedsInput));
@@ -571,13 +589,46 @@ mod tests {
     }
 
     #[test]
+    fn apply_hook_event_sets_blocking_prompt_and_heuristic_clears_it() {
+        // A permission/elicitation hook flips `blocking_prompt` so the
+        // sidebar can show "answer me"; once the transcript advances
+        // past the prompt the heuristic re-applies and clears it back
+        // to "done". Pins both ends so the glyph never sticks on.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), true, at(10));
+        assert!(
+            c.sessions()[0].blocking_prompt,
+            "blocking hook must set the flag"
+        );
+        // Transcript advances past the pin → heuristic applies and
+        // clears the flag (a transcript-derived state is never blocking).
+        c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(20)));
+        assert!(
+            !c.sessions()[0].blocking_prompt,
+            "heuristic re-apply must clear blocking_prompt"
+        );
+    }
+
+    #[test]
+    fn apply_hook_event_idle_nudge_leaves_blocking_prompt_false() {
+        // An idle_prompt (blocking=false) still forces NeedsInput but
+        // must NOT light the "answer me" glyph — it's "done/waiting".
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), false, at(10));
+        assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
+        assert!(!c.sessions()[0].blocking_prompt);
+    }
+
+    #[test]
     fn apply_heuristic_attention_suppresses_when_pinned_and_event_mtime_is_none() {
         // Initial-prime events arrive without mtime — they shouldn't
         // be able to clear a pin (we'd be guessing the transcript has
         // progressed). Suppress.
         let mut c = SessionCatalog::new();
         c.add(session("a"));
-        c.apply_hook_event(&SessionId("a".into()), at(10));
+        c.apply_hook_event(&SessionId("a".into()), false, at(10));
         let prev = c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, None);
         assert_eq!(prev, None);
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);

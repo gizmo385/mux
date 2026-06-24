@@ -70,6 +70,10 @@ pub enum WatcherEvent {
     Hook {
         id: SessionId,
         received_at: SystemTime,
+        /// Whether this hook is a blocking prompt (`permission_prompt` /
+        /// `elicitation_dialog`) rather than an idle nudge — drives the
+        /// session's `blocking_prompt` flag for the "answer me" glyph.
+        blocking_prompt: bool,
     },
     /// Snapshot of every live tmux pane on `host`: `cwds` carries
     /// each pane's `pane_current_path`, `session_names` carries each
@@ -485,6 +489,7 @@ fn poll_hooks_once(host: &dyn Host, hooks_dir: &Path, tx: &Sender<WatcherEvent>)
             .send(WatcherEvent::Hook {
                 id: event.session_id,
                 received_at: event.received_at,
+                blocking_prompt: event.blocking_prompt,
             })
             .is_err()
         {

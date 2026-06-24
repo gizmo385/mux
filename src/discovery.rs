@@ -250,6 +250,7 @@ fn assemble_session(
         parent_repo,
         has_live_pane: None,
         hook_pinned: None,
+        blocking_prompt: false,
     })
 }
 

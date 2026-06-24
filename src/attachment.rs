@@ -1218,6 +1218,7 @@ mod tests {
             parent_repo: None,
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 
@@ -1731,6 +1732,7 @@ mod tests {
             parent_repo: None,
             has_live_pane: None,
             hook_pinned: None,
+            blocking_prompt: false,
         }
     }
 

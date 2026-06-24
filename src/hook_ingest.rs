@@ -42,9 +42,14 @@
 //! - Auto-installing the hook into `~/.claude/settings.json`. Phase 1
 //!   asks the user to edit it themselves; a dedicated `agent-mux
 //!   install-hooks` subcommand is filed under TODO.
-//! - Matcher differentiation (`permission_prompt` vs `idle_prompt`).
-//!   Any Notification event for a known `session_id` fires
-//!   `NeedsInput` today.
+//!
+//! ## Blocking-prompt classification
+//!
+//! Every ingested event fires `NeedsInput`. The `notification_type` is
+//! also classified ([`is_blocking_prompt`]) into "blocking prompt"
+//! (`permission_prompt` / `elicitation_dialog`) vs "idle nudge", which
+//! drives the sidebar's "answer me" vs "done" glyph — but not whether a
+//! notification fires (both do).
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -97,9 +102,15 @@ pub fn fallback_hook_dir() -> Option<PathBuf> {
 pub struct HookEvent {
     pub session_id: SessionId,
     pub received_at: SystemTime,
+    /// Whether this event is a *blocking prompt* (`permission_prompt` /
+    /// `elicitation_dialog`) — the agent is waiting on a specific
+    /// answer — versus an idle nudge or an unlabelled event. Drives the
+    /// session's `blocking_prompt` flag and the sidebar's "answer me"
+    /// glyph; does not change whether a notification fires.
+    pub blocking_prompt: bool,
     /// The raw payload as it landed on stdin (or whatever the subset
-    /// of fields the subcommand chose to persist). Today we only care
-    /// about `session_id`; carried so future readers can extract more.
+    /// of fields the subcommand chose to persist). Carried so future
+    /// readers can extract more without changing the marker format.
     pub raw_json: String,
 }
 
@@ -201,6 +212,25 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
 ///   noise.
 const INPUT_REQUIRED_NOTIFICATION_TYPES: &[&str] =
     &["permission_prompt", "idle_prompt", "elicitation_dialog"];
+
+/// The subset of input-required types that mean the agent is *blocked
+/// waiting on a specific answer* (a permission request or an
+/// elicitation dialog), as distinct from an idle nudge. These flip the
+/// session's `blocking_prompt` so the sidebar shows an "answer me"
+/// glyph instead of the generic "done / waiting" one. `idle_prompt`
+/// and an unlabelled event stay `false`: input is wanted, but it's not
+/// a blocking question.
+const BLOCKING_PROMPT_NOTIFICATION_TYPES: &[&str] = &["permission_prompt", "elicitation_dialog"];
+
+/// True iff `notification_type` denotes a blocking prompt (see
+/// [`BLOCKING_PROMPT_NOTIFICATION_TYPES`]). A missing/unknown type is
+/// `false` — we know input is wanted (it passed the input-required
+/// filter) but not that the agent is blocked on a specific answer, so
+/// the conservative display is the generic "done" glyph.
+#[must_use]
+fn is_blocking_prompt(notification_type: Option<&str>) -> bool {
+    notification_type.is_some_and(|t| BLOCKING_PROMPT_NOTIFICATION_TYPES.contains(&t))
+}
 
 /// True iff `notification_type` should fire a `NeedsInput` notification.
 /// A missing value (`None`) is treated as input-required: an unknown
@@ -337,6 +367,7 @@ pub fn parse_marker_content(path: &Path, raw: &str) -> io::Result<HookEvent> {
     Ok(HookEvent {
         session_id: SessionId(session_id),
         received_at,
+        blocking_prompt: is_blocking_prompt(parse_notification_type(raw).as_deref()),
         raw_json: raw.to_string(),
     })
 }
@@ -417,6 +448,7 @@ fn ingest_marker(hook_dir: &Path, path: &Path, tx: &Sender<WatcherEvent>) {
     let _ = tx.send(WatcherEvent::Hook {
         id: event.session_id,
         received_at: event.received_at,
+        blocking_prompt: event.blocking_prompt,
     });
     let _ = fs::remove_file(path);
 }
@@ -541,6 +573,35 @@ mod tests {
             log.contains("notification_type=some_future_event") && log.contains("skipped"),
             "log shape: {log}"
         );
+    }
+
+    #[test]
+    fn is_blocking_prompt_only_true_for_permission_and_elicitation() {
+        // The "answer me" glyph fires only for prompts that block on a
+        // specific user answer. An idle nudge, an unknown type, or a
+        // missing field is "done/waiting", not blocked.
+        assert!(is_blocking_prompt(Some("permission_prompt")));
+        assert!(is_blocking_prompt(Some("elicitation_dialog")));
+        assert!(!is_blocking_prompt(Some("idle_prompt")));
+        assert!(!is_blocking_prompt(Some("auth_success")));
+        assert!(!is_blocking_prompt(None));
+    }
+
+    #[test]
+    fn parse_marker_content_sets_blocking_prompt_from_notification_type() {
+        let path = Path::new("/x/1700000000000-a.json");
+        let permission = parse_marker_content(
+            path,
+            r#"{"session_id":"a","notification_type":"permission_prompt"}"#,
+        )
+        .unwrap();
+        assert!(permission.blocking_prompt, "permission_prompt is blocking");
+        let idle = parse_marker_content(
+            path,
+            r#"{"session_id":"a","notification_type":"idle_prompt"}"#,
+        )
+        .unwrap();
+        assert!(!idle.blocking_prompt, "idle_prompt is not blocking");
     }
 
     #[test]

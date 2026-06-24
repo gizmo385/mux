@@ -216,9 +216,16 @@ fn assemble_session(
     if !project_dir_exists {
         return None;
     }
-    let task_title = task_toml_content
-        .and_then(|raw| worktree::parse_task_metadata(raw).ok())
-        .map(|m| m.task);
+    let task_meta = task_toml_content.and_then(|raw| worktree::parse_task_metadata(raw).ok());
+    let task_title = task_meta.as_ref().map(|m| m.task.clone());
+    // `started_at` (the "running <total>" cell) comes from the
+    // agent-mux task metadata's creation time. External sessions have
+    // no task.toml, so they get `None` and the cell is omitted —
+    // deriving a start from the first transcript entry's timestamp is a
+    // filed follow-up (it needs a date parser).
+    let started_at = task_meta
+        .as_ref()
+        .map(|m| SystemTime::UNIX_EPOCH + Duration::from_secs(m.created_at));
     // Stillborn-transcript filter. A transcript with no `task.toml`
     // task name, no `ai-title` entry, and no real first user message
     // is the "/clear-and-walked-away" case: Claude Code creates the
@@ -251,6 +258,11 @@ fn assemble_session(
         has_live_pane: None,
         hook_pinned: None,
         blocking_prompt: false,
+        // The session entered its current state around when the
+        // transcript last changed (exact for stopped states); live
+        // transitions re-stamp this in the catalog.
+        attention_entered_at: Some(mtime),
+        started_at,
     })
 }
 

@@ -3620,7 +3620,7 @@ fn format_session_row(
     name_override: Option<&str>,
     is_favorite: bool,
     in_favorites_group: bool,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let attention = effective_attention(session);
     // A hook-confirmed blocking prompt (permission / elicitation) reads
     // as a distinct glyph so "answer me" looks different from a finished
@@ -3635,7 +3635,6 @@ fn format_session_row(
     } else {
         attention_glyph(attention)
     };
-    let age = humanize_elapsed(session.last_activity);
     let dim = Style::new().add_modifier(Modifier::DIM);
     let glyph_style = apply_fg(Style::new(), attention_color(attention, theme));
     // Dim the entire title when the pane poller has confirmed no
@@ -3652,24 +3651,26 @@ fn format_session_row(
     // under `── favorites ──`), 4 spaces in the natural host/project
     // tree (two levels under the host header + project header).
     let indent = if in_favorites_group { "  " } else { "    " };
-    let mut spans = vec![Span::raw(indent)];
+
+    // ---- Line 1: (★) glyph + title ----
+    let mut l1 = vec![Span::raw(indent)];
     // ★ glyph appears on *both* copies of a favorited session — the
     // user reads "this is one of my pinned ones" the same way
-    // regardless of which copy they happen to be looking at. Dim
-    // styling keeps it out of the attention-glyph's hierarchy.
+    // regardless of which copy they're looking at. Dim styling keeps
+    // it out of the attention-glyph's hierarchy.
     if is_favorite {
-        spans.push(Span::styled("★ ", dim));
+        l1.push(Span::styled("★ ", dim));
     }
-    spans.push(Span::styled(glyph, glyph_style));
-    spans.push(Span::raw(" "));
+    l1.push(Span::styled(glyph, glyph_style));
+    l1.push(Span::raw(" "));
     // User overrides take precedence over both `aiTitle` and the
     // task-toml-derived title (the 2026-05-21 rename feature). A
     // newly-arriving AI title does *not* clobber the override — once
     // the user named something, they meant it.
     if let Some(name) = name_override {
-        spans.push(Span::styled(name.to_string(), title_style));
+        l1.push(Span::styled(name.to_string(), title_style));
     } else if let Some(title) = &session.title {
-        spans.push(Span::styled(title.clone(), title_style));
+        l1.push(Span::styled(title.clone(), title_style));
     } else {
         let id = &session.id.0;
         let suffix = if id.len() > 6 {
@@ -3677,22 +3678,33 @@ fn format_session_row(
         } else {
             id.as_str()
         };
-        // Title-less rows are already dim; the live-pane signal would
-        // be invisible on top, so keep the existing styling.
-        spans.push(Span::styled(format!("({suffix})"), dim));
+        l1.push(Span::styled(format!("({suffix})"), dim));
     }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(age, dim));
-    // Favorites group spans hosts (`recency desc across all hosts`),
-    // so the host label is otherwise invisible — the natural tree's
-    // `── local ──` / `── alpenglow ──` header doesn't apply here.
-    // Append it inline so the user can tell two same-titled sessions
-    // on different hosts apart.
+
+    // ---- Line 2 (dim): state, time-in-state, running <total> (· host) ----
+    // The whole status line is dim — the glyph on line 1 already
+    // carries the attention colour, so the detail line stays calm.
+    let mut status = attention_word(attention, blocked).to_string();
+    if let Some(in_state) = session.attention_entered_at.and_then(compact_elapsed) {
+        status.push(' ');
+        status.push_str(&in_state);
+    }
+    if let Some(total) = session.started_at.and_then(compact_elapsed) {
+        status.push_str(" · running ");
+        status.push_str(&total);
+    }
+    // The favorites group spans hosts (recency-desc across all hosts),
+    // so the host label — carried by the `── local ──` header in the
+    // natural tree — goes inline here instead.
     if in_favorites_group {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!("[{}]", session.host), dim));
+        status.push_str(" · [");
+        status.push_str(session.host.as_str());
+        status.push(']');
     }
-    Line::from(spans)
+    // Status nests one column past line 1's glyph.
+    let l2 = vec![Span::raw(format!("{indent}  ")), Span::styled(status, dim)];
+
+    vec![Line::from(l1), Line::from(l2)]
 }
 
 /// Theme lookup for the attention-state glyph colour. Returns `None`
@@ -3733,6 +3745,21 @@ fn attention_glyph(a: Attention) -> &'static str {
 /// waiting") so the two read apart at a glance. See `Session::blocking_prompt`.
 const BLOCKED_GLYPH: &str = "◆";
 
+/// Human word for a session's display state, shown on the sidebar's
+/// second line. A hook-confirmed blocking prompt reads as `blocked`
+/// rather than the plain `NeedsInput` `done`.
+fn attention_word(a: Attention, blocked: bool) -> &'static str {
+    if blocked && a == Attention::NeedsInput {
+        return "blocked";
+    }
+    match a {
+        Attention::NeedsInput => "done",
+        Attention::Working => "working",
+        Attention::Idle => "idle",
+        Attention::Unknown => "—",
+    }
+}
+
 fn display_path(path: &Path, home: Option<&Path>) -> String {
     if let Some(h) = home
         && let Ok(suffix) = path.strip_prefix(h)
@@ -3756,6 +3783,23 @@ fn humanize_elapsed(t: SystemTime) -> String {
     } else {
         format!("{}d ago", secs / 86400)
     }
+}
+
+/// Compact elapsed since `t` with no "ago" suffix — "5s", "18m", "3h",
+/// "2d" — for the sidebar's duration cells. `None` when `t` is in the
+/// future (clock skew), so the caller omits the cell rather than
+/// printing a bogus "0s".
+fn compact_elapsed(t: SystemTime) -> Option<String> {
+    let secs = t.elapsed().ok()?.as_secs();
+    Some(if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    })
 }
 
 #[cfg(test)]
@@ -3919,6 +3963,8 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            attention_entered_at: None,
+            started_at: None,
         }
     }
 
@@ -4862,6 +4908,8 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            attention_entered_at: None,
+            started_at: None,
         }
     }
 
@@ -5166,6 +5214,102 @@ mod tests {
         let bare = FavoriteMeta::default();
         assert!(placeholder_matches_query(&host, &id, &bare, "abc123"));
         assert!(!placeholder_matches_query(&host, &id, &bare, "deploy"));
+    }
+
+    // ---- session row rendering ----
+
+    fn line_text(line: &ratatui::text::Line) -> String {
+        line.spans.iter().map(|sp| sp.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn attention_word_maps_states_including_blocked() {
+        assert_eq!(attention_word(Attention::NeedsInput, true), "blocked");
+        assert_eq!(attention_word(Attention::NeedsInput, false), "done");
+        assert_eq!(attention_word(Attention::Working, false), "working");
+        assert_eq!(attention_word(Attention::Idle, false), "idle");
+        assert_eq!(attention_word(Attention::Unknown, false), "—");
+        // `blocked` only applies to NeedsInput — a stray flag on
+        // another state must not relabel it.
+        assert_eq!(attention_word(Attention::Working, true), "working");
+    }
+
+    #[test]
+    fn compact_elapsed_formats_and_skips_future() {
+        let now = SystemTime::now();
+        assert_eq!(
+            compact_elapsed(now - Duration::from_secs(5)).as_deref(),
+            Some("5s")
+        );
+        assert_eq!(
+            compact_elapsed(now - Duration::from_secs(90)).as_deref(),
+            Some("1m")
+        );
+        assert_eq!(
+            compact_elapsed(now - Duration::from_hours(3)).as_deref(),
+            Some("3h")
+        );
+        assert_eq!(
+            compact_elapsed(now - Duration::from_hours(48)).as_deref(),
+            Some("2d")
+        );
+        // Future time (clock skew) → None so the caller omits the cell.
+        assert_eq!(compact_elapsed(now + Duration::from_mins(1)), None);
+    }
+
+    #[test]
+    fn format_session_row_is_two_lines_with_state_and_durations() {
+        let now = SystemTime::now();
+        let mut s = mock_session("abc");
+        s.title = Some("refactor parser".into());
+        s.attention = Attention::Working;
+        s.last_activity = now; // keep effective_attention out of the idle overlay
+        s.attention_entered_at = Some(now - Duration::from_mins(18)); // 18m
+        s.started_at = Some(now - Duration::from_mins(45)); // running 45m
+        let lines = format_session_row(&s, &Theme::default(), None, false, false);
+        assert_eq!(lines.len(), 2, "session rows are two lines now");
+        let l1 = line_text(&lines[0]);
+        let l2 = line_text(&lines[1]);
+        assert!(
+            l1.contains("refactor parser"),
+            "line 1 has the title: {l1:?}"
+        );
+        assert!(l2.contains("working"), "line 2 names the state: {l2:?}");
+        assert!(l2.contains("18m"), "line 2 shows time-in-state: {l2:?}");
+        assert!(l2.contains("running 45m"), "line 2 shows total age: {l2:?}");
+    }
+
+    #[test]
+    fn format_session_row_blocked_uses_diamond_and_word() {
+        let now = SystemTime::now();
+        let mut s = mock_session("abc");
+        s.title = Some("deploy".into());
+        s.attention = Attention::NeedsInput;
+        s.blocking_prompt = true;
+        s.last_activity = now;
+        s.attention_entered_at = Some(now - Duration::from_mins(2));
+        let lines = format_session_row(&s, &Theme::default(), None, false, false);
+        let l1 = line_text(&lines[0]);
+        let l2 = line_text(&lines[1]);
+        assert!(l1.contains(BLOCKED_GLYPH), "blocked row uses ◆: {l1:?}");
+        assert!(l2.contains("blocked"), "line 2 says blocked: {l2:?}");
+    }
+
+    #[test]
+    fn format_session_row_omits_total_when_no_start_time() {
+        let now = SystemTime::now();
+        let mut s = mock_session("abc");
+        s.title = Some("external chat".into());
+        s.attention = Attention::NeedsInput;
+        s.last_activity = now;
+        s.attention_entered_at = Some(now - Duration::from_mins(1));
+        s.started_at = None; // e.g. externally-started session, no task.toml
+        let l2 = line_text(&format_session_row(&s, &Theme::default(), None, false, false)[1]);
+        assert!(l2.contains("done"), "still names the state: {l2:?}");
+        assert!(
+            !l2.contains("running"),
+            "no total without a start time: {l2:?}"
+        );
     }
 
     // ---- compose_sidebar_title ----

@@ -105,6 +105,13 @@ struct CachedSession {
     /// refreshes them with the actual parent.
     #[serde(default)]
     parent_repo: Option<PathBuf>,
+    /// Session start time (unix epoch seconds) for the "running <total>"
+    /// sidebar cell. Stable across a session's life, so unlike attention
+    /// it's worth caching for first-frame fidelity. `#[serde(default)]`
+    /// for backward-compat with caches written before this field; those
+    /// rows show no total until the next live discovery refreshes them.
+    #[serde(default)]
+    started_at_secs: Option<i64>,
 }
 
 /// Parallel of [`Attention`] for the wire format. Lives here (not
@@ -129,6 +136,7 @@ impl CachedSession {
             title: s.title.clone(),
             attention: s.attention.into(),
             parent_repo: s.parent_repo.clone(),
+            started_at_secs: s.started_at.map(systemtime_to_epoch_secs),
         }
     }
 
@@ -148,6 +156,11 @@ impl CachedSession {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            // Not cached (it tracks live transitions); seed it from the
+            // cached activity time so a first frame after restart still
+            // shows a plausible "time in state" until live updates land.
+            attention_entered_at: Some(epoch_secs_to_systemtime(self.last_activity_secs)),
+            started_at: self.started_at_secs.map(epoch_secs_to_systemtime),
         }
     }
 }
@@ -209,6 +222,8 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            attention_entered_at: None,
+            started_at: None,
         }
     }
 

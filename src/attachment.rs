@@ -1219,6 +1219,8 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            attention_entered_at: None,
+            started_at: None,
         }
     }
 
@@ -1733,6 +1735,8 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            attention_entered_at: None,
+            started_at: None,
         }
     }
 

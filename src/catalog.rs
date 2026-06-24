@@ -44,6 +44,11 @@ impl SessionCatalog {
             if session.id == *id {
                 let previous = session.attention;
                 session.attention = attention;
+                if previous != attention {
+                    // A live transition; now() is accurate (the
+                    // transcript just changed). Drives "time in state".
+                    session.attention_entered_at = Some(SystemTime::now());
+                }
                 return Some(previous);
             }
         }
@@ -85,6 +90,13 @@ impl SessionCatalog {
                 }
                 let previous = session.attention;
                 session.attention = attention;
+                if previous != attention {
+                    // Prefer the transcript mtime that drove this update
+                    // (when the state actually changed) over wall-clock;
+                    // fall back to now() for the rare mtime-less event.
+                    session.attention_entered_at =
+                        Some(event_mtime.unwrap_or_else(SystemTime::now));
+                }
                 // The heuristic is transcript-truth and can never mean
                 // "blocking prompt" (a transcript-derived NeedsInput is
                 // a finished turn, i.e. "done"). Any prior blocking
@@ -128,6 +140,14 @@ impl SessionCatalog {
             if session.id == *id {
                 let previous = session.attention;
                 session.attention = Attention::NeedsInput;
+                if previous != Attention::NeedsInput {
+                    // Only an actual attention transition resets the
+                    // "time in state" clock — a done→blocked escalation
+                    // (NeedsInput both times, blocking flips) keeps
+                    // counting from when it first stopped, reading as
+                    // "awaiting your input for Xm".
+                    session.attention_entered_at = Some(received_at);
+                }
                 session.blocking_prompt = blocking_prompt;
                 session.hook_pinned = Some(received_at);
                 return Some(previous);
@@ -266,6 +286,8 @@ mod tests {
             has_live_pane: None,
             hook_pinned: None,
             blocking_prompt: false,
+            attention_entered_at: None,
+            started_at: None,
         }
     }
 
@@ -530,6 +552,42 @@ mod tests {
         let s = &c.sessions()[0];
         assert_eq!(s.attention, Attention::NeedsInput);
         assert_eq!(s.hook_pinned, Some(at(100)));
+    }
+
+    #[test]
+    fn update_attention_stamps_entered_at_only_on_a_real_transition() {
+        let mut c = SessionCatalog::new();
+        let mut s = session("a");
+        s.attention = Attention::Working;
+        s.attention_entered_at = Some(at(10));
+        c.add(s);
+        // No-op update (same value) must NOT restamp — "time in state"
+        // keeps counting from the original entry.
+        c.update_attention(&SessionId("a".into()), Attention::Working);
+        assert_eq!(c.sessions()[0].attention_entered_at, Some(at(10)));
+        // A real transition advances the stamp (to ~now, which is well
+        // past the epoch-anchored at(10)).
+        c.update_attention(&SessionId("a".into()), Attention::NeedsInput);
+        let stamped = c.sessions()[0]
+            .attention_entered_at
+            .expect("stamped on transition");
+        assert!(
+            stamped > at(10),
+            "transition must advance attention_entered_at"
+        );
+    }
+
+    #[test]
+    fn apply_heuristic_attention_stamps_entered_at_from_event_mtime() {
+        let mut c = SessionCatalog::new();
+        let mut s = session("a");
+        s.attention = Attention::NeedsInput;
+        s.attention_entered_at = Some(at(5));
+        c.add(s);
+        // A transition with a known transcript mtime stamps that mtime
+        // (when the state actually changed) rather than wall-clock.
+        c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(50)));
+        assert_eq!(c.sessions()[0].attention_entered_at, Some(at(50)));
     }
 
     #[test]

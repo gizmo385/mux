@@ -113,4 +113,21 @@ pub struct Session {
     /// on never mis-renders. Ephemeral like `hook_pinned`: not
     /// serialized into the disk cache (the live hook re-establishes it).
     pub blocking_prompt: bool,
+    /// When the session's current `attention` value was entered (its
+    /// most recent transition), or `None` if unknown. Drives the
+    /// sidebar's "time in current state" (e.g. "working 18m").
+    /// Initialised to the transcript mtime at discovery — a good proxy
+    /// for stopped states, where "last wrote" ≈ "entered this state" —
+    /// and re-stamped by the catalog whenever `attention` changes. Not
+    /// serialized into the disk cache; reseeded from `last_activity` on
+    /// cache load so a first frame after restart still shows a duration.
+    pub attention_entered_at: Option<SystemTime>,
+    /// When the session/conversation began, or `None` when no start
+    /// time is known. Drives the sidebar's "running <total>" cell.
+    /// Sourced from `.agent-mux/task.toml`'s `created_at` for
+    /// agent-mux-created sessions; `None` for externally-started ones
+    /// (deriving it from the first transcript entry's timestamp is a
+    /// filed follow-up — it needs a date parser). Stable, so it *is*
+    /// serialized into the disk cache.
+    pub started_at: Option<SystemTime>,
 }

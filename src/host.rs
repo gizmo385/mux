@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::session::HostId;
@@ -182,6 +183,32 @@ pub trait Host: Send + Sync {
     /// preserves the discipline that callers stay host-agnostic
     /// without `is_local()` branches.
     fn ssh_argv(&self, tty: bool, remote_cmd: &[&str]) -> Option<Vec<String>>;
+
+    /// Ensure the host's connection is healthy, re-establishing it if a
+    /// cheap liveness probe shows it has died.
+    ///
+    /// Called proactively by the background pollers (not on the attach
+    /// hot path) so the connection is warm *before* the user switches
+    /// sessions. The motivating failure: a laptop sleeps overnight, the
+    /// SSH `ControlMaster` times out past `ControlPersist` and its TCP
+    /// connection drops, and — with no re-establishment — every later
+    /// `ssh -S <socket>` silently falls back to a full TCP+TLS+auth
+    /// handshake. That turns each poll tick and each session switch into
+    /// seconds of blocking I/O, exactly the "session switching never
+    /// blocks on I/O" property `ARCHITECTURE.md` makes load-bearing.
+    ///
+    /// Returns `Ok(true)` when a reconnect actually happened, `Ok(false)`
+    /// when the existing connection was already healthy (the common
+    /// case, and cheap — one local-socket probe). The default impl is a
+    /// no-op for connectionless hosts ([`LocalHost`]).
+    ///
+    /// # Errors
+    /// Propagates the `io::Error` from re-establishing a dead connection
+    /// (e.g. the host is genuinely unreachable). Callers should treat an
+    /// error as "still disconnected, retry next tick" rather than fatal.
+    fn ensure_connected(&self) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// `Host` implementation for the local machine. Pure `std::fs` calls; no
@@ -345,6 +372,12 @@ pub struct SshHost {
     /// `#[cfg(test)]` constructor takes a different value so unit tests
     /// can exercise command construction without contacting a real host.
     ssh_binary: PathBuf,
+    /// Serialises [`SshHost::ensure_connected`] so the two background
+    /// pollers (transcript + pane) that share this `Arc<SshHost>` can't
+    /// race on re-spawning the master — without it, two threads both
+    /// seeing a dead master could each remove the socket file and spawn
+    /// a master, with one deleting the other's freshly-created socket.
+    reconnect_lock: Mutex<()>,
 }
 
 impl SshHost {
@@ -367,6 +400,22 @@ impl SshHost {
         ssh_binary: PathBuf,
     ) -> io::Result<Self> {
         let control_path = control_socket_path(&id);
+        Self::spawn_master(&ssh_binary, &control_path, &ssh_target)?;
+        Ok(Self {
+            id,
+            ssh_target,
+            control_path,
+            ssh_binary,
+            reconnect_lock: Mutex::new(()),
+        })
+    }
+
+    /// Spawn the backgrounded `ControlMaster` on `control_path` and
+    /// verify it is actually listening with `-O check`. Shared by the
+    /// initial [`SshHost::connect`] and the [`SshHost::ensure_connected`]
+    /// reconnect path so both issue identical flags and get the same
+    /// verify-after-spawn guarantee.
+    fn spawn_master(ssh_binary: &Path, control_path: &Path, ssh_target: &str) -> io::Result<()> {
         // -fN  = fork into background, run no remote command
         // -M   = master mode
         // -S   = control socket path (clients reuse via the same path)
@@ -377,11 +426,11 @@ impl SshHost {
         // unreachable host can't stall the dashboard's startup discovery
         // (which we run in parallel threads, but each thread still needs
         // a bounded worst case).
-        let status = Command::new(&ssh_binary)
+        let status = Command::new(ssh_binary)
             .arg("-fN")
             .arg("-M")
             .arg("-S")
-            .arg(&control_path)
+            .arg(control_path)
             .arg("-o")
             .arg("ControlPersist=600")
             .arg("-o")
@@ -396,7 +445,7 @@ impl SshHost {
             // is rounding error compared to the savings.
             .arg("-o")
             .arg("Compression=yes")
-            .arg(&ssh_target)
+            .arg(ssh_target)
             .status()?;
         if !status.success() {
             return Err(io::Error::other(format!(
@@ -416,42 +465,45 @@ impl SshHost {
         // "session switching never blocks on I/O" property invisibly.
         // `-O check` asks the master directly and exits non-zero when
         // nothing is listening on the socket.
-        let check = Command::new(&ssh_binary)
-            .arg("-S")
-            .arg(&control_path)
-            .arg("-O")
-            .arg("check")
-            .arg(&ssh_target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !check.success() {
+        if !Self::master_check(ssh_binary, control_path, ssh_target) {
             // Best-effort cleanup in case the master partially
             // established. Mirrors Drop's shape; errors swallowed
             // because the connect is failing either way.
-            let _ = Command::new(&ssh_binary)
+            let _ = Command::new(ssh_binary)
                 .arg("-S")
-                .arg(&control_path)
+                .arg(control_path)
                 .arg("-O")
                 .arg("exit")
-                .arg(&ssh_target)
+                .arg(ssh_target)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
             return Err(io::Error::other(format!(
                 "ssh ControlMaster did not establish for {ssh_target} \
-                 (master spawned successfully but `-O check` failed: exit {check}). \
+                 (master spawned successfully but `-O check` failed). \
                  Common cause: a ProxyCommand that does not sustain a backgrounded master."
             )));
         }
-        Ok(Self {
-            id,
-            ssh_target,
-            control_path,
-            ssh_binary,
-        })
+        Ok(())
+    }
+
+    /// `ssh -O check`: ask the master on `control_path` whether it is
+    /// alive. Exits non-zero (→ `false`) when nothing is listening on
+    /// the socket — a never-spawned, timed-out, or TCP-dropped master.
+    /// Cheap: a local-socket round-trip, no network handshake.
+    fn master_check(ssh_binary: &Path, control_path: &Path, ssh_target: &str) -> bool {
+        Command::new(ssh_binary)
+            .arg("-S")
+            .arg(control_path)
+            .arg("-O")
+            .arg("check")
+            .arg(ssh_target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
     }
 
     fn ssh_command(&self) -> Command {
@@ -727,6 +779,39 @@ impl Host for SshHost {
             argv.push(shell_join_quoted(remote_cmd));
         }
         Some(argv)
+    }
+
+    fn ensure_connected(&self) -> io::Result<bool> {
+        // Fast path: the master is alive (the overwhelmingly common
+        // case on every poll tick). One cheap local-socket probe, no
+        // lock, no network.
+        if Self::master_check(&self.ssh_binary, &self.control_path, &self.ssh_target) {
+            return Ok(false);
+        }
+        // The master is gone. Serialise re-establishment so the
+        // transcript and pane pollers — which share this `Arc<SshHost>`
+        // — don't both remove the socket and spawn duelling masters. A
+        // poisoned lock just means a prior holder panicked mid-respawn;
+        // its data is `()`, so recover and carry on rather than cascade.
+        let _guard = self
+            .reconnect_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Double-check under the lock: a sibling thread may have
+        // rebuilt the master while we were blocked acquiring it.
+        if Self::master_check(&self.ssh_binary, &self.control_path, &self.ssh_target) {
+            return Ok(false);
+        }
+        // A dead master can leave a stale socket file behind, and
+        // `ssh -fN -M` refuses to create a master when the socket path
+        // already exists ("ControlSocket ... already exists, disabling
+        // multiplexing"). Remove it first so the re-spawn lands cleanly.
+        // Safe to delete here: we only reach this point with the master
+        // confirmed dead under the lock, so no live channel depends on
+        // the socket. NotFound is fine (nothing to clean up).
+        let _ = fs::remove_file(&self.control_path);
+        Self::spawn_master(&self.ssh_binary, &self.control_path, &self.ssh_target)?;
+        Ok(true)
     }
 }
 
@@ -1432,12 +1517,184 @@ mod tests {
         mock
     }
 
+    /// Mock `ssh` whose `-O check` exits non-zero for the first
+    /// `fail_count` invocations and exits 0 thereafter. Lets a test
+    /// drive [`SshHost::ensure_connected`] through "probe says dead →
+    /// respawn → re-probe says alive" deterministically. The invocation
+    /// count lives in `counter_path` (the mock reads/writes it) so it
+    /// survives across the separate `ssh` processes `ensure_connected`
+    /// spawns. Non-`-O check` calls (the `-fN -M` respawn, the warmup)
+    /// are logged and exit 0 without touching the counter.
+    #[cfg(unix)]
+    fn write_executable_mock_ssh_check_fails_first_n(
+        log_path: &Path,
+        counter_path: &Path,
+        fail_count: u32,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = log_path.parent().expect("log path has parent");
+        let mock = dir.join("mock-ssh-flaky-check");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> {log}\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+                 if [ \"$prev\" = \"-O\" ] && [ \"$arg\" = \"check\" ]; then\n\
+                     n=$(cat {ctr} 2>/dev/null || echo 0)\n\
+                     n=$((n+1))\n\
+                     echo \"$n\" > {ctr}\n\
+                     if [ \"$n\" -le {fail} ]; then exit 1; fi\n\
+                     exit 0\n\
+                 fi\n\
+                 prev=\"$arg\"\n\
+             done\n\
+             exit 0\n",
+            log = log_path.display(),
+            ctr = counter_path.display(),
+            fail = fail_count,
+        );
+        write_file(&mock, &script);
+        let mut perms = fs::metadata(&mock).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock, perms).unwrap();
+        mock
+    }
+
+    /// Build an [`SshHost`] directly (no `connect`, so no master spawn)
+    /// pointed at `ssh_binary`, with `control_path` inside a tempdir so
+    /// the reconnect path's `remove_file` can't touch anything real.
+    #[cfg(unix)]
+    fn ssh_host_with(ssh_binary: PathBuf, control_path: PathBuf) -> SshHost {
+        SshHost {
+            id: HostId("devbox".into()),
+            ssh_target: "devbox".into(),
+            control_path,
+            ssh_binary,
+            reconnect_lock: Mutex::new(()),
+        }
+    }
+
+    /// Exec `mock` once up front, retrying on the ETXTBSY fork/exec race
+    /// (see [`connect_with_binary_retrying_etxtbsy`] for the mechanism),
+    /// so the `ensure_connected` assertions below run against a "warm"
+    /// binary no later exec can find busy. Callers truncate the log
+    /// afterward so this warmup invocation doesn't appear in the
+    /// recorded argv.
+    #[cfg(unix)]
+    fn prime_mock_exec(mock: &Path) {
+        let mut delay = std::time::Duration::from_millis(2);
+        for _ in 0..10 {
+            match Command::new(mock).arg("warmup").status() {
+                Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_ensure_connected_is_noop_when_master_is_alive() {
+        // The common per-tick case: the master answers `-O check`, so
+        // ensure_connected does one cheap probe and reports "nothing to
+        // do" without re-spawning. A spurious respawn here would tear
+        // down a perfectly good master on every poll.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh(&log); // exits 0 for everything
+        prime_mock_exec(&mock);
+        fs::write(&log, b"").unwrap();
+
+        let host = ssh_host_with(mock, tmp.path().join("ctrl.sock"));
+        let reconnected = host.ensure_connected().expect("probe succeeds");
+
+        assert!(!reconnected, "alive master must not trigger a reconnect");
+        let lines = read_log_lines(&log);
+        assert_eq!(lines.len(), 1, "expected one `-O check`, got: {lines:?}");
+        assert!(
+            lines[0].contains("-O") && lines[0].contains("check"),
+            "the single call must be the liveness probe. got: {}",
+            lines[0]
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("-fN")),
+            "no master respawn when alive. got: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_ensure_connected_respawns_master_after_probe_fails() {
+        // The morning-after-sleep case: the master died (probe fails),
+        // so ensure_connected clears the stale socket, re-issues the
+        // `-fN -M` spawn, and confirms the rebuilt master answers — all
+        // off the attach hot path so the next session switch is fast.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let counter = tmp.path().join("check-count");
+        // Fail the first two checks (the fast-path probe + the
+        // under-lock double-check), then let the post-respawn check
+        // succeed so the rebuilt master verifies.
+        let mock = write_executable_mock_ssh_check_fails_first_n(&log, &counter, 2);
+        prime_mock_exec(&mock);
+        fs::write(&log, b"").unwrap();
+
+        let host = ssh_host_with(mock, tmp.path().join("ctrl.sock"));
+        let reconnected = host.ensure_connected().expect("respawn succeeds");
+
+        assert!(reconnected, "dead master must trigger a reconnect");
+        let lines = read_log_lines(&log);
+        assert!(
+            lines.iter().any(|l| l.contains("-fN") && l.contains("-M")),
+            "reconnect must re-issue the `-fN -M` master spawn. got: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_ensure_connected_surfaces_error_when_master_cannot_reestablish() {
+        // A genuinely-unreachable host: every `-O check` fails, so the
+        // respawn's verify also fails. ensure_connected must return Err
+        // (which the poller treats as "still down, retry next tick")
+        // rather than reporting a phantom success or hanging — and it
+        // must have actually attempted the respawn first.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("ssh-calls.log");
+        let mock = write_executable_mock_ssh_with_broken_master(&log);
+        prime_mock_exec(&mock);
+        fs::write(&log, b"").unwrap();
+
+        let host = ssh_host_with(mock, tmp.path().join("ctrl.sock"));
+        let result = host.ensure_connected();
+
+        assert!(
+            result.is_err(),
+            "a host that never re-establishes must surface Err, got: {result:?}"
+        );
+        let lines = read_log_lines(&log);
+        assert!(
+            lines.iter().any(|l| l.contains("-fN") && l.contains("-M")),
+            "reconnect must be attempted before giving up. got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn local_host_ensure_connected_is_noop() {
+        // Local hosts have no connection to heal; the trait default must
+        // report "already connected" so the shared poller loop doesn't
+        // special-case host kind.
+        assert!(!LocalHost::new().ensure_connected().unwrap());
+    }
+
     fn devbox() -> SshHost {
         SshHost {
             id: HostId("devbox".into()),
             ssh_target: "devbox".into(),
             control_path: PathBuf::from("/tmp/sock"),
             ssh_binary: PathBuf::from("ssh"),
+            reconnect_lock: Mutex::new(()),
         }
     }
 

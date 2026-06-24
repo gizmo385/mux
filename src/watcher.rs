@@ -360,6 +360,28 @@ impl TranscriptWatcher {
             let hooks_dir = crate::hook_ingest::hook_dir_for_transcripts_root(&root);
             loop {
                 thread::sleep(interval);
+                // Heal a dead connection before doing any work this tick.
+                // For SSH hosts this re-establishes a `ControlMaster`
+                // that died while the laptop slept (past ControlPersist),
+                // so the master is warm before the user switches sessions
+                // — keeping attach off the slow per-command-handshake
+                // path. No-op for local hosts. A failure here means the
+                // host is still unreachable; skip this tick's work and
+                // retry next interval rather than killing the poller, so
+                // a transient outage self-heals.
+                match host.ensure_connected() {
+                    Ok(true) => {
+                        eprintln!(
+                            "agent-mux: re-established connection to host '{}'",
+                            host_id.0
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("agent-mux: reconnect to host '{}' failed: {e}", host_id.0);
+                        continue;
+                    }
+                }
                 if !poll_once(host.as_ref(), &host_id, &root, &mut known, &tx) {
                     return;
                 }

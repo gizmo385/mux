@@ -441,6 +441,28 @@ impl SshHost {
     /// initial [`SshHost::connect`] and the [`SshHost::ensure_connected`]
     /// reconnect path so both issue identical flags and get the same
     /// verify-after-spawn guarantee.
+    /// Build an `ssh` invocation for agent-mux's *background* control-
+    /// plane ops — master spawn / `-O check` / `-O exit`, transcript
+    /// polls, discovery reads. Strips `TMUX` / `TMUX_PANE` from the
+    /// child environment so that neither the ssh client nor a locally-
+    /// run `ProxyCommand` (e.g. Coder's `coder ssh --stdio`) can talk to
+    /// the user's tmux server.
+    ///
+    /// Without this, when agent-mux runs *inside* tmux every background
+    /// ssh subprocess inherits `$TMUX` pointing at the user's active
+    /// server, and a tmux-aware proxy/wrapper can open stray short-lived
+    /// windows in the very session showing the user's Claude work —
+    /// auto-focused, then gone when the ~5s connect attempt ends
+    /// (dogfooded 2026-06, on a Coder-proxied host whose master can't
+    /// stay up, so these attempts recur). The interactive attach paths
+    /// deliberately do NOT route through here: they run via the tmux /
+    /// PTY drivers, which must see the real `$TMUX` to host the session.
+    fn background_ssh_command(ssh_binary: &Path) -> Command {
+        let mut cmd = Command::new(ssh_binary);
+        cmd.env_remove("TMUX").env_remove("TMUX_PANE");
+        cmd
+    }
+
     fn spawn_master(ssh_binary: &Path, control_path: &Path, ssh_target: &str) -> io::Result<()> {
         // -fN  = fork into background, run no remote command
         // -M   = master mode
@@ -452,7 +474,7 @@ impl SshHost {
         // unreachable host can't stall the dashboard's startup discovery
         // (which we run in parallel threads, but each thread still needs
         // a bounded worst case).
-        let status = Command::new(ssh_binary)
+        let status = Self::background_ssh_command(ssh_binary)
             .arg("-fN")
             .arg("-M")
             .arg("-S")
@@ -495,7 +517,7 @@ impl SshHost {
             // Best-effort cleanup in case the master partially
             // established. Mirrors Drop's shape; errors swallowed
             // because the connect is failing either way.
-            let _ = Command::new(ssh_binary)
+            let _ = Self::background_ssh_command(ssh_binary)
                 .arg("-S")
                 .arg(control_path)
                 .arg("-O")
@@ -519,7 +541,7 @@ impl SshHost {
     /// the socket — a never-spawned, timed-out, or TCP-dropped master.
     /// Cheap: a local-socket round-trip, no network handshake.
     fn master_check(ssh_binary: &Path, control_path: &Path, ssh_target: &str) -> bool {
-        Command::new(ssh_binary)
+        Self::background_ssh_command(ssh_binary)
             .arg("-S")
             .arg(control_path)
             .arg("-O")
@@ -533,7 +555,7 @@ impl SshHost {
     }
 
     fn ssh_command(&self) -> Command {
-        let mut cmd = Command::new(&self.ssh_binary);
+        let mut cmd = Self::background_ssh_command(&self.ssh_binary);
         cmd.arg("-S").arg(&self.control_path);
         cmd.arg(&self.ssh_target);
         cmd
@@ -558,7 +580,7 @@ impl Drop for SshHost {
         // useful recovery — worst case the remote master times out per
         // ControlPersist above. Stdin/out/err are nulled so a slow exit
         // does not bleed into the user's terminal.
-        let _ = Command::new(&self.ssh_binary)
+        let _ = Self::background_ssh_command(&self.ssh_binary)
             .arg("-S")
             .arg(&self.control_path)
             .arg("-O")
@@ -1778,6 +1800,28 @@ mod tests {
             ssh_binary: PathBuf::from("ssh"),
             reconnect: Mutex::new(ReconnectState::default()),
         }
+    }
+
+    #[test]
+    fn background_ssh_commands_strip_tmux_env() {
+        // A background ssh subprocess must not inherit $TMUX / $TMUX_PANE
+        // — otherwise the ssh client's local ProxyCommand can reach the
+        // user's tmux server and open stray windows in the session
+        // agent-mux is running inside. `get_envs` reports an explicit
+        // removal as `(key, None)`.
+        let strips = |cmd: &Command| {
+            let envs: Vec<_> = cmd.get_envs().collect();
+            let removed = |k: &str| {
+                envs.iter()
+                    .any(|(key, val)| *key == std::ffi::OsStr::new(k) && val.is_none())
+            };
+            assert!(removed("TMUX"), "TMUX must be removed");
+            assert!(removed("TMUX_PANE"), "TMUX_PANE must be removed");
+        };
+        // The shared builder and the &self poll/discovery builder both
+        // go through it.
+        strips(&SshHost::background_ssh_command(Path::new("ssh")));
+        strips(&devbox().ssh_command());
     }
 
     #[test]

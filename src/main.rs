@@ -32,8 +32,8 @@ use agent_mux::config::{self, Config, Theme, ToolBinding};
 use agent_mux::dashboard::{
     DisplayRow, FavoritePlaceholder, Focus, SearchMode, SearchOutcome, SearchState,
     anchor_header_for_selection, apply_fg, build_display_rows, build_display_rows_filtered,
-    first_session_index, is_pty_leader, matches_query, next_host_index, next_project_index,
-    next_session_index, prev_host_index, prev_project_index, prev_session_index,
+    first_session_index, is_pty_leader, matches_query, next_project_index, next_section_index,
+    next_session_index, prev_project_index, prev_section_index, prev_session_index,
 };
 use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
@@ -2400,16 +2400,16 @@ impl App {
         }
     }
 
-    fn next_host(&mut self) {
+    fn next_section(&mut self) {
         let rows = self.current_rows();
-        if let Some(i) = next_host_index(self.list_state.selected(), &rows) {
+        if let Some(i) = next_section_index(self.list_state.selected(), &rows) {
             self.list_state.select(Some(i));
         }
     }
 
-    fn prev_host(&mut self) {
+    fn prev_section(&mut self) {
         let rows = self.current_rows();
-        if let Some(i) = prev_host_index(self.list_state.selected(), &rows) {
+        if let Some(i) = prev_section_index(self.list_state.selected(), &rows) {
             self.list_state.select(Some(i));
         }
     }
@@ -2703,12 +2703,12 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.prev_project();
             ActionOutcome::Continue
         }
-        Action::NextHost => {
-            app.next_host();
+        Action::NextSection => {
+            app.next_section();
             ActionOutcome::Continue
         }
-        Action::PrevHost => {
-            app.prev_host();
+        Action::PrevSection => {
+            app.prev_section();
             ActionOutcome::Continue
         }
         Action::Attach => app.attach_under_cursor(),
@@ -2767,8 +2767,12 @@ enum Action {
     Prev,
     NextProject,
     PrevProject,
-    NextHost,
-    PrevHost,
+    /// `⌃j` / `⌃k` — jump to the next / previous top-level *section*: the
+    /// Tools group, the Favorites group, or a host. The coarsest jump
+    /// granularity above `J`/`K` (project). Lands on the section's first
+    /// selectable row.
+    NextSection,
+    PrevSection,
     Attach,
     SpawnTerminal,
     NewSession,
@@ -2793,13 +2797,14 @@ enum Action {
 }
 
 fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
-    // Ctrl-j / Ctrl-k jump host. Handled first so they don't fall through
-    // to the lowercase j/k single-session navigation below. Ctrl-C is
-    // already intercepted upstream so it never reaches this function.
+    // Ctrl-j / Ctrl-k jump between top-level sections (Tools, Favorites,
+    // hosts). Handled first so they don't fall through to the lowercase
+    // j/k single-session navigation below. Ctrl-C is already intercepted
+    // upstream so it never reaches this function.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
-            KeyCode::Char('j') => Some(Action::NextHost),
-            KeyCode::Char('k') => Some(Action::PrevHost),
+            KeyCode::Char('j') => Some(Action::NextSection),
+            KeyCode::Char('k') => Some(Action::PrevSection),
             KeyCode::Char('p') => Some(Action::OpenQuickSwitcher),
             _ => None,
         };

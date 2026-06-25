@@ -486,19 +486,23 @@ pub fn prev_project_index(current: Option<usize>, rows: &[DisplayRow]) -> Option
     walk_to_group(current, rows, -1, is_project_header)
 }
 
-/// First `SessionRow` index belonging to the next host group, wrapping
-/// at the end. Returns `None` when the dashboard has only one host (so
-/// there's nowhere distinct to go).
+/// First selectable-row index belonging to the next top-level *section*
+/// — the Tools group, the Favorites group, or a host group — wrapping at
+/// the end. The coarsest of the three jump granularities (`j`/`k` =
+/// session, `J`/`K` = project, `⌃j`/`⌃k` = section). Lands on the
+/// section's first selectable row: a tool launch, a favorite (or offline
+/// placeholder), or the first session under the host. Returns `None`
+/// when only one section is on screen (nowhere distinct to go).
 #[must_use]
-pub fn next_host_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
-    walk_to_group(current, rows, 1, is_host_header)
+pub fn next_section_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
+    walk_to_group(current, rows, 1, is_section_header)
 }
 
-/// First `SessionRow` index belonging to the previous host group,
-/// wrapping at the start.
+/// First selectable-row index of the previous top-level section, wrapping
+/// at the start. Mirror of [`next_section_index`].
 #[must_use]
-pub fn prev_host_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
-    walk_to_group(current, rows, -1, is_host_header)
+pub fn prev_section_index(current: Option<usize>, rows: &[DisplayRow]) -> Option<usize> {
+    walk_to_group(current, rows, -1, is_section_header)
 }
 
 fn is_project_header(row: &DisplayRow) -> bool {
@@ -536,14 +540,24 @@ pub fn anchor_header_for_selection(rows: &[DisplayRow], selected: usize) -> Opti
     rows[..selected].iter().rposition(predicate)
 }
 
-fn is_host_header(row: &DisplayRow) -> bool {
-    matches!(row, DisplayRow::HostHeader(_))
+/// A top-level section anchor: the Tools group header, the Favorites
+/// group header, or a host header. These are the groups `⌃j`/`⌃k` cycle
+/// through. Favorites and Tools render *above* the host→project tree, so
+/// without treating their headers as section anchors they were
+/// unreachable by explicit group-jump — only by `j`/`k` paging or the
+/// quickswitcher.
+fn is_section_header(row: &DisplayRow) -> bool {
+    matches!(
+        row,
+        DisplayRow::HostHeader(_) | DisplayRow::FavoritesHeader | DisplayRow::ToolsHeader
+    )
 }
 
 /// Shared engine for the four group-jump helpers. Identifies the group
 /// header (`is_header`) the current selection sits under, finds the
 /// next or previous header of the same kind (wrapping), then returns
-/// the first `SessionRow` index after that header.
+/// the first selectable-row index after that header (a session, favorite,
+/// or tool row, depending on the section).
 ///
 /// Returns `None` when there's no current selection, when the current
 /// row has no preceding header (malformed row list), or when there are
@@ -570,7 +584,7 @@ fn walk_to_group(
         (cur_pos + groups.len() - 1) % groups.len()
     };
     let target_header = groups[next_pos];
-    (target_header + 1..rows.len()).find(|&i| matches!(rows[i], DisplayRow::SessionRow(_)))
+    (target_header + 1..rows.len()).find(|&i| is_selectable(&rows[i]))
 }
 
 /// Apply `colour` as a foreground if `Some`; leave the style untouched
@@ -1115,7 +1129,7 @@ mod tests {
         assert_eq!(anchor_header_for_selection(&rows, 0), None);
     }
 
-    // ------- next/prev_project_index, next/prev_host_index -------
+    // ------- next/prev_project_index, next/prev_section_index -------
 
     #[test]
     fn next_project_index_jumps_to_first_session_of_next_project() {
@@ -1159,40 +1173,84 @@ mod tests {
     }
 
     #[test]
-    fn next_host_index_jumps_to_first_session_of_next_host() {
+    fn next_section_index_jumps_to_first_session_of_next_host() {
         let s = vec![
             session("a", "alpenglow", "/p", 0),
             session("b", "local", "/q", 0),
         ];
         let rows = build_display_rows(&s);
         // Layout: H:local(0) P:/q(1) S:b(2) H:alpenglow(3) P:/p(4) S:a(5)
-        assert_eq!(next_host_index(Some(2), &rows), Some(5));
+        assert_eq!(next_section_index(Some(2), &rows), Some(5));
         // From the alpenglow side, wraps to local's first session.
-        assert_eq!(next_host_index(Some(5), &rows), Some(2));
+        assert_eq!(next_section_index(Some(5), &rows), Some(2));
     }
 
     #[test]
-    fn prev_host_index_wraps_at_start() {
+    fn prev_section_index_wraps_at_start() {
         let s = vec![
             session("a", "alpenglow", "/p", 0),
             session("b", "local", "/q", 0),
         ];
         let rows = build_display_rows(&s);
         // Symmetric with next: from local we go to alpenglow and back.
-        assert_eq!(prev_host_index(Some(2), &rows), Some(5));
-        assert_eq!(prev_host_index(Some(5), &rows), Some(2));
+        assert_eq!(prev_section_index(Some(2), &rows), Some(5));
+        assert_eq!(prev_section_index(Some(5), &rows), Some(2));
     }
 
     #[test]
-    fn host_jumps_return_none_when_only_one_host_exists() {
+    fn section_jumps_return_none_when_only_one_section_exists() {
         let s = vec![
             session("a", "local", "/x", 0),
             session("b", "local", "/y", 0),
         ];
         let rows = build_display_rows(&s);
-        // Only `local` host, even with multiple projects under it.
-        assert_eq!(next_host_index(Some(2), &rows), None);
-        assert_eq!(prev_host_index(Some(2), &rows), None);
+        // Only `local` host and no Favorites/Tools sections, even with
+        // multiple projects under it.
+        assert_eq!(next_section_index(Some(2), &rows), None);
+        assert_eq!(prev_section_index(Some(2), &rows), None);
+    }
+
+    #[test]
+    fn section_jump_reaches_favorites_and_tools_above_the_host_tree() {
+        // Favorites and Tools render above the host→project tree and were
+        // unreachable by host-only group-jump. Construct the full row
+        // shape `current_rows` produces (Tools, then Favorites, then the
+        // host tree) and confirm `⌃j` cycles all three as sections.
+        let s = [session("a", "local", "/x", 0)];
+        let rows = vec![
+            DisplayRow::ToolsHeader,                             // 0
+            DisplayRow::ToolRow(0), // 1  <- Tools section's first selectable
+            DisplayRow::FavoritesHeader, // 2
+            DisplayRow::FavoriteSessionRow(0), // 3  <- Favorites' first selectable
+            DisplayRow::HostHeader(s[0].host.clone()), // 4
+            DisplayRow::ProjectHeader(s[0].project_dir.clone()), // 5
+            DisplayRow::SessionRow(0), // 6  <- host section's first selectable
+        ];
+        // From the tool row: ⌃j → favorites, ⌃j → host, ⌃j → wrap to tools.
+        assert_eq!(next_section_index(Some(1), &rows), Some(3));
+        assert_eq!(next_section_index(Some(3), &rows), Some(6));
+        assert_eq!(next_section_index(Some(6), &rows), Some(1));
+        // ⌃k walks the same cycle in reverse.
+        assert_eq!(prev_section_index(Some(1), &rows), Some(6));
+        assert_eq!(prev_section_index(Some(6), &rows), Some(3));
+        assert_eq!(prev_section_index(Some(3), &rows), Some(1));
+    }
+
+    #[test]
+    fn section_jump_lands_on_offline_favorite_placeholder() {
+        // A favorites section can hold only offline placeholders (no live
+        // session yet). The jump must still land there — placeholders are
+        // selectable and attachable-as-offline.
+        let s = [session("a", "local", "/x", 0)];
+        let rows = vec![
+            DisplayRow::FavoritesHeader,                         // 0
+            DisplayRow::FavoritePlaceholderRow(0), // 1  <- only selectable in favorites
+            DisplayRow::HostHeader(s[0].host.clone()), // 2
+            DisplayRow::ProjectHeader(s[0].project_dir.clone()), // 3
+            DisplayRow::SessionRow(0),             // 4
+        ];
+        assert_eq!(next_section_index(Some(4), &rows), Some(1));
+        assert_eq!(prev_section_index(Some(1), &rows), Some(4));
     }
 
     #[test]
@@ -1204,8 +1262,8 @@ mod tests {
         let rows = build_display_rows(&s);
         assert_eq!(next_project_index(None, &rows), None);
         assert_eq!(prev_project_index(None, &rows), None);
-        assert_eq!(next_host_index(None, &rows), None);
-        assert_eq!(prev_host_index(None, &rows), None);
+        assert_eq!(next_section_index(None, &rows), None);
+        assert_eq!(prev_section_index(None, &rows), None);
     }
 
     // ------- matches_query -------

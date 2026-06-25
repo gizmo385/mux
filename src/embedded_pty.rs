@@ -28,6 +28,7 @@ use portable_pty::{
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use tui_term::widget::PseudoTerminal;
 
 /// One-way signal from the reader thread back to the main loop.
@@ -252,9 +253,16 @@ impl EmbeddedPty {
 
     /// Render the parser's current screen into `area` of `frame`. Pure
     /// ratatui — the only synchronisation is a brief parser read-lock.
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    ///
+    /// `base_style` is the widget's default style — its background paints
+    /// the terminal cells the inner program leaves at terminal-default,
+    /// so the embedded pane harmonises with agent-mux's themed frame
+    /// (`[theme] background`). Cells the program colours itself keep their
+    /// own style; this only fills the gaps. Purely a render-layer effect —
+    /// nothing is written to the PTY or tmux.
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, base_style: Style) {
         if let Ok(p) = self.parser.read() {
-            let widget = PseudoTerminal::new(p.screen());
+            let widget = PseudoTerminal::new(p.screen()).style(base_style);
             frame.render_widget(widget, area);
         }
     }

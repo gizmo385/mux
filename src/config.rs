@@ -341,6 +341,16 @@ pub struct ThemeConfig {
     /// the historical dark grey (ANSI 238). Structural, like
     /// `focus_border`.
     pub selection: Option<String>,
+    /// Background colour painted behind the whole agent-mux frame — the
+    /// sidebar *and* the embedded terminal's default cells, so the two
+    /// panes read as one surface. Unset (the default for the `default` /
+    /// `mono` presets) leaves the terminal's own background showing
+    /// through, preserving the "compose with your terminal theme"
+    /// behaviour. The coloured presets ship a subtle dark tint. Only the
+    /// embedded terminal's *terminal-default* cells pick this up —
+    /// Claude Code's own painted background still shows where it sets one
+    /// (agent-mux deliberately doesn't reconfigure tmux/Claude Code).
+    pub background: Option<String>,
 }
 
 /// Resolved theme: each field is the parsed `ratatui::Color` or `None`
@@ -355,6 +365,7 @@ pub struct Theme {
     pub unknown: Option<Color>,
     pub focus_border: Option<Color>,
     pub selection: Option<Color>,
+    pub background: Option<Color>,
 }
 
 impl Theme {
@@ -414,6 +425,7 @@ impl Theme {
             working: Some(Color::LightYellow),
             idle: Some(Color::DarkGray),
             unknown: Some(Color::Gray),
+            background: Some(Color::Rgb(0x10, 0x10, 0x12)), // near-black
             ..Self::default()
         }
     }
@@ -438,6 +450,7 @@ impl Theme {
             working: Some(Color::Rgb(0xf4, 0xa7, 0x38)),
             idle: Some(Color::Rgb(0x8c, 0x6e, 0x54)),
             unknown: Some(Color::Rgb(0xa0, 0x87, 0x70)),
+            background: Some(Color::Rgb(0x1c, 0x14, 0x10)), // dark warm brown
             ..Self::default()
         }
     }
@@ -453,14 +466,16 @@ impl Theme {
             working: Some(Color::Rgb(0x6c, 0xb4, 0xd6)),
             idle: Some(Color::Rgb(0x47, 0x66, 0x80)),
             unknown: Some(Color::Rgb(0x5e, 0x7e, 0x94)),
+            background: Some(Color::Rgb(0x0d, 0x14, 0x1a)), // dark navy
             ..Self::default()
         }
     }
 
-    /// Solarized accents (the palette's canonical 8 colours). Designed
-    /// to work over either the dark or light Solarized backgrounds —
-    /// agent-mux doesn't set its own background, so accent-only is the
-    /// right slice to expose.
+    /// Solarized accents (the palette's canonical 8 colours) over the
+    /// canonical `base03` dark background. Like the other coloured
+    /// presets it ships a subtle frame background; clear it with
+    /// `background = ""` to run accent-only over a light Solarized
+    /// terminal instead.
     #[must_use]
     pub fn preset_solarized() -> Self {
         Self {
@@ -469,6 +484,7 @@ impl Theme {
             working: Some(Color::Rgb(0xb5, 0x89, 0x00)),     // yellow
             idle: Some(Color::Rgb(0x58, 0x6e, 0x75)),        // base01
             unknown: Some(Color::Rgb(0x58, 0x6e, 0x75)),
+            background: Some(Color::Rgb(0x00, 0x2b, 0x36)), // base03 (Solarized dark bg)
             ..Self::default()
         }
     }
@@ -484,6 +500,7 @@ impl Theme {
             working: Some(Color::Rgb(0xfa, 0xbd, 0x2f)),     // bright yellow
             idle: Some(Color::Rgb(0x92, 0x83, 0x74)),        // gray
             unknown: Some(Color::Rgb(0x92, 0x83, 0x74)),
+            background: Some(Color::Rgb(0x1d, 0x20, 0x21)), // dark0_hard
             ..Self::default()
         }
     }
@@ -498,6 +515,7 @@ impl Theme {
             working: Some(Color::Rgb(0xeb, 0xcb, 0x8b)),     // aurora yellow
             idle: Some(Color::Rgb(0x4c, 0x56, 0x6a)),        // polar night
             unknown: Some(Color::Rgb(0x4c, 0x56, 0x6a)),
+            background: Some(Color::Rgb(0x2e, 0x34, 0x40)), // nord0 polar night
             ..Self::default()
         }
     }
@@ -552,6 +570,7 @@ impl Theme {
                 base.focus_border,
             )?,
             selection: overlay("selection", cfg.selection.as_deref(), base.selection)?,
+            background: overlay("background", cfg.background.as_deref(), base.background)?,
         })
     }
 }
@@ -1298,9 +1317,51 @@ sound = true
         assert_eq!(theme.working, Some(Color::Yellow));
         assert_eq!(theme.idle, Some(Color::DarkGray));
         assert_eq!(theme.unknown, Some(Color::DarkGray));
-        // Structural elements still inherit their hardcoded fallbacks.
+        // Structural elements still inherit their hardcoded fallbacks,
+        // and the default frame stays background-less so it composes with
+        // the user's terminal theme.
         assert_eq!(theme.focus_border, None);
         assert_eq!(theme.selection, None);
+        assert_eq!(theme.background, None);
+    }
+
+    #[test]
+    fn coloured_presets_ship_a_background_default_and_mono_do_not() {
+        // The colour presets paint a subtle frame background so the
+        // themed look (and the sidebar↔terminal harmonisation) shows
+        // out-of-box; `default` and `mono` stay background-less.
+        assert!(Theme::preset_default().background.is_none());
+        assert!(Theme::preset_mono().background.is_none());
+        for name in ["bright", "warm", "cool", "solarized", "gruvbox", "nord"] {
+            assert!(
+                Theme::preset(name).unwrap().background.is_some(),
+                "{name} preset should ship a background"
+            );
+        }
+        // Nord's is its polar-night base.
+        assert_eq!(
+            Theme::preset_nord().background,
+            Some(Color::Rgb(0x2e, 0x34, 0x40))
+        );
+    }
+
+    #[test]
+    fn background_is_overridable_and_clearable() {
+        // Set it on a preset that has none…
+        let on = Theme::from_config(&ThemeConfig {
+            background: Some("#101820".to_string()),
+            ..ThemeConfig::default()
+        })
+        .unwrap();
+        assert_eq!(on.background, Some(Color::Rgb(0x10, 0x18, 0x20)));
+        // …and clear a preset's background with an explicit empty string.
+        let off = Theme::from_config(&ThemeConfig {
+            preset: Some("nord".to_string()),
+            background: Some(String::new()),
+            ..ThemeConfig::default()
+        })
+        .unwrap();
+        assert_eq!(off.background, None, "empty string clears the preset bg");
     }
 
     #[test]

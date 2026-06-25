@@ -9,7 +9,7 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 - **Create new sessions from inside the dashboard.** Press `n` to pick a repo, name a task, and pick a base branch — agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/`, writes task metadata, and launches `claude` inside it. Press `N` instead to skip the worktree step and open `claude` straight in the repo root (for quick exploratory chats where a fresh worktree would just be in the way). Either way, the new session lands in the embedded pane next to the sidebar, not a fullscreen handoff. Works equally for local and remote-host repos.
 - **Search / filter** the session list by title, project, or host with `/`.
 - **OS notifications** when a session moves into `needs-input` (libnotify on Linux, `osascript` on macOS, `wsl-notify-send.exe` on WSL).
-- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`), each colouring the state icons (green `done`, red `blocked`, amber `working`, …) plus the focus-border and selection highlight. Per-element overrides on top of any preset; `mono` is the fully-uncoloured option. Run `agent-mux themes` for a swatch preview.
+- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`), each colouring the state icons (green `done`, red `blocked`, amber `working`, …), the focus-border, the selection highlight, and a subtle frame `background` that the embedded terminal harmonises to (so the sidebar and the live session read as one surface). Per-element overrides on top of any preset; `default`/`mono` stay background-less to compose with your terminal. Run `agent-mux themes` for a swatch preview.
 
 ## Keybinds
 
@@ -96,18 +96,26 @@ disabled_hosts = []     # host labels to silence entirely
 #
 # Elements: needs_input (the green "done" accent), blocked (the red
 # "answer me" accent; falls back to needs_input when unset), working,
-# idle, unknown — plus two structural colours: focus_border (the focused
-# pane's border, default cyan) and selection (the selected-row highlight
-# background, default ANSI 238). The attention accents show in
-# `agent-mux themes`; the structural ones are config-only.
+# idle, unknown — plus three structural colours: focus_border (the
+# focused pane's border, default cyan), selection (the selected-row
+# highlight background, default ANSI 238), and background (a colour
+# painted behind the whole frame — sidebar AND the embedded terminal's
+# default cells, so the two panes read as one surface). The attention
+# accents show in `agent-mux themes`; the structural ones are config-only.
+# The coloured presets ship a subtle dark `background`; `default` and
+# `mono` leave it unset so agent-mux composes with your terminal's own
+# background. Note: the embedded terminal only picks up `background` in
+# the cells Claude Code leaves at terminal-default — agent-mux never
+# reconfigures tmux or Claude Code, so a fully matched pane needs your
+# Claude Code / terminal theme to agree.
 #
-# Built-in presets:
-#   "default"   — green done / red blocked / amber working / dim idle (out-of-box colour).
+# Built-in presets (coloured ones ship a subtle dark background):
+#   "default"   — green done / red blocked / amber working / dim idle; no background.
 #   "bright"    — high contrast; every attention state in bright_* variants.
-#   "mono"      — no colours at all (modifiers like bold/dim still apply).
+#   "mono"      — no colours at all (modifiers like bold/dim still apply); no background.
 #   "warm"      — sunset palette: reds, ambers, earthy browns, olive done.
 #   "cool"      — ocean palette: blues, teals, sea-green done (blocked stays rose).
-#   "solarized" — canonical Solarized accents (works on dark or light bg).
+#   "solarized" — canonical Solarized accents over base03 (clear `background` for light bg).
 #   "gruvbox"   — Gruvbox bright variants; earthy / retro on dark terminals.
 #   "nord"      — Nord aurora + frost; slate tones with aurora-coloured events.
 #

@@ -2849,6 +2849,18 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
 /// historical default) + BOLD for a weight fallback on uncoloured
 /// terminals. Unfocused → DIM so the rival pane recedes without
 /// disappearing.
+/// Base style for the embedded terminal widget: when `[theme] background`
+/// is set, its colour fills the cells the inner program leaves at
+/// terminal-default, so the pane harmonises with the themed sidebar; an
+/// empty style otherwise (the terminal's own background shows through).
+/// Render-layer only — never touches the PTY or tmux.
+fn embedded_base_style(theme: &Theme) -> Style {
+    match theme.background {
+        Some(bg) => Style::new().bg(bg),
+        None => Style::new(),
+    }
+}
+
 fn focus_border_style(focused: bool, theme: &Theme) -> Style {
     if focused {
         let colour = theme.focus_border.unwrap_or(ratatui::style::Color::Cyan);
@@ -3104,6 +3116,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         ]
     };
     let layout = Layout::vertical(constraints).split(frame.area());
+
+    // Themed frame background (`[theme] background`): paint the whole area
+    // first so the sidebar, header, footer, and the gaps around the
+    // embedded terminal share one colour. Everything below draws on top;
+    // fg-only widgets (header, list items, footer) let it show through.
+    // Unset (default / mono presets) leaves the terminal's own background.
+    if let Some(bg) = app.theme.background {
+        frame.render_widget(Block::default().style(Style::new().bg(bg)), frame.area());
+    }
 
     let header = Paragraph::new(Line::from(Span::styled(
         " agent-mux ",
@@ -3424,6 +3445,11 @@ fn draw_embedded(
     };
     let label = terminal_block_label(app, &session_id);
 
+    // Capture the themed background before the mutable borrow below; the
+    // embedded terminal's default cells pick it up so the pane matches
+    // the sidebar (render-layer only — nothing is written to tmux).
+    let term_base_style = embedded_base_style(&app.theme);
+
     let Some(embedded) = app.embedded.as_mut() else {
         return;
     };
@@ -3447,7 +3473,7 @@ fn draw_embedded(
 
     embedded.last_inner = Some(inner);
     frame.render_widget(term_block, split[1]);
-    embedded.pty.render(frame, inner);
+    embedded.pty.render(frame, inner, term_base_style);
 }
 
 /// Whether the user is actively engaged with the session whose attention
@@ -4275,6 +4301,22 @@ mod tests {
         let s = focus_border_style(true, &theme);
         assert_eq!(s.fg, Some(ratatui::style::Color::Magenta));
         assert!(s.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn embedded_base_style_carries_theme_background_or_is_empty() {
+        // No background → empty style (terminal's own bg shows through).
+        assert_eq!(embedded_base_style(&Theme::default()).bg, None);
+        // Background set → the terminal widget's default cells get it, so
+        // the pane matches the sidebar.
+        let themed = Theme {
+            background: Some(ratatui::style::Color::Rgb(0x2e, 0x34, 0x40)),
+            ..Theme::default()
+        };
+        assert_eq!(
+            embedded_base_style(&themed).bg,
+            Some(ratatui::style::Color::Rgb(0x2e, 0x34, 0x40))
+        );
     }
 
     #[test]

@@ -381,6 +381,7 @@ fn theme_override_count(t: &crate::config::ThemeConfig) -> usize {
         &t.focus_border,
         &t.selection,
         &t.background,
+        &t.sidebar_bg,
     ]
     .iter()
     .filter(|f| f.is_some())
@@ -453,7 +454,7 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "    focus_border / selection / background                    structural colours"
+        "    focus_border / selection / background / sidebar_bg       structural colours"
     )?;
     writeln!(
         out,

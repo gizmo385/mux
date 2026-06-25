@@ -351,6 +351,12 @@ pub struct ThemeConfig {
     /// Claude Code's own painted background still shows where it sets one
     /// (agent-mux deliberately doesn't reconfigure tmux/Claude Code).
     pub background: Option<String>,
+    /// Background colour of the sidebar panel specifically. Set a shade
+    /// or two *above* `background` to make the sidebar read as a distinct
+    /// panel against the darker content/terminal area (the coloured
+    /// presets do this). Unset falls back to `background`, so a theme that
+    /// only sets `background` gets a uniform frame as before.
+    pub sidebar_bg: Option<String>,
 }
 
 /// Resolved theme: each field is the parsed `ratatui::Color` or `None`
@@ -366,6 +372,7 @@ pub struct Theme {
     pub focus_border: Option<Color>,
     pub selection: Option<Color>,
     pub background: Option<Color>,
+    pub sidebar_bg: Option<Color>,
 }
 
 impl Theme {
@@ -378,6 +385,16 @@ impl Theme {
     #[must_use]
     pub fn blocked_color(&self) -> Option<Color> {
         self.blocked.or(self.needs_input)
+    }
+
+    /// Resolved background for the sidebar panel: the explicit
+    /// `sidebar_bg` when set, otherwise the frame `background` so a theme
+    /// that only sets `background` renders a uniform frame (no distinct
+    /// panel). `None` when neither is set — the sidebar stays at the
+    /// terminal default.
+    #[must_use]
+    pub fn sidebar_bg_color(&self) -> Option<Color> {
+        self.sidebar_bg.or(self.background)
     }
 }
 
@@ -426,6 +443,7 @@ impl Theme {
             idle: Some(Color::DarkGray),
             unknown: Some(Color::Gray),
             background: Some(Color::Rgb(0x10, 0x10, 0x12)), // near-black
+            sidebar_bg: Some(Color::Rgb(0x1f, 0x1f, 0x24)), // elevated panel
             ..Self::default()
         }
     }
@@ -451,6 +469,7 @@ impl Theme {
             idle: Some(Color::Rgb(0x8c, 0x6e, 0x54)),
             unknown: Some(Color::Rgb(0xa0, 0x87, 0x70)),
             background: Some(Color::Rgb(0x1c, 0x14, 0x10)), // dark warm brown
+            sidebar_bg: Some(Color::Rgb(0x2c, 0x21, 0x1a)), // elevated warm panel
             ..Self::default()
         }
     }
@@ -467,6 +486,7 @@ impl Theme {
             idle: Some(Color::Rgb(0x47, 0x66, 0x80)),
             unknown: Some(Color::Rgb(0x5e, 0x7e, 0x94)),
             background: Some(Color::Rgb(0x0d, 0x14, 0x1a)), // dark navy
+            sidebar_bg: Some(Color::Rgb(0x18, 0x24, 0x2e)), // elevated navy panel
             ..Self::default()
         }
     }
@@ -485,6 +505,7 @@ impl Theme {
             idle: Some(Color::Rgb(0x58, 0x6e, 0x75)),        // base01
             unknown: Some(Color::Rgb(0x58, 0x6e, 0x75)),
             background: Some(Color::Rgb(0x00, 0x2b, 0x36)), // base03 (Solarized dark bg)
+            sidebar_bg: Some(Color::Rgb(0x07, 0x36, 0x42)), // base02 (elevated panel)
             ..Self::default()
         }
     }
@@ -501,6 +522,7 @@ impl Theme {
             idle: Some(Color::Rgb(0x92, 0x83, 0x74)),        // gray
             unknown: Some(Color::Rgb(0x92, 0x83, 0x74)),
             background: Some(Color::Rgb(0x1d, 0x20, 0x21)), // dark0_hard
+            sidebar_bg: Some(Color::Rgb(0x3c, 0x38, 0x36)), // bg1 (elevated panel)
             ..Self::default()
         }
     }
@@ -516,6 +538,7 @@ impl Theme {
             idle: Some(Color::Rgb(0x4c, 0x56, 0x6a)),        // polar night
             unknown: Some(Color::Rgb(0x4c, 0x56, 0x6a)),
             background: Some(Color::Rgb(0x2e, 0x34, 0x40)), // nord0 polar night
+            sidebar_bg: Some(Color::Rgb(0x3b, 0x42, 0x52)), // nord1 (elevated panel)
             ..Self::default()
         }
     }
@@ -571,6 +594,7 @@ impl Theme {
             )?,
             selection: overlay("selection", cfg.selection.as_deref(), base.selection)?,
             background: overlay("background", cfg.background.as_deref(), base.background)?,
+            sidebar_bg: overlay("sidebar_bg", cfg.sidebar_bg.as_deref(), base.sidebar_bg)?,
         })
     }
 }
@@ -1323,6 +1347,46 @@ sound = true
         assert_eq!(theme.focus_border, None);
         assert_eq!(theme.selection, None);
         assert_eq!(theme.background, None);
+        assert_eq!(theme.sidebar_bg, None);
+        assert_eq!(theme.sidebar_bg_color(), None);
+    }
+
+    #[test]
+    fn coloured_presets_make_sidebar_a_distinct_panel() {
+        // The sidebar shade sits *above* the frame background so the
+        // sidebar reads as a panel against the darker content area.
+        let nord = Theme::preset_nord();
+        assert_eq!(nord.background, Some(Color::Rgb(0x2e, 0x34, 0x40)));
+        assert_eq!(nord.sidebar_bg, Some(Color::Rgb(0x3b, 0x42, 0x52)));
+        assert_ne!(
+            nord.sidebar_bg, nord.background,
+            "sidebar must differ from the content background"
+        );
+        // default / mono stay panel-less.
+        assert!(Theme::preset_default().sidebar_bg.is_none());
+        assert!(Theme::preset_mono().sidebar_bg.is_none());
+    }
+
+    #[test]
+    fn sidebar_bg_falls_back_to_background_then_none() {
+        // Only `background` set → sidebar matches it (uniform frame).
+        let uniform = Theme {
+            background: Some(Color::Rgb(0x10, 0x10, 0x10)),
+            sidebar_bg: None,
+            ..Theme::default()
+        };
+        assert_eq!(
+            uniform.sidebar_bg_color(),
+            Some(Color::Rgb(0x10, 0x10, 0x10))
+        );
+        // Explicit sidebar_bg wins.
+        let panel = Theme {
+            sidebar_bg: Some(Color::Rgb(0x22, 0x22, 0x22)),
+            ..uniform
+        };
+        assert_eq!(panel.sidebar_bg_color(), Some(Color::Rgb(0x22, 0x22, 0x22)));
+        // Neither set → None.
+        assert_eq!(Theme::default().sidebar_bg_color(), None);
     }
 
     #[test]

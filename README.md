@@ -96,18 +96,19 @@ disabled_hosts = []     # host labels to silence entirely
 #
 # Elements: needs_input (the green "done" accent), blocked (the red
 # "answer me" accent; falls back to needs_input when unset), working,
-# idle, unknown — plus three structural colours: focus_border (the
-# focused pane's border, default cyan), selection (the selected-row
-# highlight background, default ANSI 238), and background (a colour
-# painted behind the whole frame — sidebar AND the embedded terminal's
-# default cells, so the two panes read as one surface). The attention
-# accents show in `agent-mux themes`; the structural ones are config-only.
-# The coloured presets ship a subtle dark `background`; `default` and
-# `mono` leave it unset so agent-mux composes with your terminal's own
-# background. Note: the embedded terminal only picks up `background` in
-# the cells Claude Code leaves at terminal-default — agent-mux never
-# reconfigures tmux or Claude Code, so a fully matched pane needs your
-# Claude Code / terminal theme to agree.
+# idle, unknown — plus four structural colours: focus_border (the focused
+# pane's border, default cyan), selection (the selected-row highlight
+# background, default ANSI 238), background (painted behind the content/
+# header/footer and the embedded terminal's default cells), and
+# sidebar_bg (the sidebar panel, set a shade above `background` so the
+# sidebar reads as a distinct panel; falls back to `background` when
+# unset). The attention accents show in `agent-mux themes`; the
+# structural ones are config-only. The coloured presets ship a dark
+# `background` + a lighter `sidebar_bg`; `default` and `mono` leave both
+# unset so agent-mux composes with your terminal's own background. Note:
+# the embedded terminal only picks up `background` in the cells Claude
+# Code leaves at terminal-default — agent-mux never reconfigures tmux or
+# Claude Code, so a fully matched pane needs your terminal theme to agree.
 #
 # Built-in presets (coloured ones ship a subtle dark background):
 #   "default"   — green done / red blocked / amber working / dim idle; no background.

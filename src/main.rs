@@ -3149,10 +3149,18 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.session_names,
         &app.favorites,
     );
-    let sidebar_block = Block::default()
+    let mut sidebar_block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(sidebar_border_style(app));
+    // Paint the sidebar as a distinct panel: its own (elevated) shade
+    // over the darker frame `background`, so the list reads as a panel
+    // against the content/terminal area rather than blending in. Falls
+    // back to `background` (uniform) when only that is themed; nothing
+    // when neither is set.
+    if let Some(sidebar_bg) = app.theme.sidebar_bg_color() {
+        sidebar_block = sidebar_block.style(Style::new().bg(sidebar_bg));
+    }
     let list = List::new(items)
         .block(sidebar_block)
         // A background highlight rather than REVERSED: REVERSED inverts
@@ -4301,6 +4309,37 @@ mod tests {
         let s = focus_border_style(true, &theme);
         assert_eq!(s.fg, Some(ratatui::style::Color::Magenta));
         assert!(s.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn themed_background_fill_paints_every_cell() {
+        // Proves the draw-time `frame.render_widget(Block::default()
+        // .style(bg), frame.area())` pattern actually fills the buffer
+        // background — the render-layer mechanism behind `[theme]
+        // background`. If this passes and a preset still "looks the same",
+        // the colour is just too close to the terminal's own background,
+        // not a wiring bug.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Block;
+
+        let bg = ratatui::style::Color::Rgb(0x28, 0x28, 0x28);
+        let mut terminal = Terminal::new(TestBackend::new(6, 3)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Block::default().style(Style::new().bg(bg)), frame.area());
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        for y in 0..3 {
+            for x in 0..6 {
+                assert_eq!(
+                    buf[(x, y)].bg,
+                    bg,
+                    "cell ({x},{y}) should carry the themed bg"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2845,14 +2845,14 @@ fn action_for(key: KeyEvent, tools: &[ToolBinding]) -> Option<Action> {
 /// weight fallback. Unfocused → DIM so the rival pane recedes without
 /// disappearing.
 ///
-/// Colour is hardcoded rather than themed for now; a `[theme.focus_border]`
-/// extension is filed in TODO under "extend [theme] schema beyond
-/// foreground colours".
-fn focus_border_style(focused: bool) -> Style {
+/// Focused → the themed `focus_border` colour (cyan when unset, the
+/// historical default) + BOLD for a weight fallback on uncoloured
+/// terminals. Unfocused → DIM so the rival pane recedes without
+/// disappearing.
+fn focus_border_style(focused: bool, theme: &Theme) -> Style {
     if focused {
-        Style::new()
-            .fg(ratatui::style::Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        let colour = theme.focus_border.unwrap_or(ratatui::style::Color::Cyan);
+        Style::new().fg(colour).add_modifier(Modifier::BOLD)
     } else {
         Style::new().add_modifier(Modifier::DIM)
     }
@@ -2972,7 +2972,7 @@ fn build_sidebar_items(
 /// against and the border stays plain.
 fn sidebar_border_style(app: &App) -> Style {
     if app.embedded.is_some() {
-        focus_border_style(matches!(app.focus, Focus::Sidebar))
+        focus_border_style(matches!(app.focus, Focus::Sidebar), &app.theme)
     } else {
         Style::new()
     }
@@ -3138,8 +3138,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         // fg/bg, which turned the dim second line into low-contrast dark
         // text on a light bar. A dark-grey background keeps every span's
         // own colour/weight (titles, the coloured state word, the dim
-        // detail) legible, and the `▌` bar still marks the row.
-        .highlight_style(Style::new().bg(ratatui::style::Color::Indexed(238)))
+        // detail) legible, and the `▌` bar still marks the row. The
+        // colour is themeable via `[theme] selection`, defaulting to the
+        // historical ANSI 238 dark grey.
+        .highlight_style(
+            Style::new().bg(app
+                .theme
+                .selection
+                .unwrap_or(ratatui::style::Color::Indexed(238))),
+        )
         // One-column bar (was "▌ "): the background highlight is the
         // primary selection cue now, so the gutter only needs a thin
         // edge — reclaiming a column keeps session titles flush-left.
@@ -3423,7 +3430,7 @@ fn draw_embedded(
     let term_block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {label} "))
-        .border_style(focus_border_style(term_focus));
+        .border_style(focus_border_style(term_focus, &app.theme));
     let inner = term_block.inner(split[1]);
 
     // Resize cascade: best-effort on each frame, only firing when the
@@ -3889,19 +3896,29 @@ fn format_session_row(
         l1.push(Span::styled(format!("({suffix})"), dim));
     }
 
-    // ---- Line 2: coloured state word + dim detail ----
-    // The state word carries the attention signal: bold + the themed
-    // attention colour when the session wants the user (blocked / done),
-    // dim when it doesn't (working / idle). The word reads on any theme;
-    // colour is the at-a-glance enhancement where the user has themed it
-    // — so the signal survives the default uncoloured preset via weight.
+    // ---- Line 2: coloured state icon + word + dim detail ----
+    // A coloured glyph leads the state line so the dashboard scans at a
+    // glance (✓ done, ! blocked, ◐ working, ○ idle, · unknown); the word
+    // stays beside it so the signal still reads on the `mono` preset and
+    // there's no glyph legend to memorise. Both carry the same style:
+    // bold + the themed accent when the session wants the user (done /
+    // blocked), dim otherwise (working / idle). Blocked pulls its own
+    // colour (red by default) so "answer me" reads apart from a green
+    // "done"; `blocked_color` falls back to `needs_input` when a theme
+    // only colours one of them.
     let needs_user = attention == Attention::NeedsInput;
+    let colour = if blocked {
+        theme.blocked_color()
+    } else {
+        attention_color(attention, theme)
+    };
     let word_base = if needs_user {
         Style::new().add_modifier(Modifier::BOLD)
     } else {
         dim
     };
-    let word_style = apply_fg(word_base, attention_color(attention, theme));
+    let word_style = apply_fg(word_base, colour);
+    let glyph = attention_glyph(attention, blocked);
     let state = attention_word(attention, blocked);
 
     // Dim detail after the state word: time-in-state, then the task's
@@ -3926,7 +3943,7 @@ fn format_session_row(
 
     let l2 = vec![
         Span::raw("  "),
-        Span::styled(state.to_string(), word_style),
+        Span::styled(format!("{glyph} {state}"), word_style),
         Span::styled(detail, dim),
     ];
 
@@ -3968,6 +3985,22 @@ fn attention_word(a: Attention, blocked: bool) -> &'static str {
         Attention::Working => "working",
         Attention::Idle => "idle",
         Attention::Unknown => "—",
+    }
+}
+
+/// At-a-glance glyph for a session's display state, rendered before the
+/// word on the sidebar's second line. Distinct *shapes* (not just
+/// colour) so blocked vs done survives a colourblind eye and the `mono`
+/// preset: `✓` done, `!` blocked, `◐` working, `○` idle, `·` unknown.
+fn attention_glyph(a: Attention, blocked: bool) -> &'static str {
+    if blocked && a == Attention::NeedsInput {
+        return "!";
+    }
+    match a {
+        Attention::NeedsInput => "✓",
+        Attention::Working => "◐",
+        Attention::Idle => "○",
+        Attention::Unknown => "·",
     }
 }
 
@@ -4225,16 +4258,28 @@ mod tests {
     }
 
     #[test]
-    fn focus_border_style_focused_is_bold_cyan() {
-        let s = focus_border_style(true);
+    fn focus_border_style_focused_is_bold_cyan_by_default() {
+        // Unset `focus_border` falls back to the historical cyan.
+        let s = focus_border_style(true, &Theme::default());
         assert_eq!(s.fg, Some(ratatui::style::Color::Cyan));
         assert!(s.add_modifier.contains(Modifier::BOLD));
         assert!(!s.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
+    fn focus_border_style_focused_honours_themed_colour() {
+        let theme = Theme {
+            focus_border: Some(ratatui::style::Color::Magenta),
+            ..Theme::default()
+        };
+        let s = focus_border_style(true, &theme);
+        assert_eq!(s.fg, Some(ratatui::style::Color::Magenta));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn focus_border_style_unfocused_is_dim_no_colour() {
-        let s = focus_border_style(false);
+        let s = focus_border_style(false, &Theme::default());
         assert_eq!(s.fg, None);
         assert!(s.add_modifier.contains(Modifier::DIM));
         assert!(!s.add_modifier.contains(Modifier::BOLD));
@@ -5446,6 +5491,17 @@ mod tests {
     }
 
     #[test]
+    fn attention_glyph_maps_states_including_blocked() {
+        assert_eq!(attention_glyph(Attention::NeedsInput, true), "!");
+        assert_eq!(attention_glyph(Attention::NeedsInput, false), "✓");
+        assert_eq!(attention_glyph(Attention::Working, false), "◐");
+        assert_eq!(attention_glyph(Attention::Idle, false), "○");
+        assert_eq!(attention_glyph(Attention::Unknown, false), "·");
+        // The blocked glyph only applies to NeedsInput.
+        assert_eq!(attention_glyph(Attention::Working, true), "◐");
+    }
+
+    #[test]
     fn quickswitch_label_follows_override_then_title_then_id_suffix() {
         let id = SessionId("abcdef0123456789".to_string());
         // Override wins over everything.
@@ -5529,6 +5585,55 @@ mod tests {
             !l2.contains("done"),
             "blocked must not read as done: {l2:?}"
         );
+        assert!(l2.contains('!'), "blocked shows the ! icon: {l2:?}");
+    }
+
+    /// Foreground colour of the line-2 span whose text contains `needle`
+    /// — used to assert the state icon+word picks up the right accent.
+    fn state_span_fg(line: &Line<'static>, needle: &str) -> Option<ratatui::style::Color> {
+        line.spans
+            .iter()
+            .find(|s| s.content.contains(needle))
+            .and_then(|s| s.style.fg)
+    }
+
+    #[test]
+    fn format_session_row_done_and_blocked_use_distinct_default_colours() {
+        // The user's "both are red feels wrong": under the default
+        // theme, done is green and blocked is red — a colour split, not
+        // just a different word.
+        let now = SystemTime::now();
+
+        let mut done = mock_session("d");
+        done.title = Some("finished".into());
+        done.attention = Attention::NeedsInput;
+        done.last_activity = now;
+        let done_lines = format_session_row(&done, &theme_default_resolved(), None, false, false);
+        assert_eq!(
+            state_span_fg(&done_lines[1], "done"),
+            Some(ratatui::style::Color::Green),
+            "done is green"
+        );
+
+        let mut blocked = mock_session("b");
+        blocked.title = Some("waiting".into());
+        blocked.attention = Attention::NeedsInput;
+        blocked.blocking_prompt = true;
+        blocked.last_activity = now;
+        let blocked_lines =
+            format_session_row(&blocked, &theme_default_resolved(), None, false, false);
+        assert_eq!(
+            state_span_fg(&blocked_lines[1], "blocked"),
+            Some(ratatui::style::Color::Red),
+            "blocked is red — distinct from done's green"
+        );
+    }
+
+    /// The default preset, resolved through `from_config` exactly as the
+    /// app does at startup (the bare `Theme::default()` is all-`None`;
+    /// the colours live in `preset_default`).
+    fn theme_default_resolved() -> Theme {
+        Theme::from_config(&crate::config::ThemeConfig::default()).expect("default theme")
     }
 
     #[test]

@@ -4,12 +4,12 @@ A fast, terminal-first multiplexer for managing multiple Claude Code conversatio
 
 ## Features
 
-- **One dashboard for every Claude Code session you have running** — locally and on any SSH-reachable host you've configured. Sessions group by host, then by project. Each session is a two-line row: line 1 is the title; line 2 is a status line led by the state in words — `blocked` / `done` / `working` / `idle` — followed by how long it's been in that state and the task's age (e.g. `working 18m · 45m old`). The state word is the attention signal: it's **bold and themed-coloured when the session wants you** (`blocked` or `done`), and dim when it doesn't (`working` / `idle`), so the ones needing attention pop without a glyph column eating into the title. `blocked` (the agent is waiting on your answer to a permission/elicitation prompt) reads apart from `done` (finished its turn) — telling them apart requires the `Notification` hook (below), since the transcript alone can't. The `<n> old` age comes from agent-mux's task metadata, so it shows for sessions agent-mux created (it's the worktree's age, not active runtime); externally-started sessions show just the state + time-in-state.
+- **One dashboard for every Claude Code session you have running** — locally and on any SSH-reachable host you've configured. Sessions group by host, then by project. Each session is a two-line row: line 1 is the title; line 2 is a status line led by a coloured state icon + word — `✓ done` / `! blocked` / `◐ working` / `○ idle` — followed by how long it's been in that state and the task's age (e.g. `◐ working 18m · 45m old`). The icon + word is the attention signal: it's **bold and themed-coloured when the session wants you** (`! blocked` in red, `✓ done` in green by default), and dim when it doesn't (`working` / `idle`), so the ones needing attention pop at a glance; the word stays beside the glyph so the state still reads on the uncoloured `mono` palette. `blocked` (the agent is waiting on your answer to a permission/elicitation prompt) reads apart from `done` (finished its turn) — telling them apart requires the `Notification` hook (below), since the transcript alone can't. The `<n> old` age comes from agent-mux's task metadata, so it shows for sessions agent-mux created (it's the worktree's age, not active runtime); externally-started sessions show just the state + time-in-state.
 - **Attach without leaving the dashboard.** Pressing Enter hosts the active session inside an embedded terminal pane next to the sidebar: you see tmux + Claude Code on the right, the live session list on the left, and the sidebar keeps updating other sessions' attention state while you work. `--no-embed` reverts to the legacy "take over the whole terminal" behaviour for users who prefer it.
 - **Create new sessions from inside the dashboard.** Press `n` to pick a repo, name a task, and pick a base branch — agent-mux creates a git worktree under `<workspace>/.agent-mux-worktrees/`, writes task metadata, and launches `claude` inside it. Press `N` instead to skip the worktree step and open `claude` straight in the repo root (for quick exploratory chats where a fresh worktree would just be in the way). Either way, the new session lands in the embedded pane next to the sidebar, not a fullscreen handoff. Works equally for local and remote-host repos.
 - **Search / filter** the session list by title, project, or host with `/`.
 - **OS notifications** when a session moves into `needs-input` (libnotify on Linux, `osascript` on macOS, `wsl-notify-send.exe` on WSL).
-- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`) with per-element overrides. Run `agent-mux themes` for a swatch preview.
+- **Themes** — eight built-in palettes (`default`, `bright`, `mono`, `warm`, `cool`, `solarized`, `gruvbox`, `nord`), each colouring the state icons (green `done`, red `blocked`, amber `working`, …) plus the focus-border and selection highlight. Per-element overrides on top of any preset; `mono` is the fully-uncoloured option. Run `agent-mux themes` for a swatch preview.
 
 ## Keybinds
 
@@ -94,12 +94,19 @@ disabled_hosts = []     # host labels to silence entirely
 # "default") clears that field — useful for subtracting a colour from a
 # preset. Bad names fail loudly at load.
 #
+# Elements: needs_input (the green "done" accent), blocked (the red
+# "answer me" accent; falls back to needs_input when unset), working,
+# idle, unknown — plus two structural colours: focus_border (the focused
+# pane's border, default cyan) and selection (the selected-row highlight
+# background, default ANSI 238). The attention accents show in
+# `agent-mux themes`; the structural ones are config-only.
+#
 # Built-in presets:
-#   "default"   — uncoloured attention states (bold/dim weight still applies).
+#   "default"   — green done / red blocked / amber working / dim idle (out-of-box colour).
 #   "bright"    — high contrast; every attention state in bright_* variants.
 #   "mono"      — no colours at all (modifiers like bold/dim still apply).
-#   "warm"      — sunset palette: reds, ambers, earthy browns.
-#   "cool"      — ocean palette: blues, teals, sea greens (errors stay rose).
+#   "warm"      — sunset palette: reds, ambers, earthy browns, olive done.
+#   "cool"      — ocean palette: blues, teals, sea-green done (blocked stays rose).
 #   "solarized" — canonical Solarized accents (works on dark or light bg).
 #   "gruvbox"   — Gruvbox bright variants; earthy / retro on dark terminals.
 #   "nord"      — Nord aurora + frost; slate tones with aurora-coloured events.
@@ -107,7 +114,8 @@ disabled_hosts = []     # host labels to silence entirely
 # With no `[theme]` section, the "default" preset applies.
 [theme]
 preset = "bright"
-needs_input = "#ff5555"    # override one field on top of the preset
+needs_input = "#5fd75f"    # override one field on top of the preset
+blocked = "#ff5555"        # colour "answer me" apart from "done"
 
 [ui]
 sessions_per_project = 5   # cap rows per project; the rest collapse behind

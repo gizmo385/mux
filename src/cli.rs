@@ -105,7 +105,8 @@ pub fn print_themes<W: Write>(out: &mut W, color: bool) -> io::Result<()> {
 /// config field name. [`theme_field`] dispatches on the label so adding
 /// a column is a one-line change here once a new theme field lands.
 const THEME_TABLE_COLUMNS: &[(&str, &str)] = &[
-    ("●", "needs_input"),
+    ("✓", "needs_input"),
+    ("!", "blocked"),
     ("◐", "working"),
     ("○", "idle"),
     ("·", "unknown"),
@@ -114,6 +115,7 @@ const THEME_TABLE_COLUMNS: &[(&str, &str)] = &[
 fn theme_field(t: &Theme, label: &str) -> Option<Color> {
     match label {
         "needs_input" => t.needs_input,
+        "blocked" => t.blocked,
         "working" => t.working,
         "idle" => t.idle,
         "unknown" => t.unknown,
@@ -370,10 +372,18 @@ fn print_parsed_config<W: Write>(out: &mut W, cfg: &Config) -> io::Result<()> {
 }
 
 fn theme_override_count(t: &crate::config::ThemeConfig) -> usize {
-    [&t.needs_input, &t.working, &t.idle, &t.unknown]
-        .iter()
-        .filter(|f| f.is_some())
-        .count()
+    [
+        &t.needs_input,
+        &t.blocked,
+        &t.working,
+        &t.idle,
+        &t.unknown,
+        &t.focus_border,
+        &t.selection,
+    ]
+    .iter()
+    .filter(|f| f.is_some())
+    .count()
 }
 
 /// Print a compact one-screen reference of every config key. Lives at
@@ -436,7 +446,14 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
         out,
         "    preset = \"default\"           one of: {preset_list}"
     )?;
-    writeln!(out, "    needs_input / working / idle / unknown")?;
+    writeln!(
+        out,
+        "    needs_input(done) / blocked / working / idle / unknown   accent colours"
+    )?;
+    writeln!(
+        out,
+        "    focus_border / selection                                structural colours"
+    )?;
     writeln!(
         out,
         "                                 colour: \"red\" | \"bright_red\" | \"#RRGGBB\" | \"\""
@@ -618,7 +635,7 @@ mod tests {
         // able to see needs_input / working / etc. by name so the
         // swatch maps back to the config key without guessing.
         let out = run(|w| print_themes(w, false));
-        for field in ["needs_input", "working", "idle", "unknown"] {
+        for field in ["needs_input", "blocked", "working", "idle", "unknown"] {
             assert!(out.contains(field), "missing element {field:?}: {out}");
         }
     }

@@ -315,14 +315,32 @@ impl ToolBinding {
 pub struct ThemeConfig {
     /// Named baseline. See [`Theme::preset_names`] for the built-in set.
     pub preset: Option<String>,
-    /// Colour of the `●` glyph for sessions in `NeedsInput`.
+    /// Colour of the `✓` "done" state — a session that finished its turn
+    /// and is waiting for your next message (transcript-derived
+    /// `NeedsInput` with no blocking prompt).
     pub needs_input: Option<String>,
+    /// Colour of the `!` "blocked" state — a session waiting on a
+    /// specific answer (a permission / elicitation prompt, surfaced by
+    /// the `Notification` hook). Distinct from `needs_input` so "answer
+    /// me" reads apart from "done"; falls back to `needs_input` when
+    /// unset so themers who only colour one of them still get a sensible
+    /// blocked colour.
+    pub blocked: Option<String>,
     /// Colour of the `◐` glyph for sessions currently `Working`.
     pub working: Option<String>,
     /// Colour of the `○` glyph for `Idle` sessions.
     pub idle: Option<String>,
     /// Colour of the `·` glyph for `Unknown` (no signal yet) sessions.
     pub unknown: Option<String>,
+    /// Colour of the focused-pane border (sidebar / embedded terminal).
+    /// Unset falls back to the historical cyan so existing configs are
+    /// unchanged. A structural element, not an attention accent — so it
+    /// is *not* shown in the `agent-mux themes` table.
+    pub focus_border: Option<String>,
+    /// Background colour of the selected sidebar row. Unset falls back to
+    /// the historical dark grey (ANSI 238). Structural, like
+    /// `focus_border`.
+    pub selection: Option<String>,
 }
 
 /// Resolved theme: each field is the parsed `ratatui::Color` or `None`
@@ -331,9 +349,25 @@ pub struct ThemeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Theme {
     pub needs_input: Option<Color>,
+    pub blocked: Option<Color>,
     pub working: Option<Color>,
     pub idle: Option<Color>,
     pub unknown: Option<Color>,
+    pub focus_border: Option<Color>,
+    pub selection: Option<Color>,
+}
+
+impl Theme {
+    /// Resolved colour for the `blocked` state: the explicit `blocked`
+    /// colour when set, otherwise the `needs_input` ("done") colour so a
+    /// theme that only colours one attention accent still renders blocked
+    /// sensibly (the glyph + bold weight carry the rest of the
+    /// distinction). Centralised so render paths don't re-implement the
+    /// fallback.
+    #[must_use]
+    pub fn blocked_color(&self) -> Option<Color> {
+        self.blocked.or(self.needs_input)
+    }
 }
 
 impl Theme {
@@ -353,15 +387,19 @@ impl Theme {
         ]
     }
 
-    /// The "default" preset: attention glyphs uncoloured. Used when
-    /// `cfg.preset` is absent.
+    /// The "default" preset: green "done", red "blocked", amber
+    /// "working", dim idle/unknown — the out-of-box colours so the state
+    /// icons read at a glance with no config at all. `mono` is the
+    /// no-colour escape hatch for terminals or tastes that want it.
     #[must_use]
     pub fn preset_default() -> Self {
         Self {
-            needs_input: None,
-            working: None,
-            idle: None,
-            unknown: None,
+            needs_input: Some(Color::Green),
+            blocked: Some(Color::Red),
+            working: Some(Color::Yellow),
+            idle: Some(Color::DarkGray),
+            unknown: Some(Color::DarkGray),
+            ..Self::default()
         }
     }
 
@@ -371,46 +409,51 @@ impl Theme {
     #[must_use]
     pub fn preset_bright() -> Self {
         Self {
-            needs_input: Some(Color::LightRed),
+            needs_input: Some(Color::LightGreen),
+            blocked: Some(Color::LightRed),
             working: Some(Color::LightYellow),
             idle: Some(Color::DarkGray),
             unknown: Some(Color::Gray),
+            ..Self::default()
         }
     }
 
     /// Monochrome: no foreground colours at all. The bold modifier on
-    /// user prompts is the lone structural signal carrying the user
-    /// versus assistant distinction. For users on terminals without
-    /// colour, or simply for a quieter palette.
+    /// the "done"/"blocked" state words and the glyph shapes are the
+    /// lone signals. For users on terminals without colour, or simply
+    /// for a quieter palette.
     #[must_use]
     pub fn preset_mono() -> Self {
         Self::default()
     }
 
-    /// Sunset / warm palette: reds, ambers, and earthy browns. Picks
-    /// custom RGB instead of plain `Yellow`/`Red` so the warmth is more
-    /// distinctive than the bare ANSI red would suggest.
+    /// Sunset / warm palette: reds, ambers, and earthy browns, with a
+    /// warm olive-green "done". Picks custom RGB instead of plain
+    /// `Yellow`/`Red` so the warmth is more distinctive than bare ANSI.
     #[must_use]
     pub fn preset_warm() -> Self {
         Self {
-            needs_input: Some(Color::Rgb(0xff, 0x57, 0x33)),
+            needs_input: Some(Color::Rgb(0x9e, 0xcd, 0x4c)), // olive green
+            blocked: Some(Color::Rgb(0xff, 0x57, 0x33)),     // sunset red
             working: Some(Color::Rgb(0xf4, 0xa7, 0x38)),
             idle: Some(Color::Rgb(0x8c, 0x6e, 0x54)),
             unknown: Some(Color::Rgb(0xa0, 0x87, 0x70)),
+            ..Self::default()
         }
     }
 
-    /// Ocean / cool palette: blues, teals, sea greens. Errors stay
-    /// rose-red so attention still pops against the surrounding cool
-    /// tones — a pure all-blue palette buries the primary attention
-    /// signal.
+    /// Ocean / cool palette: blues, teals, sea greens. "Done" is a
+    /// sea-green, "blocked" stays rose-red so the answer-me signal still
+    /// pops against the surrounding cool tones.
     #[must_use]
     pub fn preset_cool() -> Self {
         Self {
-            needs_input: Some(Color::Rgb(0xe2, 0x6d, 0x75)),
+            needs_input: Some(Color::Rgb(0x5f, 0xd7, 0xa7)), // sea green
+            blocked: Some(Color::Rgb(0xe2, 0x6d, 0x75)),     // rose
             working: Some(Color::Rgb(0x6c, 0xb4, 0xd6)),
             idle: Some(Color::Rgb(0x47, 0x66, 0x80)),
             unknown: Some(Color::Rgb(0x5e, 0x7e, 0x94)),
+            ..Self::default()
         }
     }
 
@@ -421,10 +464,12 @@ impl Theme {
     #[must_use]
     pub fn preset_solarized() -> Self {
         Self {
-            needs_input: Some(Color::Rgb(0xdc, 0x32, 0x2f)), // red
+            needs_input: Some(Color::Rgb(0x85, 0x99, 0x00)), // green
+            blocked: Some(Color::Rgb(0xdc, 0x32, 0x2f)),     // red
             working: Some(Color::Rgb(0xb5, 0x89, 0x00)),     // yellow
             idle: Some(Color::Rgb(0x58, 0x6e, 0x75)),        // base01
             unknown: Some(Color::Rgb(0x58, 0x6e, 0x75)),
+            ..Self::default()
         }
     }
 
@@ -434,22 +479,26 @@ impl Theme {
     #[must_use]
     pub fn preset_gruvbox() -> Self {
         Self {
-            needs_input: Some(Color::Rgb(0xfb, 0x49, 0x34)), // bright red
+            needs_input: Some(Color::Rgb(0xb8, 0xbb, 0x26)), // bright green
+            blocked: Some(Color::Rgb(0xfb, 0x49, 0x34)),     // bright red
             working: Some(Color::Rgb(0xfa, 0xbd, 0x2f)),     // bright yellow
             idle: Some(Color::Rgb(0x92, 0x83, 0x74)),        // gray
             unknown: Some(Color::Rgb(0x92, 0x83, 0x74)),
+            ..Self::default()
         }
     }
 
     /// Nord aurora + frost palette. Cool slate tones with the aurora
-    /// accents (red, yellow, green) for the primary semantic events.
+    /// accents (green, red, yellow) for the primary semantic events.
     #[must_use]
     pub fn preset_nord() -> Self {
         Self {
-            needs_input: Some(Color::Rgb(0xbf, 0x61, 0x6a)), // aurora red
+            needs_input: Some(Color::Rgb(0xa3, 0xbe, 0x8c)), // aurora green
+            blocked: Some(Color::Rgb(0xbf, 0x61, 0x6a)),     // aurora red
             working: Some(Color::Rgb(0xeb, 0xcb, 0x8b)),     // aurora yellow
             idle: Some(Color::Rgb(0x4c, 0x56, 0x6a)),        // polar night
             unknown: Some(Color::Rgb(0x4c, 0x56, 0x6a)),
+            ..Self::default()
         }
     }
 
@@ -493,9 +542,16 @@ impl Theme {
         };
         Ok(Self {
             needs_input: overlay("needs_input", cfg.needs_input.as_deref(), base.needs_input)?,
+            blocked: overlay("blocked", cfg.blocked.as_deref(), base.blocked)?,
             working: overlay("working", cfg.working.as_deref(), base.working)?,
             idle: overlay("idle", cfg.idle.as_deref(), base.idle)?,
             unknown: overlay("unknown", cfg.unknown.as_deref(), base.unknown)?,
+            focus_border: overlay(
+                "focus_border",
+                cfg.focus_border.as_deref(),
+                base.focus_border,
+            )?,
+            selection: overlay("selection", cfg.selection.as_deref(), base.selection)?,
         })
     }
 }
@@ -1231,15 +1287,28 @@ sound = true
     }
 
     #[test]
-    fn theme_default_leaves_attention_glyphs_uncoloured() {
-        // The default preset keeps the attention glyphs at the
-        // terminal's default foreground — a bare `ThemeConfig::default()`
-        // must reflect that.
+    fn theme_default_colours_done_green_and_blocked_red() {
+        // The default preset now ships the out-of-box state colours
+        // (green "done", red "blocked", amber "working", dim idle/unknown)
+        // so the icons read at a glance with no config. `mono` is the
+        // uncoloured escape hatch.
         let theme = Theme::from_config(&ThemeConfig::default()).expect("default theme parses");
+        assert_eq!(theme.needs_input, Some(Color::Green));
+        assert_eq!(theme.blocked, Some(Color::Red));
+        assert_eq!(theme.working, Some(Color::Yellow));
+        assert_eq!(theme.idle, Some(Color::DarkGray));
+        assert_eq!(theme.unknown, Some(Color::DarkGray));
+        // Structural elements still inherit their hardcoded fallbacks.
+        assert_eq!(theme.focus_border, None);
+        assert_eq!(theme.selection, None);
+    }
+
+    #[test]
+    fn theme_mono_preset_is_fully_uncoloured() {
+        let theme = Theme::preset_mono();
+        assert_eq!(theme, Theme::default());
         assert_eq!(theme.needs_input, None);
-        assert_eq!(theme.working, None);
-        assert_eq!(theme.idle, None);
-        assert_eq!(theme.unknown, None);
+        assert_eq!(theme.blocked, None);
     }
 
     #[test]
@@ -1410,24 +1479,46 @@ sound = true
     }
 
     #[test]
-    fn solarized_uses_canonical_red_accent() {
+    fn solarized_splits_green_done_from_red_blocked() {
         // Pin one well-known value from each named palette so a
         // future refactor of the preset constants doesn't silently
-        // drift away from the spec.
+        // drift away from the spec. "done" is the palette green,
+        // "blocked" the palette red.
         let solarized = Theme::preset_solarized();
-        assert_eq!(solarized.needs_input, Some(Color::Rgb(0xdc, 0x32, 0x2f)));
+        assert_eq!(solarized.needs_input, Some(Color::Rgb(0x85, 0x99, 0x00)));
+        assert_eq!(solarized.blocked, Some(Color::Rgb(0xdc, 0x32, 0x2f)));
     }
 
     #[test]
-    fn gruvbox_uses_bright_red_accent() {
+    fn gruvbox_splits_green_done_from_red_blocked() {
         let gruvbox = Theme::preset_gruvbox();
-        assert_eq!(gruvbox.needs_input, Some(Color::Rgb(0xfb, 0x49, 0x34)));
+        assert_eq!(gruvbox.needs_input, Some(Color::Rgb(0xb8, 0xbb, 0x26)));
+        assert_eq!(gruvbox.blocked, Some(Color::Rgb(0xfb, 0x49, 0x34)));
     }
 
     #[test]
-    fn nord_uses_aurora_red_accent() {
+    fn nord_splits_green_done_from_red_blocked() {
         let nord = Theme::preset_nord();
-        assert_eq!(nord.needs_input, Some(Color::Rgb(0xbf, 0x61, 0x6a)));
+        assert_eq!(nord.needs_input, Some(Color::Rgb(0xa3, 0xbe, 0x8c)));
+        assert_eq!(nord.blocked, Some(Color::Rgb(0xbf, 0x61, 0x6a)));
+    }
+
+    #[test]
+    fn blocked_color_falls_back_to_needs_input_when_unset() {
+        // A theme that colours only `needs_input` still gets a sensible
+        // blocked colour (the same one) rather than the terminal default.
+        let theme = Theme {
+            needs_input: Some(Color::Green),
+            blocked: None,
+            ..Theme::default()
+        };
+        assert_eq!(theme.blocked_color(), Some(Color::Green));
+        // An explicit blocked colour wins.
+        let split = Theme {
+            blocked: Some(Color::Red),
+            ..theme
+        };
+        assert_eq!(split.blocked_color(), Some(Color::Red));
     }
 
     #[test]
@@ -1461,8 +1552,9 @@ working = "#aabbcc"
         let theme = Theme::from_config(&cfg.theme).expect("resolve");
         assert_eq!(theme.needs_input, Some(Color::Red));
         assert_eq!(theme.working, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
-        // Un-overridden field stays at the default preset value (None).
-        assert_eq!(theme.idle, None);
+        // Un-overridden field inherits the (now-coloured) default preset
+        // value — idle is dim grey, not the terminal default.
+        assert_eq!(theme.idle, Some(Color::DarkGray));
     }
 
     #[test]

@@ -3936,7 +3936,10 @@ fn format_session_row(
     // stays beside it so the signal still reads on the `mono` preset and
     // there's no glyph legend to memorise. Both carry the same style:
     // bold + the themed accent when the session wants the user (done /
-    // blocked), dim otherwise (working / idle). Blocked pulls its own
+    // blocked); for working / idle / unknown the muted themed colour
+    // carries the de-emphasis on its own (plain weight, no DIM — see
+    // `word_base`), falling back to DIM only when the state is uncoloured.
+    // Blocked pulls its own
     // colour (red by default) so "answer me" reads apart from a green
     // "done"; `blocked_color` falls back to `needs_input` when a theme
     // only colours one of them.
@@ -3948,7 +3951,17 @@ fn format_session_row(
     };
     let word_base = if needs_user {
         Style::new().add_modifier(Modifier::BOLD)
+    } else if colour.is_some() {
+        // A themed working/idle/unknown colour is *already* chosen muted to
+        // read as de-emphasised; stacking DIM on top pushed it into the
+        // elevated `sidebar_bg` and made every panel preset's idle word
+        // unreadable (gruvbox/nord were the worst — ~1.3:1). Trust the
+        // colour, and let the plain (non-bold) weight carry the recession.
+        Style::new()
     } else {
+        // Un-themed (mono / empty `[theme]`): no colour to signal idle, so
+        // DIM still keeps the default-fg word receding behind the bold
+        // done/blocked accents.
         dim
     };
     let word_style = apply_fg(word_base, colour);

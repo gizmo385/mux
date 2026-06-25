@@ -466,8 +466,8 @@ impl Theme {
             needs_input: Some(Color::Rgb(0x9e, 0xcd, 0x4c)), // olive green
             blocked: Some(Color::Rgb(0xff, 0x57, 0x33)),     // sunset red
             working: Some(Color::Rgb(0xf4, 0xa7, 0x38)),
-            idle: Some(Color::Rgb(0x8c, 0x6e, 0x54)),
-            unknown: Some(Color::Rgb(0xa0, 0x87, 0x70)),
+            idle: Some(Color::Rgb(0xa0, 0x87, 0x63)), // legible warm tan
+            unknown: Some(Color::Rgb(0xb3, 0x91, 0x69)),
             background: Some(Color::Rgb(0x1c, 0x14, 0x10)), // dark warm brown
             sidebar_bg: Some(Color::Rgb(0x2c, 0x21, 0x1a)), // elevated warm panel
             ..Self::default()
@@ -483,8 +483,8 @@ impl Theme {
             needs_input: Some(Color::Rgb(0x5f, 0xd7, 0xa7)), // sea green
             blocked: Some(Color::Rgb(0xe2, 0x6d, 0x75)),     // rose
             working: Some(Color::Rgb(0x6c, 0xb4, 0xd6)),
-            idle: Some(Color::Rgb(0x47, 0x66, 0x80)),
-            unknown: Some(Color::Rgb(0x5e, 0x7e, 0x94)),
+            idle: Some(Color::Rgb(0x6c, 0x8f, 0xae)), // legible steel blue
+            unknown: Some(Color::Rgb(0x89, 0xa9, 0xc4)),
             background: Some(Color::Rgb(0x0d, 0x14, 0x1a)), // dark navy
             sidebar_bg: Some(Color::Rgb(0x18, 0x24, 0x2e)), // elevated navy panel
             ..Self::default()
@@ -502,10 +502,10 @@ impl Theme {
             needs_input: Some(Color::Rgb(0x85, 0x99, 0x00)), // green
             blocked: Some(Color::Rgb(0xdc, 0x32, 0x2f)),     // red
             working: Some(Color::Rgb(0xb5, 0x89, 0x00)),     // yellow
-            idle: Some(Color::Rgb(0x58, 0x6e, 0x75)),        // base01
-            unknown: Some(Color::Rgb(0x58, 0x6e, 0x75)),
-            background: Some(Color::Rgb(0x00, 0x2b, 0x36)), // base03 (Solarized dark bg)
-            sidebar_bg: Some(Color::Rgb(0x07, 0x36, 0x42)), // base02 (elevated panel)
+            idle: Some(Color::Rgb(0x83, 0x94, 0x96)),        // base0 (legible on base02)
+            unknown: Some(Color::Rgb(0x93, 0xa1, 0xa1)),     // base1
+            background: Some(Color::Rgb(0x00, 0x2b, 0x36)),  // base03 (Solarized dark bg)
+            sidebar_bg: Some(Color::Rgb(0x07, 0x36, 0x42)),  // base02 (elevated panel)
             ..Self::default()
         }
     }
@@ -519,10 +519,10 @@ impl Theme {
             needs_input: Some(Color::Rgb(0xb8, 0xbb, 0x26)), // bright green
             blocked: Some(Color::Rgb(0xfb, 0x49, 0x34)),     // bright red
             working: Some(Color::Rgb(0xfa, 0xbd, 0x2f)),     // bright yellow
-            idle: Some(Color::Rgb(0x92, 0x83, 0x74)),        // gray
-            unknown: Some(Color::Rgb(0x92, 0x83, 0x74)),
-            background: Some(Color::Rgb(0x1d, 0x20, 0x21)), // dark0_hard
-            sidebar_bg: Some(Color::Rgb(0x3c, 0x38, 0x36)), // bg1 (elevated panel)
+            idle: Some(Color::Rgb(0xa8, 0x99, 0x84)),        // fg4/light4 (legible on bg1)
+            unknown: Some(Color::Rgb(0xbd, 0xae, 0x93)),     // light3
+            background: Some(Color::Rgb(0x1d, 0x20, 0x21)),  // dark0_hard
+            sidebar_bg: Some(Color::Rgb(0x3c, 0x38, 0x36)),  // bg1 (elevated panel)
             ..Self::default()
         }
     }
@@ -535,8 +535,8 @@ impl Theme {
             needs_input: Some(Color::Rgb(0xa3, 0xbe, 0x8c)), // aurora green
             blocked: Some(Color::Rgb(0xbf, 0x61, 0x6a)),     // aurora red
             working: Some(Color::Rgb(0xeb, 0xcb, 0x8b)),     // aurora yellow
-            idle: Some(Color::Rgb(0x4c, 0x56, 0x6a)),        // polar night
-            unknown: Some(Color::Rgb(0x4c, 0x56, 0x6a)),
+            idle: Some(Color::Rgb(0xa3, 0xac, 0xbd)),        // muted frost-grey (legible on nord1)
+            unknown: Some(Color::Rgb(0xb1, 0xba, 0xcb)),
             background: Some(Color::Rgb(0x2e, 0x34, 0x40)), // nord0 polar night
             sidebar_bg: Some(Color::Rgb(0x3b, 0x42, 0x52)), // nord1 (elevated panel)
             ..Self::default()
@@ -1365,6 +1365,47 @@ sound = true
         // default / mono stay panel-less.
         assert!(Theme::preset_default().sidebar_bg.is_none());
         assert!(Theme::preset_mono().sidebar_bg.is_none());
+    }
+
+    #[test]
+    fn panel_preset_idle_words_stay_legible_on_their_sidebar() {
+        // Regression for the gruvbox/nord "idle is impossible to read"
+        // report: the status word renders on the elevated `sidebar_bg`, so
+        // the muted idle/unknown greys must keep enough contrast there. The
+        // render path deliberately does *not* DIM a themed colour (that was
+        // the original killer — it halved these ratios), so the colour
+        // alone has to clear the bar. 3.0:1 is the floor for this UI text.
+        fn lin(c: u8) -> f64 {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(c: Color) -> f64 {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("preset colours are RGB")
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        }
+        fn contrast(a: Color, b: Color) -> f64 {
+            let (la, lb) = (luminance(a), luminance(b));
+            let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        for name in ["warm", "cool", "solarized", "gruvbox", "nord"] {
+            let t = Theme::preset(name).expect("preset parses");
+            let bg = t.sidebar_bg_color().expect("panel preset sets a sidebar");
+            for (label, colour) in [("idle", t.idle), ("unknown", t.unknown)] {
+                let c = colour.expect("panel preset colours idle/unknown");
+                let ratio = contrast(c, bg);
+                assert!(
+                    ratio >= 3.0,
+                    "{name} {label} {c:?} on sidebar {bg:?} is only {ratio:.2}:1 (need >= 3.0)"
+                );
+            }
+        }
     }
 
     #[test]

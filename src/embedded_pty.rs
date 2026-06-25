@@ -27,9 +27,26 @@ use portable_pty::{
     ChildKiller, CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem,
 };
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use tui_term::widget::PseudoTerminal;
+
+/// Re-paint the theme background onto every cell in `area` whose
+/// background is still `Color::Reset` — the host-terminal default that
+/// tui-term leaves behind for cells the inner program didn't colour
+/// (see [`EmbeddedPty::render`]). Cells the program coloured itself have
+/// a concrete bg and are skipped, so only the gaps pick up the theme.
+fn paint_default_bg(buf: &mut Buffer, area: Rect, bg: Color) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if cell.bg == Color::Reset {
+                cell.bg = bg;
+            }
+        }
+    }
+}
 
 /// One-way signal from the reader thread back to the main loop.
 ///
@@ -260,10 +277,24 @@ impl EmbeddedPty {
     /// (`[theme] background`). Cells the program colours itself keep their
     /// own style; this only fills the gaps. Purely a render-layer effect —
     /// nothing is written to the PTY or tmux.
+    ///
+    /// `PseudoTerminal::style()` is honoured only as documentation here:
+    /// tui-term 0.3.4 never reads the widget style in its render path, and
+    /// it maps every vt100 default cell to [`Color::Reset`]
+    /// (`Style::reset().bg(Reset)`), so the widget alone leaves default
+    /// cells at the host terminal's background. We therefore re-paint the
+    /// gap ourselves: after the widget renders, any cell still at `Reset`
+    /// background takes the theme background. Cells the program coloured
+    /// keep their own bg untouched.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, base_style: Style) {
         if let Ok(p) = self.parser.read() {
             let widget = PseudoTerminal::new(p.screen()).style(base_style);
             frame.render_widget(widget, area);
+        }
+        // tui-term ignores the widget style; fill default-bg cells here so
+        // a themed `[theme] background` actually reaches the session pane.
+        if let Some(bg) = base_style.bg {
+            paint_default_bg(frame.buffer_mut(), area, bg);
         }
     }
 
@@ -446,7 +477,53 @@ impl std::fmt::Debug for EmbeddedPty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn paint_default_bg_fills_reset_cells_and_spares_coloured_ones() {
+        // Reset-bg cells are the host-terminal default tui-term leaves
+        // behind; they should take the theme background. A cell the inner
+        // program coloured (concrete bg) must be left untouched.
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buf = Buffer::empty(area);
+        buf[(0, 0)].bg = Color::Reset; // default cell
+        buf[(1, 0)].bg = Color::Blue; // program-coloured cell
+
+        paint_default_bg(&mut buf, area, Color::Rgb(0x2e, 0x34, 0x40));
+
+        assert_eq!(buf[(0, 0)].bg, Color::Rgb(0x2e, 0x34, 0x40));
+        assert_eq!(buf[(1, 0)].bg, Color::Blue);
+    }
+
+    #[test]
+    fn render_paints_theme_background_onto_session_pane() {
+        // End-to-end guard for the tui-term-ignores-.style() bug: a child
+        // that writes plain text leaves most cells at terminal-default, and
+        // a themed `base_style.bg` must reach them through `render`.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf hi".to_string(),
+        ];
+        let pty = EmbeddedPty::spawn(&argv, None, 24, 80).unwrap();
+        assert!(wait_for_screen(
+            &pty,
+            |s| s.contains("hi"),
+            Duration::from_secs(5)
+        ));
+
+        let bg = Color::Rgb(0x2e, 0x34, 0x40);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| pty.render(f, f.area(), Style::new().bg(bg)))
+            .unwrap();
+
+        // A blank cell beyond the "hi" the child wrote is terminal-default
+        // and must have picked up the theme bg.
+        assert_eq!(terminal.backend().buffer()[(40, 12)].bg, bg);
+    }
 
     /// Poll `pred` against the screen text until it returns true or
     /// `timeout` elapses. Drains events between polls so the channel

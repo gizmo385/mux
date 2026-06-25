@@ -70,22 +70,39 @@ impl SessionCatalog {
     /// `event_mtime` is `None` for initial-prime events whose mtime
     /// the watcher couldn't capture; treat those as "no signal about
     /// transcript progress" and suppress while pinned.
+    ///
+    /// `from_tool_use` is `true` when the heuristic derived `Working`
+    /// from a bare assistant `tool_use` last-entry (see
+    /// [`crate::watcher::AttentionDerivation`]). That entry is the
+    /// transcript *signature* of the very prompt a hook pins as
+    /// "blocked" — the assistant paused mid-tool to ask — so it is not
+    /// evidence the conversation progressed past the prompt, even though
+    /// its file mtime can edge a millisecond or two beyond the hook's
+    /// timestamp. Only genuine progress (a `tool_result` / user message
+    /// / turn-end, i.e. `from_tool_use == false`) with a strictly-newer
+    /// mtime releases hook authority and clears the blocking flag.
+    /// Without this guard a permission prompt flickers to `working` the
+    /// instant the triggering `tool_use` write out-races the hook.
     pub fn apply_heuristic_attention(
         &mut self,
         id: &SessionId,
         attention: Attention,
         event_mtime: Option<SystemTime>,
+        from_tool_use: bool,
     ) -> Option<Attention> {
         for session in &mut self.sessions {
             if session.id == *id {
                 if let Some(pin) = session.hook_pinned {
-                    match event_mtime {
-                        Some(m) if m > pin => {
-                            // Transcript advanced past the hook event;
-                            // heuristic is authoritative again.
-                            session.hook_pinned = None;
-                        }
-                        _ => return None,
+                    // A bare `tool_use` update never releases the pin: it
+                    // *is* the blocked prompt's own transcript entry, not
+                    // progress past it. Genuine progress (a non-`tool_use`
+                    // entry with a strictly-newer mtime) hands authority
+                    // back to the heuristic.
+                    let progressed = !from_tool_use && matches!(event_mtime, Some(m) if m > pin);
+                    if progressed {
+                        session.hook_pinned = None;
+                    } else {
+                        return None;
                     }
                 }
                 let previous = session.attention;
@@ -97,12 +114,17 @@ impl SessionCatalog {
                     session.attention_entered_at =
                         Some(event_mtime.unwrap_or_else(SystemTime::now));
                 }
-                // The heuristic is transcript-truth and can never mean
-                // "blocking prompt" (a transcript-derived NeedsInput is
-                // a finished turn, i.e. "done"). Any prior blocking
-                // prompt is resolved once the transcript moves past it,
-                // so clear the flag whenever the heuristic applies.
-                session.blocking_prompt = false;
+                // Clear the blocking flag only on genuine progress past
+                // the prompt. A bare `tool_use` update is the prompt's
+                // own signature, so it must not self-clear — a blocking
+                // prompt would otherwise erase itself the moment the
+                // heuristic re-read the same `tool_use` entry. (When a
+                // pin is live this point is only reached after
+                // `progressed`, i.e. `!from_tool_use`; the guard also
+                // covers the pin-less case.)
+                if !from_tool_use {
+                    session.blocking_prompt = false;
+                }
                 return Some(previous);
             }
         }
@@ -586,7 +608,12 @@ mod tests {
         c.add(s);
         // A transition with a known transcript mtime stamps that mtime
         // (when the state actually changed) rather than wall-clock.
-        c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(50)));
+        c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(50)),
+            false,
+        );
         assert_eq!(c.sessions()[0].attention_entered_at, Some(at(50)));
     }
 
@@ -608,8 +635,12 @@ mod tests {
         let mut c = SessionCatalog::new();
         c.add(session("a"));
         c.apply_hook_event(&SessionId("a".into()), false, at(10));
-        let prev =
-            c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(8)));
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(8)),
+            true,
+        );
         assert_eq!(prev, None, "stale heuristic update must be suppressed");
         let s = &c.sessions()[0];
         assert_eq!(s.attention, Attention::NeedsInput);
@@ -625,8 +656,12 @@ mod tests {
         let mut c = SessionCatalog::new();
         c.add(session("a"));
         c.apply_hook_event(&SessionId("a".into()), false, at(10));
-        let prev =
-            c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(20)));
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(20)),
+            false,
+        );
         assert_eq!(prev, Some(Attention::NeedsInput));
         let s = &c.sessions()[0];
         assert_eq!(s.attention, Attention::Working);
@@ -640,8 +675,12 @@ mod tests {
     fn apply_heuristic_attention_passes_through_when_no_hook_pin_set() {
         let mut c = SessionCatalog::new();
         c.add(session("a"));
-        let prev =
-            c.apply_heuristic_attention(&SessionId("a".into()), Attention::NeedsInput, Some(at(5)));
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::NeedsInput,
+            Some(at(5)),
+            false,
+        );
         assert_eq!(prev, Some(Attention::Unknown));
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
     }
@@ -659,13 +698,69 @@ mod tests {
             c.sessions()[0].blocking_prompt,
             "blocking hook must set the flag"
         );
-        // Transcript advances past the pin → heuristic applies and
+        // Transcript advances past the pin with genuine progress (a
+        // tool_result, `from_tool_use == false`) → heuristic applies and
         // clears the flag (a transcript-derived state is never blocking).
-        c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, Some(at(20)));
+        c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(20)),
+            false,
+        );
         assert!(
             !c.sessions()[0].blocking_prompt,
             "heuristic re-apply must clear blocking_prompt"
         );
+    }
+
+    #[test]
+    fn bare_tool_use_does_not_clear_blocking_pin_even_when_mtime_races_past() {
+        // Regression for the dogfooded "blocked detection is off". A
+        // permission prompt fires the hook at T=10 (blocked). The very
+        // assistant `tool_use` entry that triggered it can land in the
+        // transcript with a file mtime a hair *after* the hook's
+        // timestamp (T=11) — they're written milliseconds apart and the
+        // ordering isn't guaranteed. That heuristic update is `Working`
+        // with `from_tool_use == true`; it must NOT clear the pin or the
+        // blocking flag, or the row flickers back to "working" while the
+        // agent is actually waiting on the user.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), true, at(10));
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(11)), // races a tick past the hook timestamp
+            true,         // ...but it's the prompt's own tool_use entry
+        );
+        assert_eq!(prev, None, "the prompt's own tool_use must be suppressed");
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::NeedsInput, "stays blocked");
+        assert!(s.blocking_prompt, "blocking flag must survive");
+        assert_eq!(s.hook_pinned, Some(at(10)), "pin must survive");
+    }
+
+    #[test]
+    fn genuine_progress_after_block_clears_flag_and_pin() {
+        // The companion to the regression above: once the user answers,
+        // the tool runs and writes a `tool_result` (`from_tool_use ==
+        // false`) with a newer mtime — *that* is real progress past the
+        // prompt, so the heuristic re-takes authority and the blocking
+        // flag clears back to "working".
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.apply_hook_event(&SessionId("a".into()), true, at(10));
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(20)),
+            false,
+        );
+        assert_eq!(prev, Some(Attention::NeedsInput));
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::Working);
+        assert!(!s.blocking_prompt, "answered prompt clears the flag");
+        assert!(s.hook_pinned.is_none(), "pin releases on real progress");
     }
 
     #[test]
@@ -687,7 +782,8 @@ mod tests {
         let mut c = SessionCatalog::new();
         c.add(session("a"));
         c.apply_hook_event(&SessionId("a".into()), false, at(10));
-        let prev = c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, None);
+        let prev =
+            c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, None, true);
         assert_eq!(prev, None);
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
     }

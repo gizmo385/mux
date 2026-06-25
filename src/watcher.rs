@@ -27,6 +27,14 @@ pub const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub struct AttentionUpdate {
     pub id: SessionId,
     pub attention: Attention,
+    /// Whether `attention` is `Working` *because* the last transcript
+    /// entry is a bare assistant `tool_use` — the signature of an
+    /// in-flight tool or a blocked permission prompt. The catalog uses
+    /// this to refuse to clear a live hook "blocked" pin on the prompt's
+    /// own entry (see [`AttentionDerivation`] and
+    /// [`crate::catalog::SessionCatalog::apply_heuristic_attention`]).
+    /// `false` for every non-`tool_use` derivation.
+    pub from_tool_use: bool,
     /// Transcript mtime captured at the moment the event was produced.
     /// `None` only when the producer couldn't stat the file
     /// (filesystem hiccup, file vanished between event and stat) —
@@ -185,9 +193,11 @@ impl TranscriptWatcher {
         // doesn't rewind the cell.
         for (id, path) in &initial {
             let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+            let detail = derive_attention_detail(host.as_ref(), path);
             let _ = event_tx.send(WatcherEvent::Attention(AttentionUpdate {
                 id: id.clone(),
-                attention: derive_attention(host.as_ref(), path),
+                attention: detail.attention,
+                from_tool_use: detail.from_tool_use,
                 mtime,
             }));
         }
@@ -236,9 +246,11 @@ impl TranscriptWatcher {
                         // vanished, filesystem hiccup) is fine; the
                         // catalog keeps its existing value.
                         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+                        let detail = derive_attention_detail(host_for_thread.as_ref(), &path);
                         WatcherEvent::Attention(AttentionUpdate {
                             id,
-                            attention: derive_attention(host_for_thread.as_ref(), &path),
+                            attention: detail.attention,
+                            from_tool_use: detail.from_tool_use,
                             mtime,
                         })
                     } else {
@@ -290,14 +302,15 @@ impl TranscriptWatcher {
         if !self.has_recursive_root {
             self.watcher.watch(&path, RecursiveMode::NonRecursive)?;
         }
-        let attention = derive_attention(self.host.as_ref(), &path);
+        let detail = derive_attention_detail(self.host.as_ref(), &path);
         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         if let Ok(mut targets) = self.targets.lock() {
             targets.insert(path, id.clone());
         }
         let _ = self.event_tx.send(WatcherEvent::Attention(AttentionUpdate {
             id,
-            attention,
+            attention: detail.attention,
+            from_tool_use: detail.from_tool_use,
             mtime,
         }));
         Ok(())
@@ -537,11 +550,12 @@ fn poll_once(
             // at one `find` per interval rather than N `tail -c`.
             if stat.mtime > *last_seen {
                 *last_seen = stat.mtime;
-                let attention = derive_attention(host, &stat.path);
+                let detail = derive_attention_detail(host, &stat.path);
                 if tx
                     .send(WatcherEvent::Attention(AttentionUpdate {
                         id: id.clone(),
-                        attention,
+                        attention: detail.attention,
+                        from_tool_use: detail.from_tool_use,
                         mtime: Some(stat.mtime),
                     }))
                     .is_err()
@@ -569,11 +583,12 @@ fn poll_once(
         // The dashboard would otherwise see this row sit at `Unknown`
         // until the *next* write — for a session that's been idle for
         // hours that could be a long time. Emit one Attention now.
-        let attention = derive_attention(host, &stat.path);
+        let detail = derive_attention_detail(host, &stat.path);
         if tx
             .send(WatcherEvent::Attention(AttentionUpdate {
                 id,
-                attention,
+                attention: detail.attention,
+                from_tool_use: detail.from_tool_use,
                 mtime: Some(stat.mtime),
             }))
             .is_err()
@@ -596,6 +611,34 @@ fn is_top_level_transcript(path: &Path, projects_root: &Path) -> bool {
         .is_some_and(|p| p == projects_root)
 }
 
+/// The heuristic's full read of a transcript: the derived [`Attention`]
+/// plus whether the last classified entry was a bare assistant
+/// `tool_use`. The flag lets the catalog tell a permission prompt's
+/// transcript signature (the assistant paused mid-tool to ask → reads as
+/// `Working`) apart from genuine progress past a prompt (a `tool_result`
+/// / user message / turn-end). Without it, the very `tool_use` entry that
+/// triggered a hook's "blocked" pin would clobber that pin back to
+/// "working" the moment its file mtime edged a millisecond past the
+/// hook's timestamp. See [`crate::catalog::SessionCatalog::apply_heuristic_attention`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionDerivation {
+    pub attention: Attention,
+    /// `true` iff the last classified entry was an assistant `tool_use`
+    /// (the transcript shape of an in-flight tool *or* a blocked
+    /// permission prompt — the two are indistinguishable from the
+    /// transcript alone, which is exactly why the hook exists).
+    pub from_tool_use: bool,
+}
+
+/// Larger escalation window for [`derive_attention_detail`] when the
+/// default [`TAIL_BYTES`] tail yields no parseable entry. A single final
+/// assistant message can exceed 32 KiB (a long answer on one JSONL
+/// line); the 32 KiB tail then holds only an unterminated continuation
+/// that fails to parse, so a *completed* turn would otherwise read as
+/// `Unknown`. 1 MiB covers any realistic final message; a message larger
+/// still falls back to `Unknown` (acceptably rare).
+const TAIL_BYTES_ESCALATED: u64 = 1024 * 1024;
+
 /// Derive an attention state from the most recent meaningful JSONL entry in
 /// `transcript_path`. Reads only the last `TAIL_BYTES` of the file through
 /// `host`; the (possibly truncated) first line is discarded by virtue of
@@ -603,10 +646,35 @@ fn is_top_level_transcript(path: &Path, projects_root: &Path) -> bool {
 /// conversational entry.
 #[must_use]
 pub fn derive_attention(host: &dyn Host, transcript_path: &Path) -> Attention {
+    derive_attention_detail(host, transcript_path).attention
+}
+
+/// Like [`derive_attention`] but also reports the `from_tool_use`
+/// discriminator (see [`AttentionDerivation`]). The five watcher
+/// producers use this so the catalog can protect a live hook pin from
+/// the blocked prompt's own `tool_use` signature.
+///
+/// Escalates to a larger read once when the default tail yields
+/// `Unknown` — a guard against a final message that overran the 32 KiB
+/// window leaving a completed turn looking like "no signal".
+#[must_use]
+pub fn derive_attention_detail(host: &dyn Host, transcript_path: &Path) -> AttentionDerivation {
     let Ok(tail) = host.read_tail(transcript_path, TAIL_BYTES) else {
-        return Attention::Unknown;
+        return AttentionDerivation {
+            attention: Attention::Unknown,
+            from_tool_use: false,
+        };
     };
-    derive_attention_from_content(&tail)
+    let detail = derive_attention_detail_from_content(&tail);
+    if detail.attention == Attention::Unknown
+        && let Ok(bigger) = host.read_tail(transcript_path, TAIL_BYTES_ESCALATED)
+    {
+        let escalated = derive_attention_detail_from_content(&bigger);
+        if escalated.attention != Attention::Unknown {
+            return escalated;
+        }
+    }
+    detail
 }
 
 /// Same attention-derivation logic as [`derive_attention`], but operates
@@ -618,6 +686,14 @@ pub fn derive_attention(host: &dyn Host, transcript_path: &Path) -> Attention {
 /// few KB carry signal once the session is well underway.
 #[must_use]
 pub fn derive_attention_from_content(transcript: &str) -> Attention {
+    derive_attention_detail_from_content(transcript).attention
+}
+
+/// [`derive_attention_from_content`] plus the `from_tool_use`
+/// discriminator. Walks every parseable JSONL line, keeping the last
+/// classifiable entry, then maps it to an [`AttentionDerivation`].
+#[must_use]
+pub fn derive_attention_detail_from_content(transcript: &str) -> AttentionDerivation {
     let mut last: Option<EntryKind> = None;
     for line in transcript.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -627,12 +703,16 @@ pub fn derive_attention_from_content(transcript: &str) -> Attention {
             last = Some(kind);
         }
     }
-    match last {
+    let attention = match last {
         Some(EntryKind::AssistantAwaiting) => Attention::NeedsInput,
         Some(EntryKind::AssistantToolUse | EntryKind::UserMessage | EntryKind::ToolResult) => {
             Attention::Working
         }
         None => Attention::Unknown,
+    };
+    AttentionDerivation {
+        attention,
+        from_tool_use: matches!(last, Some(EntryKind::AssistantToolUse)),
     }
 }
 
@@ -875,6 +955,55 @@ mod tests {
             r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read"}]}}"#,
         ]);
         assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
+    }
+
+    #[test]
+    fn detail_flags_from_tool_use_only_for_trailing_tool_use() {
+        // The `from_tool_use` discriminator the catalog leans on to
+        // protect a hook "blocked" pin: true iff the *last* classified
+        // entry is an assistant `tool_use`.
+        let tool_use = derive_attention_detail_from_content(
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}"#,
+        );
+        assert_eq!(tool_use.attention, Attention::Working);
+        assert!(tool_use.from_tool_use);
+
+        // A tool_result (user entry) after the tool_use is genuine
+        // progress — Working, but NOT from a tool_use.
+        let tool_result = derive_attention_detail_from_content(
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"tool_use\",\"content\":[{\"type\":\"tool_use\"}]}}\n\
+             {\"type\":\"user\",\"toolUseResult\":{\"ok\":true},\"message\":\"r\"}",
+        );
+        assert_eq!(tool_result.attention, Attention::Working);
+        assert!(
+            !tool_result.from_tool_use,
+            "tool_result is progress, not a tool_use"
+        );
+
+        // An end_turn assistant is `done`, never a tool_use.
+        let done = derive_attention_detail_from_content(
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        assert_eq!(done.attention, Attention::NeedsInput);
+        assert!(!done.from_tool_use);
+    }
+
+    #[test]
+    fn derive_attention_recovers_done_from_oversized_final_message() {
+        // Regression for "completed not detected": a final assistant
+        // message larger than TAIL_BYTES leaves only an unterminated
+        // continuation in the 32 KiB tail, so the tail-only read derives
+        // `Unknown`. The escalation re-read must recover the real `done`.
+        let big_text = "x".repeat(40 * 1024); // > TAIL_BYTES (32 KiB) tail window
+        let huge_final = format!(
+            r#"{{"type":"assistant","message":{{"stop_reason":"end_turn","content":[{{"type":"text","text":"{big_text}"}}]}}}}"#,
+        );
+        let f = write_jsonl(&[r#"{"type":"user","message":"go"}"#, &huge_final]);
+        assert_eq!(
+            derive_attention(&host(), f.path()),
+            Attention::NeedsInput,
+            "oversized final message must still read as done, not unknown"
+        );
     }
 
     // ---- poll_once ----

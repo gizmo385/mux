@@ -1737,6 +1737,7 @@ impl App {
                         &update.id,
                         update.attention,
                         update.mtime,
+                        update.from_tool_use,
                     );
                     if let Some(mtime) = update.mtime {
                         // Keeps the sidebar's "last activity" cell live

@@ -82,7 +82,7 @@ pub struct FavoritePlaceholder {
 /// when a new host is added.
 #[must_use]
 pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
-    build_display_rows_filtered(sessions, &[], None, |_| true, |_| false)
+    build_display_rows_filtered(sessions, &[], None, |_| true, |_| false, |_| String::new())
 }
 
 /// Like [`build_display_rows`] but emits rows only for sessions where
@@ -129,23 +129,26 @@ pub fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
 /// active (every match stays visible) and normalises a configured `0`
 /// to `None`, so `n` here is always ≥ 1.
 #[must_use]
-pub fn build_display_rows_filtered<F, G>(
+pub fn build_display_rows_filtered<F, G, H>(
     sessions: &[Session],
     placeholders: &[FavoritePlaceholder],
     cap: Option<usize>,
     include: F,
     is_favorite: G,
+    fav_sort_key: H,
 ) -> Vec<DisplayRow>
 where
     F: Fn(usize) -> bool,
     G: Fn(usize) -> bool,
+    H: Fn(usize) -> String,
 {
     let mut rows = Vec::new();
 
-    // Pinned favorites group first. Live favorites (recency desc across
-    // all hosts) lead, then the placeholder rows for favorites whose
-    // session isn't in the catalog yet. The `is_favorite` predicate
-    // passes through `include` so the search filter applies
+    // Pinned favorites group first. Live favorites lead (sorted
+    // alphabetically by their displayed label — see below), then the
+    // placeholder rows for favorites whose session isn't in the catalog
+    // yet (the caller passes those pre-sorted). The `is_favorite`
+    // predicate passes through `include` so the search filter applies
     // symmetrically (per the spec's resolved "favorites obey the
     // filter" decision); placeholders arrive pre-filtered.
     let mut favorite_idxs: Vec<usize> = sessions
@@ -154,7 +157,15 @@ where
         .filter(|(i, _)| include(*i) && is_favorite(*i))
         .map(|(i, _)| i)
         .collect();
-    favorite_idxs.sort_by(|&a, &b| sessions[b].last_activity.cmp(&sessions[a].last_activity));
+    // Favorites sort alphabetically, not by recency. The favorites group
+    // is the user's curated, stable set of pins; recency ordering made
+    // rows jump around under the user as `last_activity` ticked on every
+    // transcript update, which dogfooding flagged as a navigation hazard
+    // (2026-06-25). `fav_sort_key` yields the row's displayed label
+    // (rename → title → id-suffix), already lowercased, so the order
+    // matches what the eye reads. `sort_by_cached_key` computes each key
+    // once and is stable, so equal labels keep a deterministic order.
+    favorite_idxs.sort_by_cached_key(|&i| fav_sort_key(i));
     if !favorite_idxs.is_empty() || !placeholders.is_empty() {
         rows.push(DisplayRow::FavoritesHeader);
         for i in favorite_idxs {
@@ -657,24 +668,42 @@ mod tests {
     /// a per-test predicate. Plain [`layout`] passes `|_| false` so
     /// the favorites section never appears, keeping the pre-favorites
     /// expected-output assertions unchanged.
+    /// Sort key a favorite row uses in tests: its displayed label
+    /// (title, else session id), lowercased — mirroring the production
+    /// `favorite_sort_key` without the rename-override layer (which the
+    /// pure builder never sees).
+    fn fav_key_for_test(s: &Session) -> String {
+        s.title
+            .clone()
+            .unwrap_or_else(|| s.id.0.clone())
+            .to_lowercase()
+    }
+
     fn layout_with_favorites<G>(sessions: &[Session], is_favorite: G) -> Vec<String>
     where
         G: Fn(usize) -> bool,
     {
-        build_display_rows_filtered(sessions, &[], None, |_| true, is_favorite)
-            .into_iter()
-            .map(|r| match r {
-                DisplayRow::HostHeader(host) => format!("H:{host}"),
-                DisplayRow::ProjectHeader(path) => format!("P:{}", path.display()),
-                DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
-                DisplayRow::ToolsHeader => "TH:tools".to_string(),
-                DisplayRow::ToolRow(i) => format!("T:{i}"),
-                DisplayRow::FavoritesHeader => "FH".to_string(),
-                DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
-                DisplayRow::FavoritePlaceholderRow(i) => format!("FP:{i}"),
-                DisplayRow::ProjectOverflow(n) => format!("OV:{n}"),
-            })
-            .collect()
+        build_display_rows_filtered(
+            sessions,
+            &[],
+            None,
+            |_| true,
+            is_favorite,
+            |i| fav_key_for_test(&sessions[i]),
+        )
+        .into_iter()
+        .map(|r| match r {
+            DisplayRow::HostHeader(host) => format!("H:{host}"),
+            DisplayRow::ProjectHeader(path) => format!("P:{}", path.display()),
+            DisplayRow::SessionRow(i) => format!("S:{}", sessions[i].id.0),
+            DisplayRow::ToolsHeader => "TH:tools".to_string(),
+            DisplayRow::ToolRow(i) => format!("T:{i}"),
+            DisplayRow::FavoritesHeader => "FH".to_string(),
+            DisplayRow::FavoriteSessionRow(i) => format!("F:{}", sessions[i].id.0),
+            DisplayRow::FavoritePlaceholderRow(i) => format!("FP:{i}"),
+            DisplayRow::ProjectOverflow(n) => format!("OV:{n}"),
+        })
+        .collect()
     }
 
     #[test]
@@ -854,11 +883,16 @@ mod tests {
     }
 
     #[test]
-    fn favorites_section_orders_by_recency_desc_across_hosts_and_projects() {
+    fn favorites_section_orders_alphabetically_across_hosts_and_projects() {
         // Three favorited sessions spanning two hosts and three
-        // projects must list strictly by `last_activity` desc inside
-        // the pinned group, regardless of their natural host/project
-        // grouping.
+        // projects must list alphabetically by their displayed label
+        // inside the pinned group, regardless of their natural
+        // host/project grouping *and* regardless of recency — the
+        // curated favorites set stays put under the user rather than
+        // reshuffling as `last_activity` ticks (2026-06-25 dogfood).
+        // These are title-less, so the label is the session id: the
+        // recency order (new, mid, old) must NOT survive; "mid" sorts
+        // first alphabetically despite being the middle by recency.
         let s = vec![
             session("old", "local", "/p1", 1000),
             session("new", "alpenglow", "/p3", 5),
@@ -868,7 +902,22 @@ mod tests {
         // Strip everything after the natural-tree start so the
         // assertion focuses on favorites ordering only.
         let head: Vec<_> = l.iter().take_while(|r| !r.starts_with("H:")).collect();
-        assert_eq!(head, vec!["FH", "F:new", "F:mid", "F:old"]);
+        assert_eq!(head, vec!["FH", "F:mid", "F:new", "F:old"]);
+    }
+
+    #[test]
+    fn favorites_sort_by_title_when_present_not_id() {
+        // When favorites carry titles, the alphabetical order follows
+        // the *title* (what the row displays), not the underlying id.
+        // ids are deliberately in the opposite order to the titles.
+        let s = vec![
+            session_with_title("zzz", "local", "/p", 0, Some("Apple")),
+            session_with_title("aaa", "local", "/p", 0, Some("Zebra")),
+            session_with_title("mmm", "local", "/p", 0, Some("Mango")),
+        ];
+        let l = layout_with_favorites(&s, |_| true);
+        let head: Vec<_> = l.iter().take_while(|r| !r.starts_with("H:")).collect();
+        assert_eq!(head, vec!["FH", "F:zzz", "F:mmm", "F:aaa"]);
     }
 
     #[test]
@@ -890,6 +939,7 @@ mod tests {
             None,
             |i| matches_query(&s[i], q),
             |_| true, // both favorited
+            |i| fav_key_for_test(&s[i]),
         );
         let labels: Vec<_> = rows
             .iter()
@@ -912,7 +962,14 @@ mod tests {
             session("c", "local", "/p", 10),
         ];
         let favs = std::collections::HashSet::from([1usize]);
-        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |i| favs.contains(&i));
+        let rows = build_display_rows_filtered(
+            &s,
+            &[],
+            None,
+            |_| true,
+            |i| favs.contains(&i),
+            |i| fav_key_for_test(&s[i]),
+        );
         let favorite_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {
@@ -935,8 +992,14 @@ mod tests {
             title: Some("Remote work".into()),
         }];
         let favs = std::collections::HashSet::from([0usize]);
-        let rows =
-            build_display_rows_filtered(&s, &placeholders, None, |_| true, |i| favs.contains(&i));
+        let rows = build_display_rows_filtered(
+            &s,
+            &placeholders,
+            None,
+            |_| true,
+            |i| favs.contains(&i),
+            |i| fav_key_for_test(&s[i]),
+        );
         assert_eq!(rows[0], DisplayRow::FavoritesHeader);
         assert_eq!(rows[1], DisplayRow::FavoriteSessionRow(0));
         assert_eq!(rows[2], DisplayRow::FavoritePlaceholderRow(0));
@@ -953,7 +1016,14 @@ mod tests {
             id: SessionId("gone".into()),
             title: None,
         }];
-        let rows = build_display_rows_filtered(&s, &placeholders, None, |_| true, |_| false);
+        let rows = build_display_rows_filtered(
+            &s,
+            &placeholders,
+            None,
+            |_| true,
+            |_| false,
+            |_| String::new(),
+        );
         assert_eq!(rows[0], DisplayRow::FavoritesHeader);
         assert_eq!(rows[1], DisplayRow::FavoritePlaceholderRow(0));
     }
@@ -963,7 +1033,8 @@ mod tests {
         // Guard the empty case: an empty favorites set and no
         // placeholders must not emit a bare `── favorites ──` header.
         let s = vec![session("a", "local", "/p", 0)];
-        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |_| false);
+        let rows =
+            build_display_rows_filtered(&s, &[], None, |_| true, |_| false, |_| String::new());
         assert!(!rows.contains(&DisplayRow::FavoritesHeader));
     }
 
@@ -978,7 +1049,8 @@ mod tests {
             session("c", "local", "/p", 20),
             session("d", "local", "/p", 10),
         ];
-        let rows = build_display_rows_filtered(&s, &[], Some(2), |_| true, |_| false);
+        let rows =
+            build_display_rows_filtered(&s, &[], Some(2), |_| true, |_| false, |_| String::new());
         let shown: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {
@@ -1000,7 +1072,8 @@ mod tests {
             session("b", "local", "/p", 20),
             session("c", "local", "/p", 10),
         ];
-        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |_| false);
+        let rows =
+            build_display_rows_filtered(&s, &[], None, |_| true, |_| false, |_| String::new());
         assert_eq!(
             rows.iter()
                 .filter(|r| matches!(r, DisplayRow::SessionRow(_)))
@@ -1020,7 +1093,8 @@ mod tests {
             session("a", "local", "/p", 20),
             session("b", "local", "/p", 10),
         ];
-        let rows = build_display_rows_filtered(&s, &[], Some(5), |_| true, |_| false);
+        let rows =
+            build_display_rows_filtered(&s, &[], Some(5), |_| true, |_| false, |_| String::new());
         assert!(
             !rows
                 .iter()
@@ -1116,7 +1190,14 @@ mod tests {
     #[test]
     fn anchor_header_for_favorite_session_returns_favorites_header() {
         let s = vec![session("a", "local", "/p", 0)];
-        let rows = build_display_rows_filtered(&s, &[], None, |_| true, |_| true);
+        let rows = build_display_rows_filtered(
+            &s,
+            &[],
+            None,
+            |_| true,
+            |_| true,
+            |i| fav_key_for_test(&s[i]),
+        );
         // Layout: FH(0) F:a(1) H:local(2) P:/p(3) S:a(4)
         assert_eq!(anchor_header_for_selection(&rows, 1), Some(0));
         // The natural-group SessionRow still anchors to its ProjectHeader.
@@ -1322,6 +1403,7 @@ mod tests {
             None,
             |i| matches_query(&sessions[i], &q),
             |_| false,
+            |_| String::new(),
         )
         .into_iter()
         .map(|r| match r {
@@ -1387,8 +1469,14 @@ mod tests {
             session_with_title("b", "local", "/p", 1, Some("keep me")),
         ];
         let q = "keep";
-        let rows =
-            build_display_rows_filtered(&s, &[], None, |i| matches_query(&s[i], q), |_| false);
+        let rows = build_display_rows_filtered(
+            &s,
+            &[],
+            None,
+            |i| matches_query(&s[i], q),
+            |_| false,
+            |_| String::new(),
+        );
         let session_rows: Vec<usize> = rows
             .iter()
             .filter_map(|r| match r {

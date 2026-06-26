@@ -894,6 +894,20 @@ impl App {
                 .get(i)
                 .is_some_and(|s| self.favorites.contains(&s.host, &s.id))
         };
+        // Sort key for the pinned favorites group: the label the row
+        // actually displays — the user's rename if any, else the
+        // transcript/task title, else the id-suffix fallback — lowercased
+        // for case-insensitive alphabetical order. Favorites sort by this
+        // rather than recency so the curated set stays put under the user
+        // instead of reshuffling on every activity tick (2026-06-25).
+        let fav_sort_key = |i: usize| {
+            let s = &sessions[i];
+            favorite_sort_key(
+                self.session_names.get(&s.host, &s.id),
+                s.title.as_deref(),
+                &s.id,
+            )
+        };
         // Placeholder rows for favorites whose live session isn't in
         // the catalog right now (host still connecting, or offline) so
         // the favorite doesn't vanish. Recomputed each frame from the
@@ -918,9 +932,17 @@ impl App {
                     cap,
                     |i| matches_query(&sessions[i], &q),
                     is_favorite,
+                    fav_sort_key,
                 )
             }
-            _ => build_display_rows_filtered(sessions, &placeholders, cap, |_| true, is_favorite),
+            _ => build_display_rows_filtered(
+                sessions,
+                &placeholders,
+                cap,
+                |_| true,
+                is_favorite,
+                fav_sort_key,
+            ),
         };
         // Surface the Tools group above sessions when one or more
         // launches are running. Search filtering doesn't affect this
@@ -974,6 +996,11 @@ impl App {
                 title: meta.title.clone(),
             });
         }
+        // Same alphabetical ordering as the live favorites above, so the
+        // whole pinned group reads top-to-bottom by label. Placeholders
+        // never carry a rename override (they render `meta.title`
+        // directly), so the key omits the override layer.
+        out.sort_by_cached_key(|ph| favorite_sort_key(None, ph.title.as_deref(), &ph.id));
         out
     }
 
@@ -3787,6 +3814,32 @@ fn format_favorites_header() -> Line<'static> {
     ))
 }
 
+/// The `(xxxxxx)` fallback label for a session with no title: the last
+/// six characters of its id in parentheses (or the whole id when
+/// shorter). Shared by the title-less render paths and the favorites
+/// sort key so they agree on what a title-less row "is called".
+fn short_id_suffix(id: &SessionId) -> String {
+    let id = &id.0;
+    let suffix = if id.len() > 6 {
+        &id[id.len() - 6..]
+    } else {
+        id.as_str()
+    };
+    format!("({suffix})")
+}
+
+/// Lowercased label a favorite row sorts by — exactly what the row
+/// displays. Mirrors the title-resolution order in `format_session_row`
+/// (and `format_favorite_placeholder_row`): user rename, then the
+/// transcript/task title, then the id-suffix fallback. Lowercasing
+/// makes the alphabetical favorites order case-insensitive.
+fn favorite_sort_key(name_override: Option<&str>, title: Option<&str>, id: &SessionId) -> String {
+    name_override
+        .or(title)
+        .map_or_else(|| short_id_suffix(id), str::to_owned)
+        .to_lowercase()
+}
+
 /// Render a favorited session that isn't in the live catalog as a
 /// dimmed "unconfirmed" one-line placeholder: `★ <title>  unconfirmed ·
 /// [host]`. The whole line is dim and the word "unconfirmed" stands in
@@ -3794,15 +3847,7 @@ fn format_favorites_header() -> Line<'static> {
 /// attention to show, only the user's intent to keep this pinned.
 fn format_favorite_placeholder_row(ph: &FavoritePlaceholder) -> Line<'static> {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let label = ph.title.clone().unwrap_or_else(|| {
-        let id = &ph.id.0;
-        let suffix = if id.len() > 6 {
-            &id[id.len() - 6..]
-        } else {
-            id.as_str()
-        };
-        format!("({suffix})")
-    });
+    let label = ph.title.clone().unwrap_or_else(|| short_id_suffix(&ph.id));
     Line::from(vec![
         Span::styled("★ ", dim),
         Span::styled(label, dim),
@@ -3921,13 +3966,7 @@ fn format_session_row(
     } else if let Some(title) = &session.title {
         l1.push(Span::styled(title.clone(), title_style));
     } else {
-        let id = &session.id.0;
-        let suffix = if id.len() > 6 {
-            &id[id.len() - 6..]
-        } else {
-            id.as_str()
-        };
-        l1.push(Span::styled(format!("({suffix})"), dim));
+        l1.push(Span::styled(short_id_suffix(&session.id), dim));
     }
 
     // ---- Line 2: coloured state icon + word + dim detail ----
@@ -5745,6 +5784,22 @@ mod tests {
             !l2.contains(" old"),
             "no total-age cell without a start time: {l2:?}"
         );
+    }
+
+    // ---- favorite_sort_key ----
+
+    #[test]
+    fn favorite_sort_key_prefers_rename_then_title_then_id() {
+        let id = SessionId("0123456789abcdef".into());
+        // Rename wins over everything and is lowercased.
+        assert_eq!(
+            favorite_sort_key(Some("Renamed"), Some("ai title"), &id),
+            "renamed"
+        );
+        // No rename → the transcript/task title.
+        assert_eq!(favorite_sort_key(None, Some("AI Title"), &id), "ai title");
+        // Neither → the `(last-6)` id-suffix fallback, matching the row.
+        assert_eq!(favorite_sort_key(None, None, &id), "(abcdef)");
     }
 
     // ---- compose_sidebar_title ----

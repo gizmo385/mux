@@ -82,10 +82,25 @@ const DEFAULT_PTY_ROWS: u16 = 24;
 const DEFAULT_PTY_COLS: u16 = 80;
 
 /// Width (in cells) of the dashboard sidebar when an embedded PTY is
-/// active. Wide enough to render the host + project headers without
-/// truncating common labels; narrow enough that the terminal pane
-/// dominates the screen. M5 candidate for `[ui]` config.
+/// active *and* the terminal pane has focus. Wide enough to render the
+/// host + project headers without truncating common labels; narrow
+/// enough that the terminal pane dominates the screen. M5 candidate for
+/// `[ui]` config.
 const SIDEBAR_WIDTH: u16 = 40;
+
+/// Sidebar width when focus has returned to the sidebar (`Ctrl-a Esc`)
+/// while a PTY is embedded. The terminal pane is no longer the centre of
+/// attention, so the sidebar widens to give longer session titles room
+/// to breathe — the user is navigating, not typing into the session.
+/// Collapses back to [`SIDEBAR_WIDTH`] the moment focus returns to the
+/// terminal. 2026-06-25 dogfood ask.
+const SIDEBAR_WIDTH_EXPANDED: u16 = 60;
+
+/// Floor on the embedded terminal pane's width when the sidebar expands.
+/// Caps [`SIDEBAR_WIDTH_EXPANDED`] on narrow screens so the session pane
+/// never collapses to a sliver behind the widened sidebar; the expansion
+/// gives back only what the terminal can spare above this minimum.
+const MIN_EMBED_TERM_WIDTH: u16 = 30;
 
 /// How long the Repo Registry's cached scan is allowed to age before the
 /// next picker-open re-scans. Short enough that newly-cloned repos appear
@@ -3456,7 +3471,25 @@ fn footer_tool_label(t: &ToolBinding) -> String {
         .unwrap_or_else(|| "tool".to_string())
 }
 
-/// Embedded-PTY layout: compact sidebar on the left, terminal on the
+/// Width the embedded-mode sidebar should occupy for the given focus and
+/// total frame width. Compact while the terminal has focus so the
+/// session pane dominates; widened when focus is on the sidebar (the
+/// user is navigating, longer titles want room). The expansion is
+/// clamped so the terminal pane keeps at least [`MIN_EMBED_TERM_WIDTH`]
+/// and never drops below the compact [`SIDEBAR_WIDTH`] — on a very narrow
+/// screen "expanded" simply stays compact rather than going backwards.
+fn embedded_sidebar_width(focus: Focus, total_width: u16) -> u16 {
+    if matches!(focus, Focus::Sidebar) {
+        SIDEBAR_WIDTH_EXPANDED
+            .min(total_width.saturating_sub(MIN_EMBED_TERM_WIDTH))
+            .max(SIDEBAR_WIDTH)
+    } else {
+        SIDEBAR_WIDTH
+    }
+}
+
+/// Embedded-PTY layout: sidebar on the left (compact while the terminal
+/// has focus, widened when focus is on the sidebar), terminal on the
 /// right with a focus-aware border. Extracted from `draw` to keep that
 /// function under the line cap; takes the prepared sidebar `list`
 /// widget and the rect to fill.
@@ -3466,8 +3499,9 @@ fn draw_embedded(
     list: List<'_>,
     area: ratatui::layout::Rect,
 ) {
+    let sidebar_width = embedded_sidebar_width(app.focus, area.width);
     let split =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)]).split(area);
+        Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).split(area);
     frame.render_stateful_widget(list, split[0], &mut app.list_state);
 
     let term_focus = matches!(app.focus, Focus::Terminal { .. });
@@ -5800,6 +5834,47 @@ mod tests {
         assert_eq!(favorite_sort_key(None, Some("AI Title"), &id), "ai title");
         // Neither → the `(last-6)` id-suffix fallback, matching the row.
         assert_eq!(favorite_sort_key(None, None, &id), "(abcdef)");
+    }
+
+    // ---- embedded_sidebar_width ----
+
+    #[test]
+    fn embedded_sidebar_stays_compact_while_terminal_focused() {
+        let focus = Focus::Terminal {
+            leader_armed: false,
+        };
+        assert_eq!(embedded_sidebar_width(focus, 200), SIDEBAR_WIDTH);
+        assert_eq!(embedded_sidebar_width(focus, 50), SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn embedded_sidebar_expands_when_sidebar_focused_on_wide_screen() {
+        // Plenty of width → the full expanded size, terminal keeps the rest.
+        assert_eq!(
+            embedded_sidebar_width(Focus::Sidebar, 200),
+            SIDEBAR_WIDTH_EXPANDED
+        );
+    }
+
+    #[test]
+    fn embedded_sidebar_expansion_yields_to_a_usable_terminal_pane() {
+        // Mid-width: expansion is clamped so the terminal keeps at least
+        // MIN_EMBED_TERM_WIDTH rather than the sidebar eating the pane.
+        let total = SIDEBAR_WIDTH_EXPANDED + MIN_EMBED_TERM_WIDTH - 10;
+        let w = embedded_sidebar_width(Focus::Sidebar, total);
+        assert_eq!(w, total - MIN_EMBED_TERM_WIDTH);
+        assert!(
+            total - w >= MIN_EMBED_TERM_WIDTH,
+            "terminal keeps its floor"
+        );
+    }
+
+    #[test]
+    fn embedded_sidebar_never_narrower_than_compact_on_tiny_screen() {
+        // On a very narrow screen the clamp would push below the compact
+        // width; the `.max(SIDEBAR_WIDTH)` floor keeps it at compact so
+        // "expanded" never goes backwards.
+        assert_eq!(embedded_sidebar_width(Focus::Sidebar, 20), SIDEBAR_WIDTH);
     }
 
     // ---- compose_sidebar_title ----

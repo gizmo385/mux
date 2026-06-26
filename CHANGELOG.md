@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/gizmo385/mux/compare/v0.1.3...v0.1.4) - 2026-06-26
+
+### Added
+
+- *(ui)* widen the sidebar on Ctrl-a Esc
+- *(ui)* sort favorites alphabetically, not by recency
+- *(theme)* distinct sidebar panel via [theme] sidebar_bg
+- *(theme)* themeable frame background + render-layer terminal harmonisation
+- *(ui)* coloured state icons + done/blocked colour split + [theme] expansion
+- *(ui)* extend Ctrl-j/Ctrl-k group-jump to Favorites and Tools sections
+- *(ui)* quickswitcher fuzzy-jump modal (Ctrl-P)
+- *(ui)* cap session rows per project with a "+ K more" overflow
+- *(ui)* two-line session rows with state, time-in-state, total age
+- *(attention)* distinguish blocked-on-a-prompt from done in sidebar
+- *(favorites)* render offline favorites as placeholders, not gaps
+- *(remote)* auto-reconnect a dead SSH ControlMaster
+
+### Fixed
+
+- *(theme)* paint session-pane background + rescue idle legibility
+- *(attention)* protect blocked pin from tool_use clobber; recover done from oversized final message
+- *(remote)* strip $TMUX from background ssh subprocesses
+- *(remote)* back off reconnect/poll for an unsustainable master
+- *(worktree)* keep .agent-mux/task.toml out of git
+
+### Other
+
+- *(ui)* dedent session blocks flush-left
+- *(ui)* sidebar readability pass from dogfooding
+- *(todo)* pull 2026-06-23 dogfooding batch to top as priority queue
+- *(lint)* satisfy clippy 0.1.95 duration/map_or/into_iter lints
+
 ## [0.1.3](https://github.com/gizmo385/mux/compare/v0.1.2...v0.1.3) - 2026-05-30
 
 ### Added

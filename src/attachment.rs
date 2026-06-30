@@ -91,12 +91,26 @@ pub struct EmbedSpec {
 pub trait AttachmentDriver {
     /// Switch the user's terminal focus into the running session.
     ///
+    /// `excluded_tmux_sessions` lists tmux *session names* the pane
+    /// resolver must never resolve onto — the live `[[tools]]` launches
+    /// (lazygit, nvim, a shell). A tool launch runs in a detached tmux
+    /// session whose cwd is the parent session's `project_dir` by
+    /// construction, so without this exclusion the cwd fallback in
+    /// `resolve_pane_target` could hand back a tool's pane when the user
+    /// presses Enter on the Claude row. Callers pass the tool-launch
+    /// registry's session names for the session's host.
+    ///
     /// # Errors
     /// Returns `AttachError::NotFound` if no tmux pane matches the session,
     /// `AttachError::TmuxCommandFailed` if tmux returns non-zero, or
     /// `AttachError::RemoteUnsupported` for remote code paths not yet
     /// implemented (e.g. `claude --resume` against a remote tmux).
-    fn attach(&self, session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError>;
+    fn attach(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+        excluded_tmux_sessions: &[String],
+    ) -> Result<AttachOutcome, AttachError>;
 
     /// Open a fresh terminal in the session's working directory.
     ///
@@ -162,11 +176,16 @@ impl TmuxDriver {
 }
 
 impl AttachmentDriver for TmuxDriver {
-    fn attach(&self, session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+    fn attach(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+        excluded_tmux_sessions: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
         if session.host.is_local() {
-            Self::attach_local(session)
+            Self::attach_local(session, excluded_tmux_sessions)
         } else {
-            Self::attach_remote(session, host)
+            Self::attach_remote(session, host, excluded_tmux_sessions)
         }
     }
 
@@ -214,8 +233,11 @@ impl AttachmentDriver for TmuxDriver {
 // ---------- Local ----------
 
 impl TmuxDriver {
-    fn attach_local(session: &Session) -> Result<AttachOutcome, AttachError> {
-        if let Ok(target) = find_pane_local(session) {
+    fn attach_local(
+        session: &Session,
+        excluded_tmux_sessions: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        if let Ok(target) = find_pane_local(session, excluded_tmux_sessions) {
             return Self::switch_to_live(&target);
         }
         // No live pane (either tmux says NotFound, or there's no tmux server
@@ -326,8 +348,12 @@ impl TmuxDriver {
     /// Inside-tmux on the local side, both branches live in a new
     /// local tmux window (yes, nested tmux — see README); outside-tmux,
     /// we `SuspendAndRun` the ssh directly.
-    fn attach_remote(session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
-        match find_pane_remote(host, session) {
+    fn attach_remote(
+        session: &Session,
+        host: &dyn Host,
+        excluded_tmux_sessions: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        match find_pane_remote(host, session, excluded_tmux_sessions) {
             Ok(target) => Self::run_remote_interactive(host, &["tmux", "attach", "-t", &target]),
             Err(AttachError::NotFound) => Self::resume_remote(session, host),
             Err(other) => Err(other),
@@ -506,7 +532,11 @@ pub fn parse_pane_records(tmux_output: &str) -> LivePaneSnapshot {
     }
 }
 
-fn find_pane_remote(host: &dyn Host, session: &Session) -> Result<String, AttachError> {
+fn find_pane_remote(
+    host: &dyn Host,
+    session: &Session,
+    excluded_tmux_sessions: &[String],
+) -> Result<String, AttachError> {
     // -F format starts with `#{...}` — `Host::ssh_argv` shell-quotes
     // each remote_cmd element so the leading `#` survives the remote
     // shell tokenizer (which would otherwise eat it as a comment).
@@ -536,7 +566,7 @@ fn find_pane_remote(host: &dyn Host, session: &Session) -> Result<String, Attach
         return Err(AttachError::NotFound);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    resolve_pane_target(&stdout, session).ok_or(AttachError::NotFound)
+    resolve_pane_target(&stdout, session, excluded_tmux_sessions).ok_or(AttachError::NotFound)
 }
 
 // ---------- PtyDriver ----------
@@ -568,11 +598,16 @@ impl PtyDriver {
 }
 
 impl AttachmentDriver for PtyDriver {
-    fn attach(&self, session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+    fn attach(
+        &self,
+        session: &Session,
+        host: &dyn Host,
+        excluded_tmux_sessions: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
         if session.host.is_local() {
-            Ok(Self::attach_local(session))
+            Ok(Self::attach_local(session, excluded_tmux_sessions))
         } else {
-            Self::attach_remote(session, host)
+            Self::attach_remote(session, host, excluded_tmux_sessions)
         }
     }
 
@@ -646,8 +681,8 @@ impl PtyDriver {
     /// folds into the resume fallback, so this never produces an
     /// `Err`. Returning `AttachOutcome` directly keeps the local
     /// branch readable; the dispatcher in `attach` wraps it in `Ok`.
-    fn attach_local(session: &Session) -> AttachOutcome {
-        let argv = match find_pane_local(session) {
+    fn attach_local(session: &Session, excluded_tmux_sessions: &[String]) -> AttachOutcome {
+        let argv = match find_pane_local(session, excluded_tmux_sessions) {
             Ok(target) => tmux_attach_argv(&target),
             // `TmuxCommandFailed` here means tmux isn't running or
             // list-panes errored — same condition the legacy driver
@@ -883,8 +918,12 @@ impl PtyDriver {
     /// variant. The ssh wrap comes from `Host::ssh_argv(true, …)` —
     /// identical to the `SuspendAndRun` path so the embedded widget
     /// sees the same argv the legacy outside-tmux path would.
-    fn attach_remote(session: &Session, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
-        let remote_cmd = match find_pane_remote(host, session) {
+    fn attach_remote(
+        session: &Session,
+        host: &dyn Host,
+        excluded_tmux_sessions: &[String],
+    ) -> Result<AttachOutcome, AttachError> {
+        let remote_cmd = match find_pane_remote(host, session, excluded_tmux_sessions) {
             Ok(target) => tmux_attach_argv(&target),
             Err(AttachError::NotFound) => tmux_resume_argv(session),
             Err(other) => return Err(other),
@@ -1067,7 +1106,9 @@ fn user_shell() -> String {
 /// Resolve the local tmux pane (if any) that should serve as the
 /// attach target for `session`. Used both inside `PtyDriver::attach_local`
 /// and from the App's pre-attach parallel-resume gate, hence the
-/// `pub` visibility.
+/// `pub` visibility. `excluded_tmux_sessions` is forwarded to
+/// [`resolve_pane_target`] — see its docs for why tool-launch sessions
+/// must be filtered out of the cwd fallback.
 ///
 /// # Errors
 /// Returns `AttachError::NotFound` when `tmux list-panes -a` ran
@@ -1076,7 +1117,10 @@ fn user_shell() -> String {
 /// when the `tmux` invocation itself failed (binary missing, exit
 /// non-zero, etc.) — the bare-terminal case where there's no local
 /// tmux server at all collapses to this.
-pub fn find_pane_local(session: &Session) -> Result<String, AttachError> {
+pub fn find_pane_local(
+    session: &Session,
+    excluded_tmux_sessions: &[String],
+) -> Result<String, AttachError> {
     let output = Command::new("tmux")
         .args([
             "list-panes",
@@ -1092,7 +1136,7 @@ pub fn find_pane_local(session: &Session) -> Result<String, AttachError> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    resolve_pane_target(&stdout, session).ok_or(AttachError::NotFound)
+    resolve_pane_target(&stdout, session, excluded_tmux_sessions).ok_or(AttachError::NotFound)
 }
 
 /// Resolve the tmux target for `session` from the output of
@@ -1114,12 +1158,26 @@ pub fn find_pane_local(session: &Session) -> Result<String, AttachError> {
 ///    session from the initial `spawn_session_local` (before any
 ///    re-attach has consolidated onto the deterministic name).
 ///
+/// `excluded_tmux_sessions` carries the tmux *session names* of live
+/// `[[tools]]` launches (lazygit, nvim, a shell). Each such launch runs
+/// in a detached tmux session spawned with `-c <project_dir>`, so its
+/// pane's `pane_current_path` is identical to the parent Claude
+/// session's — without this guard the cwd fallback below could resolve
+/// the Claude attach onto a tool's pane (the user reports "returning to
+/// the session keeps opening the tool"). Excluded only from the cwd
+/// fallback: stage 1's `agent-mux-<id>` match can't collide with a
+/// tmux-auto-named tool session, so it needs no filtering.
+///
 /// Sessions sharing one cwd that *also* lack a deterministic name
 /// will still collide on the first cwd match. That's a known
 /// limitation; the affordance to fully disambiguate them is filed in
 /// TODO.
 #[must_use]
-fn resolve_pane_target(tmux_output: &str, session: &Session) -> Option<String> {
+fn resolve_pane_target(
+    tmux_output: &str,
+    session: &Session,
+    excluded_tmux_sessions: &[String],
+) -> Option<String> {
     let preferred = format!("agent-mux-{}", session.id.0);
     let mut cwd_match: Option<String> = None;
     for line in tmux_output.lines() {
@@ -1128,6 +1186,12 @@ fn resolve_pane_target(tmux_output: &str, session: &Session) -> Option<String> {
         };
         if target.starts_with(&format!("{preferred}:")) {
             return Some(target.to_string());
+        }
+        // `target` is `<session_name>:<window>.<pane>`; compare the
+        // session-name segment against the tool-launch exclusion set.
+        let session_name = target.split_once(':').map_or(target, |(name, _)| name);
+        if excluded_tmux_sessions.iter().any(|e| e == session_name) {
+            continue;
         }
         if cwd_match.is_none() && Path::new(path) == session.project_dir {
             cwd_match = Some(target.to_string());
@@ -1275,7 +1339,7 @@ mod tests {
         let out = "main:0.0 /home/u/proj\n\
              main:1.0 /home/u/other\n";
         let s = test_session("abc", "/home/u/proj");
-        let got = resolve_pane_target(out, &s);
+        let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("main:0.0".to_string()));
     }
 
@@ -1283,14 +1347,14 @@ mod tests {
     fn resolve_pane_target_returns_none_when_no_match() {
         let out = "main:0.0 /home/u/a\nmain:1.0 /home/u/b\n";
         let s = test_session("abc", "/home/u/c");
-        assert_eq!(resolve_pane_target(out, &s), None);
+        assert_eq!(resolve_pane_target(out, &s, &[]), None);
     }
 
     #[test]
     fn resolve_pane_target_handles_paths_with_spaces() {
         let out = "main:0.0 /home/u/path with spaces\n";
         let s = test_session("abc", "/home/u/path with spaces");
-        let got = resolve_pane_target(out, &s);
+        let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("main:0.0".to_string()));
     }
 
@@ -1298,7 +1362,7 @@ mod tests {
     fn resolve_pane_target_skips_malformed_lines() {
         let out = "garbage_without_space\nmain:0.0 /good/path\n";
         let s = test_session("abc", "/good/path");
-        let got = resolve_pane_target(out, &s);
+        let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("main:0.0".to_string()));
     }
 
@@ -1311,7 +1375,7 @@ mod tests {
         let out = "other:0.0 /home/u/proj\n\
              agent-mux-target-id:1.0 /home/u/proj\n";
         let s = test_session("target-id", "/home/u/proj");
-        let got = resolve_pane_target(out, &s);
+        let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("agent-mux-target-id:1.0".to_string()));
     }
 
@@ -1322,8 +1386,52 @@ mod tests {
         // sessions.
         let out = "other:0.0 /home/u/proj\n";
         let s = test_session("missing-named", "/home/u/proj");
-        let got = resolve_pane_target(out, &s);
+        let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("other:0.0".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_target_skips_tool_launch_pane_sharing_the_cwd() {
+        // Regression (2026-06-30): a `[[tools]]` launch (lazygit, vim, a
+        // shell) runs in a detached tmux session spawned with `-c
+        // <project_dir>`, so its pane reports the same cwd as the
+        // externally-started Claude session. Without exclusion the cwd
+        // fallback could resolve the Claude attach onto the tool's pane,
+        // and the user reports "returning to the session keeps opening
+        // the tool." The tool's tmux session name is passed in the
+        // exclusion set and must be skipped; the Claude pane wins.
+        let out = "3 /home/u/proj\n\
+             user-claude:0.0 /home/u/proj\n";
+        let s = test_session("ext-id", "/home/u/proj");
+        // `3` is the tmux-auto-named tool session that lists first.
+        let excluded = ["3".to_string()];
+        let got = resolve_pane_target(out, &s, &excluded);
+        assert_eq!(got, Some("user-claude:0.0".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_target_excluding_all_cwd_matches_yields_none() {
+        // If the *only* pane at the session's cwd is a tool launch, the
+        // resolver must report NotFound (None) rather than the tool —
+        // the caller then falls through to the resume path, which is the
+        // correct behaviour for a session with no live Claude pane.
+        let out = "3 /home/u/proj\n";
+        let s = test_session("ext-id", "/home/u/proj");
+        let excluded = ["3".to_string()];
+        assert_eq!(resolve_pane_target(out, &s, &excluded), None);
+    }
+
+    #[test]
+    fn resolve_pane_target_excluded_name_does_not_block_agent_mux_pin() {
+        // The exclusion set only gates the cwd fallback. A deterministic
+        // `agent-mux-<id>` pin still wins even when an unrelated tool
+        // session is in the exclusion set.
+        let out = "3 /home/u/proj\n\
+             agent-mux-pinned:0.0 /home/u/proj\n";
+        let s = test_session("pinned", "/home/u/proj");
+        let excluded = ["3".to_string()];
+        let got = resolve_pane_target(out, &s, &excluded);
+        assert_eq!(got, Some("agent-mux-pinned:0.0".to_string()));
     }
 
     #[test]
@@ -1334,7 +1442,7 @@ mod tests {
         let out = "agent-mux-abc:0.0 /tmp/elsewhere\n\
              beta:1.0 /home/u/proj\n";
         let s = test_session("abc", "/home/u/proj");
-        let got = resolve_pane_target(out, &s);
+        let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("agent-mux-abc:0.0".to_string()));
     }
 
@@ -1829,7 +1937,7 @@ mod tests {
         // either shape rather than fail the whole suite.
         let session = make_session(HostId::local(), "/agent-mux-pty-test-no-such-path");
         let outcome = PtyDriver::new()
-            .attach(&session, &LocalHost::new())
+            .attach(&session, &LocalHost::new(), &[])
             .expect("local attach should not error");
         let AttachOutcome::EmbedPty(spec) = outcome else {
             panic!("expected EmbedPty, got {outcome:?}");
@@ -1853,7 +1961,7 @@ mod tests {
         let mut session = make_session(HostId::local(), "/p");
         session.title = Some("hello-world".to_string());
         let outcome = PtyDriver::new()
-            .attach(&session, &LocalHost::new())
+            .attach(&session, &LocalHost::new(), &[])
             .expect("local attach should not error");
         let AttachOutcome::EmbedPty(spec) = outcome else {
             panic!("expected EmbedPty");

@@ -1991,6 +1991,21 @@ impl App {
         };
         let session_id = session_clone.id.clone();
 
+        // tmux session names of live `[[tools]]` launches on this
+        // session's host. A tool launch runs in a detached tmux session
+        // spawned at the parent session's cwd, so its pane shares
+        // `project_dir` and would otherwise hijack the pane resolver's
+        // cwd fallback — the user reports "returning to the session
+        // keeps opening the tool." Filtered to the session's host so a
+        // local tool name can't shadow a remote pane (or vice versa).
+        let excluded_tmux_sessions: Vec<String> = self
+            .tool_launches
+            .launches()
+            .iter()
+            .filter(|l| l.host == session_clone.host)
+            .map(|l| l.tmux_session.clone())
+            .collect();
+
         // Parallel-resume gate: when the host is local AND there's no
         // tmux pane for the session (so the driver would fall through
         // to `tmux_resume_argv` and spawn a brand-new `claude --resume`)
@@ -2010,7 +2025,7 @@ impl App {
             .is_some_and(|s| s.session_id == session_id);
         if should_gate_attach(
             session_clone.host.is_local(),
-            find_pane_local(&session_clone).is_ok(),
+            find_pane_local(&session_clone, &excluded_tmux_sessions).is_ok(),
             probe_live_writer(&session_clone.transcript_path),
             already_armed,
         ) {
@@ -2028,7 +2043,9 @@ impl App {
         // doesn't leave a stale banner behind.
         self.attach_confirm = None;
 
-        let result = self.driver.attach(&session_clone, host.as_ref());
+        let result = self
+            .driver
+            .attach(&session_clone, host.as_ref(), &excluded_tmux_sessions);
         match result {
             Ok(AttachOutcome::Done) => {
                 self.status = None;

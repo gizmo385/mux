@@ -1,6 +1,6 @@
 [package]
 name = "agent-mux"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A fast, terminal-first multiplexer for managing multiple Claude Code conversations across local and remote hosts."
 license = "MIT"

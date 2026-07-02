@@ -470,10 +470,21 @@ impl SshHost {
         // ControlPersist=600 = if our Drop guard never fires (SIGKILL,
         // panic during unwind), the remote-side master self-terminates
         // after ten minutes of idleness rather than lingering forever.
-        // ConnectTimeout=5 caps a wedged-host connect at 5s so a single
+        // ConnectTimeout=15 caps a wedged-host connect so a single
         // unreachable host can't stall the dashboard's startup discovery
         // (which we run in parallel threads, but each thread still needs
-        // a bounded worst case).
+        // a bounded worst case). This bound is only paid on the *initial*
+        // connect here (and on reconnect via the same helper) — the
+        // per-tick `-O check` and every poll read reuse the established
+        // master over its local socket and carry no ConnectTimeout, so a
+        // generous value here does not slow the steady state. It was 5s,
+        // but a proxied host whose tunnel has to wake and dial a remote
+        // agent legitimately exceeds that: Coder's `coder ssh --stdio`
+        // ProxyCommand measured a consistent ~6s (warm or cold) to reach
+        // the workspace agent, so a 5s cap failed the spawn deterministically
+        // ("timed out during banner exchange") on every coder-backed host.
+        // 15s clears that with margin while still bounding a truly-dead
+        // host; a slower proxy can get a per-host override — see TODO.
         let status = Self::background_ssh_command(ssh_binary)
             .arg("-fN")
             .arg("-M")
@@ -482,7 +493,7 @@ impl SshHost {
             .arg("-o")
             .arg("ControlPersist=600")
             .arg("-o")
-            .arg("ConnectTimeout=5")
+            .arg("ConnectTimeout=15")
             // Compression is set on the ControlMaster so every channel
             // multiplexed through it inherits it. Discovery's bulk
             // transcript read shovels JSON over the wire — for a
@@ -1404,10 +1415,13 @@ mod tests {
         // (connect → check → drop → inspect the log):
         //
         // 1. Connect uses `-fN -M`, `ControlPersist=600`, and
-        //    `ConnectTimeout=5`. Losing any of these breaks the
+        //    `ConnectTimeout=15`. Losing any of these breaks the
         //    operational guarantees agent-mux relies on (background
         //    master, idle timeout for the SIGKILL-mid-sleep case,
-        //    bounded startup latency for unreachable hosts).
+        //    bounded startup latency for unreachable hosts). The
+        //    timeout must exceed a proxied host's tunnel-establishment
+        //    latency (~6s for Coder's `coder ssh --stdio`) or the
+        //    spawn fails on every connect; see spawn_master.
         //
         // 2. Connect runs `ssh -O check` after the `-fN -M` spawn
         //    to confirm the master actually established. Without
@@ -1457,9 +1471,11 @@ mod tests {
              strand masters forever. got: {connect}"
         );
         assert!(
-            connect.contains("ConnectTimeout=5"),
+            connect.contains("ConnectTimeout=15"),
             "ConnectTimeout caps a wedged-host connect — without it \
-             a single unreachable host can stall startup. got: {connect}"
+             a single unreachable host can stall startup; the value \
+             must also exceed a proxy tunnel's establishment latency \
+             (~6s for Coder) or every connect fails. got: {connect}"
         );
         assert!(connect.contains("devbox"), "target missing: {connect}");
 

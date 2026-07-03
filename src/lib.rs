@@ -11,6 +11,7 @@ pub mod favorites;
 pub mod hook_ingest;
 pub mod hook_install;
 pub mod host;
+pub mod logging;
 pub mod new_session_modal;
 pub mod notifications;
 pub mod quickswitcher;

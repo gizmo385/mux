@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -80,6 +80,14 @@ const TICK_TERMINAL: Duration = Duration::from_millis(16);
 /// at this size and lets vt100 / the child's SIGWINCH handler reflow.
 const DEFAULT_PTY_ROWS: u16 = 24;
 const DEFAULT_PTY_COLS: u16 = 80;
+
+/// A non-zero embedded-child exit within this window of its spawn reads
+/// as a failed attach — the pane stays up showing whatever the command
+/// printed (e.g. tmux's `open terminal failed: not a terminal`) instead
+/// of flashing back to the sidebar. ~750ms clears a rejected `tmux
+/// attach` / dead-master ssh (both die in ~200ms) without catching a
+/// user who detaches a genuinely-live session almost immediately.
+const FAILED_ATTACH_WINDOW: Duration = Duration::from_millis(750);
 
 /// Width (in cells) of the dashboard sidebar when an embedded PTY is
 /// active *and* the terminal pane has focus. Wide enough to render the
@@ -199,6 +207,12 @@ fn main() -> io::Result<()> {
 }
 
 fn run_tui(embedded: bool) -> io::Result<()> {
+    // Open the diagnostics log before anything else so startup messages
+    // and the background pollers' reconnect/failure chatter land in a file
+    // rather than painting over the alt-screen (see `logging` module docs).
+    if let Some(path) = agent_mux::logging::default_path() {
+        agent_mux::logging::init(&path);
+    }
     // The driver choice is decided once at boot and stays for the life
     // of the process — there's no in-app switcher. Dogfooders flip the
     // flag between runs.
@@ -539,6 +553,15 @@ struct RenameState {
 struct Embedded {
     pty: EmbeddedPty,
     session_id: SessionId,
+    /// When this PTY was spawned. Lets `drain_pty_events` tell a
+    /// blink-and-die failed attach (surface it in-pane) from a normal
+    /// detach that returns to the sidebar.
+    spawned_at: Instant,
+    /// Set once the child exited near-instantly with a non-zero status —
+    /// the attach never got off the ground. The pane lingers on screen
+    /// with its error rather than flashing away, and `draw_embedded`
+    /// retitles the block to make it read as dead, not live.
+    failed: bool,
     last_size: (u16, u16),
     last_inner: Option<ratatui::layout::Rect>,
     /// Set when this PTY hosts a tool launch (the tool wraps its
@@ -2080,6 +2103,7 @@ impl App {
     fn install_embedded(&mut self, spec: &EmbedSpec, session_id: SessionId) {
         if let Some(existing) = &self.embedded
             && existing.session_id == session_id
+            && !existing.failed
         {
             self.focus = Focus::Terminal {
                 leader_armed: false,
@@ -2102,6 +2126,8 @@ impl App {
                 self.embedded = Some(Embedded {
                     pty,
                     session_id,
+                    spawned_at: Instant::now(),
+                    failed: false,
                     last_size: (DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS),
                     last_inner: None,
                     tool_tmux_session: spec.tmux_session.clone(),
@@ -2233,22 +2259,49 @@ impl App {
         let Some(embedded) = self.embedded.as_ref() else {
             return;
         };
-        let mut exited = false;
+        let mut status = None;
         while let Some(ev) = embedded.pty.poll_event() {
-            if matches!(ev, PtyEvent::Exited(_)) {
-                exited = true;
+            if let PtyEvent::Exited(s) = ev {
+                status = Some(s);
                 break;
             }
         }
-        if exited {
-            // Capture the tool's tmux session name before dropping
-            // the Embedded — pruning the registry afterwards is what
-            // makes the sidebar row vanish.
-            let tool_session = embedded.tool_tmux_session.clone();
-            self.embedded = None;
-            self.focus = Focus::Sidebar;
-            if let Some(tmux_session) = tool_session {
-                self.forget_tool_launch(&tmux_session);
+        let Some(status) = status else {
+            return;
+        };
+
+        // Snapshot what we need before any mutation so the immutable
+        // borrow of `self.embedded` above is released.
+        let tool_session = embedded.tool_tmux_session.clone();
+        let action = classify_pty_exit(
+            embedded.tool_tmux_session.is_some(),
+            status.success(),
+            embedded.spawned_at.elapsed(),
+        );
+
+        match action {
+            // A non-zero child that dies within a blink of spawning almost
+            // never means "user detached" — the attach never got off the
+            // ground (dead ssh master, tmux server/client protocol skew, a
+            // missing remote binary). Leave the pane up showing whatever it
+            // printed and drop focus to the sidebar, rather than flashing
+            // it away with the error unread. Enter on the same row respawns
+            // (see `install_embedded`).
+            PtyExitAction::Linger => {
+                if let Some(embedded) = self.embedded.as_mut() {
+                    embedded.failed = true;
+                }
+                self.focus = Focus::Sidebar;
+            }
+            // Normal detach / clean exit: drop the PTY and return to the
+            // sidebar. The tool's tmux session name was captured above so
+            // pruning the registry makes its sidebar row vanish.
+            PtyExitAction::Dismiss => {
+                self.embedded = None;
+                self.focus = Focus::Sidebar;
+                if let Some(tmux_session) = tool_session {
+                    self.forget_tool_launch(&tmux_session);
+                }
             }
         }
     }
@@ -2636,6 +2689,17 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             // (re-edit); everything else falls through to action dispatch
             // so j/k/Enter/n/t continue to work against the filtered list.
             if app.route_search_active_key(key) {
+                continue;
+            }
+            // Esc dismisses a lingering failed-attach pane — the
+            // counterpart to the Enter-to-retry it advertises in its
+            // title. Only a *failed* pane: a live embedded session is
+            // governed by its own `Ctrl-a Esc` leader chord (handled in
+            // the `Focus::Terminal` branch above), so a bare Esc here
+            // must never tear a running session down. Comes after the
+            // search routes so a first Esc still clears an active filter.
+            if key.code == KeyCode::Esc && app.embedded.as_ref().is_some_and(|e| e.failed) {
+                app.embedded = None;
                 continue;
             }
             match dispatch_action(app, action_for(key, &app.config.tools)) {
@@ -3065,22 +3129,24 @@ fn init_hook_watcher(
     // `transcript_path` so local and remote producers + consumers
     // share one path convention.
     let Some(root) = claude_projects_dir() else {
-        eprintln!(
-            "agent-mux: hook watcher disabled (no Claude Code transcripts dir resolved); \
-             heuristic-only attention path stays in effect"
-        );
+        let msg = "hook watcher disabled (no Claude Code transcripts dir resolved); \
+                   heuristic-only attention path stays in effect";
+        eprintln!("agent-mux: {msg}");
+        agent_mux::logging::log_line(msg);
         return None;
     };
     let dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
     match agent_mux::hook_ingest::spawn_hook_watcher(&dir, event_tx) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!(
-                "agent-mux: hook watcher disabled ({} on {}); \
+            let msg = format!(
+                "hook watcher disabled ({} on {}); \
                  heuristic-only attention path stays in effect",
                 e,
                 dir.display()
             );
+            eprintln!("agent-mux: {msg}");
+            agent_mux::logging::log_line(&msg);
             None
         }
     }
@@ -3095,7 +3161,10 @@ fn init_hook_watcher(
 #[must_use]
 fn build_notifier(cfg: &config::NotificationsConfig) -> Notifier {
     let (dispatcher, backend_label) = pick_dispatcher(cfg.backend);
+    // Pre-alt-screen, so stderr lands cleanly in scrollback; also tee to
+    // the diagnostics log so every agent-mux message has one home.
     eprintln!("agent-mux: notifications backend = {backend_label}");
+    agent_mux::logging::log_line(&format!("notifications backend = {backend_label}"));
     Notifier::new(dispatcher, cfg.clone())
 }
 
@@ -3529,6 +3598,7 @@ fn draw_embedded(
     let Some(session_id) = app.embedded.as_ref().map(|e| e.session_id.clone()) else {
         return;
     };
+    let failed = app.embedded.as_ref().is_some_and(|e| e.failed);
     let label = terminal_block_label(app, &session_id);
 
     // Capture the themed background before the mutable borrow below; the
@@ -3541,7 +3611,7 @@ fn draw_embedded(
     };
     let term_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {label} "))
+        .title(terminal_pane_title(failed, &label))
         .border_style(focus_border_style(term_focus, &app.theme));
     let inner = term_block.inner(split[1]);
 
@@ -3754,6 +3824,46 @@ fn should_gate_attach(
     already_armed: bool,
 ) -> bool {
     !already_armed && host_is_local && !pane_present && live_writer
+}
+
+/// What `drain_pty_events` does when an embedded child exits.
+#[derive(Debug, PartialEq, Eq)]
+enum PtyExitAction {
+    /// Keep the pane on screen showing its final output — a failed attach
+    /// whose error would otherwise flash past unread.
+    Linger,
+    /// Drop the pane and return to the sidebar — a normal detach, a clean
+    /// exit, or any tool-launch exit.
+    Dismiss,
+}
+
+/// Classify an embedded child's exit. A *session* attach (not a tool
+/// launch) that exits non-zero within [`FAILED_ATTACH_WINDOW`] of spawn
+/// reads as a failed attach worth lingering on; everything else dismisses:
+/// tool launches (their sidebar row must be pruned, not left dangling), a
+/// clean exit, and a slow non-zero exit (a real session the user worked in
+/// and detached from). Pure so the timing/kind truth table is unit-testable
+/// without spawning a PTY.
+#[must_use]
+fn classify_pty_exit(is_tool: bool, success: bool, elapsed: Duration) -> PtyExitAction {
+    if !is_tool && !success && elapsed < FAILED_ATTACH_WINDOW {
+        PtyExitAction::Linger
+    } else {
+        PtyExitAction::Dismiss
+    }
+}
+
+/// Title for the embedded pane's block. A failed attach gets a distinct
+/// dead-pane title so it doesn't read as a live session; otherwise the
+/// session's normal label. Pure to keep the string choice out of the
+/// borrow-heavy `draw_embedded` and under test.
+#[must_use]
+fn terminal_pane_title(failed: bool, label: &str) -> String {
+    if failed {
+        " ⚠ attach failed — Enter to retry ".to_string()
+    } else {
+        format!(" {label} ")
+    }
 }
 
 /// Whether the embedded PTY should be resized to `proposed`. False for
@@ -5192,6 +5302,78 @@ mod tests {
         // Second Enter on the same session: user saw the banner and
         // is confirming. Don't re-arm.
         assert!(!should_gate_attach(true, false, true, true));
+    }
+
+    // ---- classify_pty_exit ----
+
+    #[test]
+    fn classify_pty_exit_lingers_on_fast_nonzero_session_attach() {
+        // The motivating case: `ssh … tmux attach` rejected by a stale
+        // server dies non-zero in ~200ms. Keep the pane so the error is
+        // readable instead of flashing back to the sidebar.
+        assert_eq!(
+            classify_pty_exit(false, false, Duration::from_millis(200)),
+            PtyExitAction::Linger
+        );
+    }
+
+    #[test]
+    fn classify_pty_exit_dismisses_slow_nonzero_exit() {
+        // A session the user actually worked in for a while, then it
+        // exited non-zero — that's a real session ending, not a failed
+        // attach. Returning to the sidebar is correct.
+        assert_eq!(
+            classify_pty_exit(
+                false,
+                false,
+                FAILED_ATTACH_WINDOW + Duration::from_millis(1)
+            ),
+            PtyExitAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn classify_pty_exit_dismisses_clean_exit() {
+        // Zero exit is a normal detach even if it happens fast.
+        assert_eq!(
+            classify_pty_exit(false, true, Duration::from_millis(10)),
+            PtyExitAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn classify_pty_exit_dismisses_tool_launch_even_on_fast_failure() {
+        // Tool launches keep the drop+prune path so their `Tools`
+        // sidebar row can't leak — never linger, regardless of timing.
+        assert_eq!(
+            classify_pty_exit(true, false, Duration::from_millis(50)),
+            PtyExitAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn classify_pty_exit_boundary_is_exclusive() {
+        // Exactly at the window is treated as "slow" (dismiss); only
+        // strictly-inside counts as a failed attach.
+        assert_eq!(
+            classify_pty_exit(false, false, FAILED_ATTACH_WINDOW),
+            PtyExitAction::Dismiss
+        );
+    }
+
+    // ---- terminal_pane_title ----
+
+    #[test]
+    fn terminal_pane_title_marks_a_failed_pane() {
+        assert!(terminal_pane_title(true, "Debug OIDC login").contains("attach failed"));
+    }
+
+    #[test]
+    fn terminal_pane_title_uses_the_label_when_healthy() {
+        assert_eq!(
+            terminal_pane_title(false, "Debug OIDC login"),
+            " Debug OIDC login "
+        );
     }
 
     // ---- compute_actively_viewed ----

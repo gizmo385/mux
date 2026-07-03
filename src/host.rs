@@ -486,6 +486,18 @@ impl SshHost {
         // 15s clears that with margin while still bounding a truly-dead
         // host; a slower proxy can get a per-host override — see TODO.
         let status = Self::background_ssh_command(ssh_binary)
+            // Null all three std streams. `-fN` forks a *persistent*
+            // backgrounded master that inherits these fds for its whole
+            // life (up to ControlPersist), so leaving them attached to
+            // agent-mux's terminal lets ssh warnings ("Permanently added
+            // …"), host-key prompts, or a chatty ProxyCommand paint over
+            // the TUI's alternate screen at any later moment — including
+            // reconnects fired by the background pollers. The sibling
+            // control-plane ops (`master_check`, Drop, the failed-spawn
+            // cleanup) already null their streams; this one was the gap.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .arg("-fN")
             .arg("-M")
             .arg("-S")

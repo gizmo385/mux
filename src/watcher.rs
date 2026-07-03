@@ -388,14 +388,21 @@ impl TranscriptWatcher {
                 // a transient outage self-heals.
                 match host.ensure_connected() {
                     Ok(true) => {
-                        eprintln!(
-                            "agent-mux: re-established connection to host '{}'",
+                        // Diagnostic, not user-facing — and this thread
+                        // runs while the TUI owns the alternate screen, so
+                        // an `eprintln!` here would paint over the
+                        // dashboard. Route to the log file instead.
+                        crate::logging::log_line(&format!(
+                            "re-established connection to host '{}'",
                             host_id.0
-                        );
+                        ));
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        eprintln!("agent-mux: reconnect to host '{}' failed: {e}", host_id.0);
+                        crate::logging::log_line(&format!(
+                            "reconnect to host '{}' failed: {e}",
+                            host_id.0
+                        ));
                         continue;
                     }
                 }

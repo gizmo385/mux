@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/gizmo385/mux/compare/v0.1.5...v0.1.6) - 2026-07-04
+
+### Added
+
+- *(embedded-pty)* surface failed attaches instead of flashing away
+
+### Fixed
+
+- *(ssh)* raise master-spawn ConnectTimeout to 15s for proxied hosts
+
+### Other
+
+- Rewrite README
+- *(todo)* file ConnectTimeout=5 vs Coder proxy tunnel-establishment latency
+
 ## [0.1.5](https://github.com/gizmo385/mux/compare/v0.1.4...v0.1.5) - 2026-06-30
 
 ### Fixed

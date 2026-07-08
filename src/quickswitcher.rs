@@ -20,11 +20,40 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::session::{HostId, SessionId};
+
+/// Width the status column is padded to so every row's label starts at
+/// the same column: glyph (1) + space (1) + the widest state word (7,
+/// "blocked"/"working"). Non-session rows (tools, offline pins) reserve
+/// the same blank width.
+const STATUS_WORD_WIDTH: usize = 7;
+
+/// The sidebar-style attention status shown as a switcher row prefix,
+/// so the switcher reads with the same `! blocked` / `✓ done` /
+/// `◐ working` / `○ idle` vocabulary as the dashboard. Built by the
+/// caller from a session's attention (via the same `attention_glyph` /
+/// `attention_word` / theme lookups the sidebar uses) and handed in as
+/// plain data, so this module stays decoupled from the `Theme` type.
+/// `None` on a `SwitchEntry` means "not a session" (tool launch /
+/// offline placeholder) — those have no attention state and render with
+/// a blank status column.
+#[derive(Debug, Clone)]
+pub struct SwitchStatus {
+    pub glyph: &'static str,
+    pub word: &'static str,
+    /// Resolved foreground colour (the sidebar's themed state colour),
+    /// or `None` for an unthemed state — mirrors the sidebar, where an
+    /// empty `[theme]` leaves states uncoloured.
+    pub color: Option<Color>,
+    /// Whether the word renders bold — set for the needs-user states
+    /// (`blocked` / `done`) exactly as the sidebar bolds them, so the
+    /// sessions that want the user pop at the top of the list.
+    pub bold: bool,
+}
 
 /// One jump target. Mirrors the selectable `DisplayRow` kinds so the
 /// caller can re-seat the sidebar cursor onto the matching row before
@@ -49,6 +78,11 @@ pub struct SwitchEntry {
     pub context: String,
     pub haystack: String,
     pub target: SwitchTarget,
+    /// Sidebar-style attention status rendered as a row prefix, or
+    /// `None` for non-session targets (tools, offline placeholders).
+    /// The caller also uses the underlying attention to order sessions
+    /// that want the user to the top before handing entries in.
+    pub status: Option<SwitchStatus>,
 }
 
 /// What the caller should do after handing a key to the modal.
@@ -225,11 +259,31 @@ impl QuickSwitcher {
                 .iter()
                 .filter_map(|&i| self.entries.get(i))
                 .map(|e| {
-                    ListItem::new(Line::from(vec![
-                        Span::raw(e.label.clone()),
-                        Span::raw("  "),
-                        Span::styled(e.context.clone(), dim),
-                    ]))
+                    let mut spans: Vec<Span<'_>> = Vec::new();
+                    // Status column: the sidebar's glyph + word, padded so
+                    // every label lines up. Non-session rows reserve the
+                    // same blank width so they align too.
+                    if let Some(st) = &e.status {
+                        let mut style = Style::new();
+                        if let Some(c) = st.color {
+                            style = style.fg(c);
+                        }
+                        if st.bold {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        spans.push(Span::styled(
+                            format!("{} {:<STATUS_WORD_WIDTH$}", st.glyph, st.word),
+                            style,
+                        ));
+                    } else {
+                        // glyph(1) + space(1) + word(STATUS_WORD_WIDTH).
+                        spans.push(Span::raw(" ".repeat(2 + STATUS_WORD_WIDTH)));
+                    }
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::raw(e.label.clone()));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(e.context.clone(), dim));
+                    ListItem::new(Line::from(spans))
                 })
                 .collect();
             let list = List::new(items)
@@ -343,6 +397,7 @@ mod tests {
                 id: SessionId(id.to_string()),
                 in_favorites: false,
             },
+            status: None,
         }
     }
 
@@ -425,6 +480,50 @@ mod tests {
             }
             _ => panic!("expected Pick of second entry"),
         }
+    }
+
+    #[test]
+    fn draw_renders_status_glyph_and_word_prefix() {
+        // The status column reuses the sidebar vocabulary (glyph + word)
+        // as a per-row prefix, so the switcher reads the same as the
+        // dashboard. Render into a TestBackend and scan the top row for
+        // the blocked glyph+word and the label after it.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut sw = QuickSwitcher::new(vec![SwitchEntry {
+            label: "deploy-fix".to_string(),
+            context: "mux  ·  local".to_string(),
+            haystack: "deploy-fix mux local".to_string(),
+            target: SwitchTarget::Session {
+                id: SessionId("a".to_string()),
+                in_favorites: false,
+            },
+            status: Some(SwitchStatus {
+                glyph: "!",
+                word: "blocked",
+                color: None,
+                bold: true,
+            }),
+        }]);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("test terminal");
+        terminal.draw(|frame| sw.draw(frame)).expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            rendered.contains("! blocked"),
+            "status prefix missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("deploy-fix"),
+            "label missing:\n{rendered}"
+        );
     }
 
     #[test]

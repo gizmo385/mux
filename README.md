@@ -38,7 +38,7 @@ The dashboard discovers local Claude Code sessions, groups them under host heade
 | `↑`/`↓` or `j`/`k` | Navigate the list |
 | `J`/`K` | Jump to next / previous **project** |
 | `Ctrl-j`/`Ctrl-k` | Jump to next / previous top-level **section** (Favorites, Tools, or a host) |
-| `Ctrl-P` | **Quickswitcher**: fuzzy-jump modal over everything attachable. Type to filter |
+| `Ctrl-P` | **Quickswitcher**: fuzzy-jump modal over everything attachable. Rows show each session's status (`! blocked`, `✓ done`, `◐ working`, `○ idle`) and float the ones that need you to the top; type to filter |
 | `Enter` | Attach to the selected session in the embedded pane |
 | `t` | Open `$SHELL` in the session's cwd inside the embedded pane |
 | `n` | New  worktree session |
@@ -48,6 +48,8 @@ The dashboard discovers local Claude Code sessions, groups them under host heade
 | `d` | Delete the selected worktree (worktree-backed sessions only) |
 | `/` | Search/filter by title, project, or host (case-insensitive substring) |
 | `q` / `Ctrl-C` | Quit  |
+
+**Inside an attached session**, the terminal owns the keyboard; the `Ctrl-a` leader is the way back out: `Ctrl-a Esc` returns focus to the sidebar (the session stays alive), and `Ctrl-a p` opens the quickswitcher over the live session — `Esc` drops you back in, `Enter` attaches the picked one. (`Ctrl-a p` overrides an inner tmux's `prefix p`; use `Ctrl-a Ctrl-p` to pass a prefix through.)
 
 
 ## Configuration

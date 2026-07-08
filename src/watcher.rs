@@ -88,6 +88,10 @@ pub enum WatcherEvent {
         /// `elicitation_dialog`) rather than an idle nudge — drives the
         /// session's `blocking_prompt` flag for the "answer me" glyph.
         blocking_prompt: bool,
+        /// The Claude Code payload's `message` field (the prompt text),
+        /// or `None` when absent. Carried through to the notifier as
+        /// the toast body — far more informative than the project path.
+        message: Option<String>,
     },
     /// Snapshot of every live tmux pane on `host`: `cwds` carries
     /// each pane's `pane_current_path`, `session_names` carries each
@@ -530,6 +534,7 @@ fn poll_hooks_once(host: &dyn Host, hooks_dir: &Path, tx: &Sender<WatcherEvent>)
                 id: event.session_id,
                 received_at: event.received_at,
                 blocking_prompt: event.blocking_prompt,
+                message: event.message,
             })
             .is_err()
         {

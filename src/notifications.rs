@@ -49,6 +49,15 @@ pub const DEBOUNCE_WINDOW: Duration = Duration::from_secs(5);
 pub struct Payload {
     pub title: String,
     pub body: String,
+    /// Whether this notification is for a *blocking* prompt — a
+    /// permission request or elicitation dialog the agent is stuck on,
+    /// as opposed to a finished turn / idle nudge. Drives the Linux
+    /// urgency hint: `true` → [`notify_rust::Urgency::Critical`] (the
+    /// toast stays on screen until dismissed, since the agent can't
+    /// proceed without an answer), `false` → the default expiring
+    /// toast. Ignored by the macOS/WSL backends, which have no urgency
+    /// knob.
+    pub blocking: bool,
     /// Whether to request an audible cue from the OS notification
     /// system. Plumbed through the payload so the dispatcher can stay
     /// stateless — config decisions live with the [`Notifier`], not
@@ -125,6 +134,7 @@ impl Dispatcher for LibNotifyDispatcher {
             if request_default_sound {
                 n.sound_name("default");
             }
+            apply_urgency(&mut n, payload.blocking);
             let _ = n.show();
         });
         if let Some(path) = sound_file {
@@ -142,12 +152,97 @@ impl Dispatcher for LibNotifyDispatcher {
         if request_default_sound {
             n.sound_name("default");
         }
+        apply_urgency(&mut n, payload.blocking);
         let _ = n.show();
         if let Some(path) = payload.sound_file {
             play_sound_file_blocking(&path);
         }
         Ok(())
     }
+}
+
+/// Set the XDG urgency hint on a `notify-rust` notification: a blocking
+/// prompt becomes `Critical` (stays on screen until the user dismisses
+/// it — the agent is stuck until answered), everything else stays at
+/// the default expiring urgency. The `urgency` method only exists on
+/// Linux/BSD and Windows in notify-rust (macOS has no urgency knob), so
+/// the call is `cfg`-gated; on macOS this is a no-op, which is correct
+/// because the macOS path uses [`OsascriptDispatcher`], not this one.
+#[allow(unused_variables)]
+fn apply_urgency(n: &mut notify_rust::Notification, blocking: bool) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if blocking {
+        n.urgency(notify_rust::Urgency::Critical);
+    }
+}
+
+/// Longest hook `message` we surface as body text. Claude Code prompts
+/// are short ("Claude needs your permission to use Bash"), but an
+/// elicitation question can run long; clipping keeps the toast to a
+/// scannable line rather than a wall of text.
+const BODY_MESSAGE_CLIP: usize = 140;
+
+/// Build the `(title, body)` pair for a `NeedsInput` notification.
+/// Pulled out of the dispatch path so the formatting is unit-testable
+/// and shared with [`Notifier::test_payload`].
+///
+/// - **Title** leads with the session `name` (the same label the
+///   sidebar shows) and a state suffix, so the user can triage *which*
+///   session and *how urgent* without opening the dashboard: a blocking
+///   prompt reads "needs your input" (the agent is stuck on a
+///   permission / elicitation answer), everything else "finished" (turn
+///   ended, or an idle nudge). No `agent-mux:` prefix — `notify-rust`
+///   already sets the app name, so the prefix only wasted the line the
+///   user scans first.
+/// - **Body** prefers the hook `message` — the actual prompt text,
+///   which is the single most useful datum — and falls back to the
+///   project's basename when there's no hook (the heuristic path). The
+///   host is appended only when remote; `local` is noise.
+#[must_use]
+fn format_notification(
+    name: &str,
+    host: &HostId,
+    project: &Path,
+    blocking: bool,
+    message: Option<&str>,
+) -> (String, String) {
+    let state = if blocking {
+        "needs your input"
+    } else {
+        "finished"
+    };
+    let title = format!("{name} — {state}");
+
+    let mut body = match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(msg) => clip_message(msg),
+        None => project
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    if !host.is_local() {
+        if body.is_empty() {
+            body = host.as_str().to_string();
+        } else {
+            body.push_str(" · ");
+            body.push_str(host.as_str());
+        }
+    }
+    (title, body)
+}
+
+/// Collapse a hook message to a single scannable line: internal
+/// whitespace (hook messages can carry newlines) becomes single spaces,
+/// and anything past [`BODY_MESSAGE_CLIP`] characters is truncated with
+/// an ellipsis. Counts by `char` so a multibyte boundary is never split.
+#[must_use]
+fn clip_message(msg: &str) -> String {
+    let collapsed = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= BODY_MESSAGE_CLIP {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(BODY_MESSAGE_CLIP - 1).collect();
+    format!("{truncated}\u{2026}")
 }
 
 /// Whether the OS notification API should request its built-in default
@@ -563,9 +658,11 @@ impl Notifier {
         {
             return;
         }
+        let (title, body) = format_notification(t.title, t.host, t.project, t.blocking, t.message);
         let payload = Payload {
-            title: format!("agent-mux: {}", t.title),
-            body: format!("{} · {}", t.host, t.project.display()),
+            title,
+            body,
+            blocking: t.blocking,
             sound: self.config.sound,
             sound_file: self.config.sound_file.clone(),
         };
@@ -674,10 +771,25 @@ impl Notifier {
     /// dispatch path so the test subcommand can introspect the payload
     /// (e.g. log what it sent) before handing it to the dispatcher.
     #[must_use]
-    pub fn test_payload(&self, title: &str, host: &str, project: &Path) -> Payload {
+    pub fn test_payload(
+        &self,
+        title: &str,
+        host: &str,
+        project: &Path,
+        blocking: bool,
+        message: Option<&str>,
+    ) -> Payload {
+        // Route through the same formatter the live path uses so
+        // `notify-test` previews exactly what a real toast looks like.
+        // The `notify-test --blocking` flag drives the `blocking` +
+        // `message` inputs so the user can preview the sticky
+        // "needs your input" variant, not just the "finished" fallback.
+        let (title, body) =
+            format_notification(title, &HostId(host.to_string()), project, blocking, message);
         Payload {
-            title: format!("agent-mux: {title}"),
-            body: format!("{host} · {}", project.display()),
+            title,
+            body,
+            blocking,
             sound: self.config.sound,
             sound_file: self.config.sound_file.clone(),
         }
@@ -718,6 +830,20 @@ pub struct Transition<'a> {
     pub title: &'a str,
     pub host: &'a HostId,
     pub project: &'a Path,
+    /// Whether this `NeedsInput` is a Claude Code *blocking prompt*
+    /// (permission request / elicitation dialog — the agent is stuck
+    /// waiting on a specific answer) versus a finished turn / idle
+    /// nudge. Mirrors the session's `blocking_prompt` flag at the call
+    /// site. Drives both the title wording ("needs your input" vs
+    /// "finished") and the Linux urgency hint (`Critical` when true).
+    pub blocking: bool,
+    /// The Claude Code `Notification` hook's `message` field when this
+    /// transition was driven by a hook event (e.g. "Claude needs your
+    /// permission to use Bash", or an elicitation question) — the most
+    /// informative body text available. `None` on the heuristic path
+    /// (a transcript-derived transition has no prompt text), in which
+    /// case the body falls back to the project context.
+    pub message: Option<&'a str>,
     /// True when the user is *actively engaged* with this specific
     /// session at transition time — the embedded PTY pane currently
     /// hosts this session and keyboard focus is on the terminal, not
@@ -796,6 +922,7 @@ mod tests {
         Payload {
             title: title.into(),
             body: body.into(),
+            blocking: false,
             sound,
             sound_file: None,
         }
@@ -957,6 +1084,8 @@ mod tests {
                 title,
                 host,
                 project,
+                blocking: false,
+                message: None,
                 actively_viewed: false,
                 source_at: None,
             },
@@ -986,6 +1115,8 @@ mod tests {
                 title,
                 host,
                 project,
+                blocking: false,
+                message: None,
                 actively_viewed: true,
                 source_at: None,
             },
@@ -1015,7 +1146,7 @@ mod tests {
             Path::new("/proj"),
             at(100),
         );
-        assert_eq!(log_titles(&rec), vec!["agent-mux: refactor parser"]);
+        assert_eq!(log_titles(&rec), vec!["refactor parser — finished"]);
     }
 
     #[test]
@@ -1109,6 +1240,8 @@ mod tests {
                 title,
                 host,
                 project,
+                blocking: false,
+                message: None,
                 actively_viewed: false,
                 source_at,
             },
@@ -1445,7 +1578,11 @@ mod tests {
     }
 
     #[test]
-    fn payload_includes_session_title_host_and_project() {
+    fn payload_title_leads_with_session_and_body_carries_remote_context() {
+        // Heuristic path (no hook message) on a remote host: the title
+        // leads with the session name + "finished" state (no wasteful
+        // `agent-mux:` prefix), and the body is the project *basename*
+        // plus the remote host label.
         let (mut n, rec) = notifier_with_log();
         fire(
             &mut n,
@@ -1458,8 +1595,88 @@ mod tests {
             at(0),
         );
         let log = rec.log.lock().unwrap();
-        assert_eq!(log[0].title, "agent-mux: refactor parser");
-        assert_eq!(log[0].body, "alpenglow · /home/user/work/mux");
+        assert_eq!(log[0].title, "refactor parser — finished");
+        assert_eq!(log[0].body, "mux · alpenglow");
+    }
+
+    #[test]
+    fn format_notification_local_finished_drops_host_and_uses_basename() {
+        // Local + no hook message: title says "finished", body is just
+        // the project basename (no `local ·` noise).
+        let (title, body) = format_notification(
+            "refactor parser",
+            &HostId::local(),
+            Path::new("/home/user/work/mux"),
+            false,
+            None,
+        );
+        assert_eq!(title, "refactor parser — finished");
+        assert_eq!(body, "mux");
+    }
+
+    #[test]
+    fn format_notification_blocking_with_hook_message_uses_message_as_body() {
+        // Blocking prompt + hook message: title flags "needs your
+        // input", body is the actual prompt text.
+        let (title, body) = format_notification(
+            "deploy",
+            &HostId::local(),
+            Path::new("/w/deploy"),
+            true,
+            Some("Claude needs your permission to use Bash"),
+        );
+        assert_eq!(title, "deploy — needs your input");
+        assert_eq!(body, "Claude needs your permission to use Bash");
+    }
+
+    #[test]
+    fn format_notification_remote_message_appends_host() {
+        let (_, body) = format_notification(
+            "deploy",
+            &HostId("alpenglow".to_string()),
+            Path::new("/w/deploy"),
+            true,
+            Some("Approve running git push?"),
+        );
+        assert_eq!(body, "Approve running git push? · alpenglow");
+    }
+
+    #[test]
+    fn clip_message_collapses_whitespace_and_truncates_long_input() {
+        assert_eq!(clip_message("a\n  b\tc"), "a b c");
+        let long = "x".repeat(200);
+        let clipped = clip_message(&long);
+        assert_eq!(clipped.chars().count(), BODY_MESSAGE_CLIP);
+        assert!(
+            clipped.ends_with('\u{2026}'),
+            "expected ellipsis: {clipped}"
+        );
+    }
+
+    #[test]
+    fn blocking_payload_sets_blocking_flag_for_urgency() {
+        // The `blocking` bool must reach the Payload so the Linux
+        // dispatcher can raise urgency to Critical.
+        let (mut n, rec) = notifier_with_log();
+        n.on_attention_update(
+            &Transition {
+                id: &sid("a"),
+                prev: Attention::Working,
+                new: Attention::NeedsInput,
+                title: "deploy",
+                host: &local(),
+                project: Path::new("/w/deploy"),
+                blocking: true,
+                message: Some("Approve?"),
+                actively_viewed: false,
+                source_at: None,
+            },
+            at(0),
+        );
+        let log = rec.log.lock().unwrap();
+        assert!(log[0].blocking, "blocking flag must reach the payload");
+        assert_eq!(log[0].title, "deploy — needs your input");
+        assert_eq!(log[0].body, "Approve?");
     }
 
     #[test]
@@ -1549,7 +1766,7 @@ mod tests {
         );
         let log = rec.log.lock().unwrap();
         assert_eq!(log.len(), 1);
-        assert_eq!(log[0].title, "agent-mux: y");
+        assert_eq!(log[0].title, "y — finished");
     }
 
     #[test]
@@ -1611,7 +1828,7 @@ mod tests {
         );
         let log = rec.log.lock().unwrap();
         assert_eq!(log.len(), 1, "second transition should fire");
-        assert_eq!(log[0].title, "agent-mux: second");
+        assert_eq!(log[0].title, "second — finished");
     }
 
     #[test]
@@ -1637,7 +1854,7 @@ mod tests {
         n.on_terminal_focus_lost(at(1));
         let log = rec.log.lock().unwrap();
         assert_eq!(log.len(), 1, "belated toast on focus loss");
-        assert_eq!(log[0].title, "agent-mux: permission prompt");
+        assert_eq!(log[0].title, "permission prompt — finished");
     }
 
     #[test]
@@ -1754,6 +1971,8 @@ mod tests {
                 title: "x",
                 host: &local(),
                 project: Path::new("/p"),
+                blocking: false,
+                message: None,
                 actively_viewed: true,
                 source_at: None,
             },
@@ -1984,6 +2203,7 @@ mod tests {
         let no_file = Payload {
             title: "x".into(),
             body: "y".into(),
+            blocking: false,
             sound: true,
             sound_file: None,
         };
@@ -2074,7 +2294,7 @@ mod tests {
             Box::new(SharedRouteRecorder(std::sync::Arc::clone(&rec))),
             NotificationsConfig::default(),
         );
-        let payload = notifier.test_payload("x", "h", Path::new("/p"));
+        let payload = notifier.test_payload("x", "h", Path::new("/p"), false, None);
         notifier.dispatch_test(payload).unwrap();
         assert_eq!(
             *rec.sync_calls.lock().unwrap(),
@@ -2103,6 +2323,7 @@ mod tests {
         d.dispatch_blocking(Payload {
             title: "x".into(),
             body: "y".into(),
+            blocking: false,
             sound: false,
             sound_file: None,
         })
@@ -2118,10 +2339,29 @@ mod tests {
             ..NotificationsConfig::default()
         };
         let (n, _) = notifier_with_log_and_config(cfg);
-        let p = n.test_payload("preview", "alpenglow", Path::new("/work/mux"));
-        assert_eq!(p.title, "agent-mux: preview");
-        assert_eq!(p.body, "alpenglow · /work/mux");
+        let p = n.test_payload("preview", "alpenglow", Path::new("/work/mux"), false, None);
+        assert_eq!(p.title, "preview — finished");
+        assert_eq!(p.body, "mux · alpenglow");
         assert!(p.sound);
         assert_eq!(p.sound_file.as_deref(), Some(Path::new("/abs/ding.mp3")));
+    }
+
+    #[test]
+    fn test_payload_blocking_previews_the_needs_input_variant() {
+        // `notify-test --blocking` drives this: the title flips to
+        // "needs your input", the sample message becomes the body, and
+        // the `blocking` flag is set so the Linux dispatcher can raise
+        // urgency to Critical.
+        let (n, _) = notifier_with_log();
+        let p = n.test_payload(
+            "preview",
+            "local",
+            Path::new("/work/mux"),
+            true,
+            Some("Approve running git push?"),
+        );
+        assert_eq!(p.title, "preview — needs your input");
+        assert_eq!(p.body, "Approve running git push?");
+        assert!(p.blocking, "blocking flag must be set for urgency");
     }
 }

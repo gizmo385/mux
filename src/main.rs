@@ -49,7 +49,9 @@ use agent_mux::favorites::{
 use agent_mux::host::{Host, LocalHost, SshHost};
 use agent_mux::new_session_modal::{KeyOutcome, NewSessionModal, NewSessionSeed};
 use agent_mux::notifications::{Notifier, Transition, pick_dispatcher};
-use agent_mux::quickswitcher::{QuickSwitcher, SwitchEntry, SwitchOutcome, SwitchTarget};
+use agent_mux::quickswitcher::{
+    QuickSwitcher, SwitchEntry, SwitchOutcome, SwitchStatus, SwitchTarget,
+};
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
 use agent_mux::session_names::{SessionNameStore, default_store_path};
@@ -150,10 +152,15 @@ fn main() -> io::Result<()> {
             cli::print_config(&mut stdout, &searched, loaded_from.as_deref(), &result)
         }
         Some("notify-test") => {
+            // `--blocking` previews the sticky "needs your input"
+            // variant (title state suffix + hook-message body + Linux
+            // Critical urgency); without it the default "finished"
+            // preview fires.
+            let blocking = argv.iter().any(|s| s == "--blocking");
             let cfg = Config::load().unwrap_or_default();
             let (dispatcher, backend_label) = pick_dispatcher(cfg.notifications.backend);
             let notifier = Notifier::new(dispatcher, cfg.notifications);
-            cli::print_notify_test(&mut stdout, &notifier, backend_label)
+            cli::print_notify_test(&mut stdout, &notifier, backend_label, blocking)
         }
         Some("hook") => {
             // Producer side of the Claude Code Notification hook
@@ -382,6 +389,15 @@ struct App {
     /// query + selection; on Enter it yields a [`SwitchTarget`] that the
     /// run loop re-seats the sidebar cursor onto and attaches.
     quickswitcher: Option<QuickSwitcher>,
+    /// Where to return focus when the open quickswitcher is *cancelled*.
+    /// `Some(Focus::Terminal { .. })` when it was launched from inside a
+    /// session via the `Ctrl-a p` leader chord — focus was moved to the
+    /// sidebar so the overlay receives keys, but the embedded session is
+    /// still alive underneath, so cancel drops the user back into it
+    /// rather than the sidebar. `None` for the ordinary `Ctrl-P`-from-
+    /// sidebar open (cancel just leaves the sidebar focused). Cleared
+    /// whenever the switcher closes.
+    quickswitch_return_focus: Option<Focus>,
     /// Open edited-files picker. A sibling overlay of `quickswitcher` —
     /// at most one overlay up at a time, enforced by the open-time guard
     /// in `open_edited_files`. Opened by pressing a file-scoped
@@ -773,6 +789,7 @@ impl App {
             modal: None,
             delete_modal: None,
             quickswitcher: None,
+            quickswitch_return_focus: None,
             edited_files_modal: None,
             create_tx,
             create_rx,
@@ -1409,12 +1426,25 @@ impl App {
                 ActionOutcome::Continue
             }
             // Modal dropped (not re-stored) on Cancel and Pick.
-            SwitchOutcome::Cancel => ActionOutcome::Continue,
+            SwitchOutcome::Cancel => {
+                // Opened from inside a session: the embedded PTY is still
+                // alive, so cancel drops the user back into it rather
+                // than the sidebar. (If the session died while the
+                // overlay was up, fall through to the sidebar.)
+                if let Some(return_focus) = self.quickswitch_return_focus.take()
+                    && self.embedded.is_some()
+                {
+                    self.focus = return_focus;
+                }
+                ActionOutcome::Continue
+            }
             SwitchOutcome::Pick(target) => {
                 // Re-seat the sidebar cursor onto the chosen row, then
                 // run the exact attach path a manual Enter would — the
                 // switcher is a selection layer over the one attach
-                // flow, not a parallel one.
+                // flow, not a parallel one. A successful attach sets
+                // `Focus::Terminal` itself; the return-focus has done its job.
+                self.quickswitch_return_focus = None;
                 let anchor = switch_target_anchor(target);
                 self.reseat_selection_to(Some(&anchor));
                 self.attach_under_cursor()
@@ -1505,71 +1535,100 @@ impl App {
         }
     }
 
-    /// Build the quickswitcher's candidate set: every live session
-    /// (recency-ordered, most-recent first), every running tool launch,
-    /// and every offline favorite (placeholder). Flat and de-duplicated
-    /// — a favorited session appears once here even though it renders
-    /// twice in the sidebar. The `haystack` folds title + project + host
-    /// so a query can hit any of them.
+    /// Build the quickswitcher's candidate set: every live session,
+    /// every running tool launch, and every offline favorite
+    /// (placeholder). Flat and de-duplicated — a favorited session
+    /// appears once here even though it renders twice in the sidebar.
+    /// The `haystack` folds title + project + host so a query can hit
+    /// any of them.
+    ///
+    /// Ordering (the empty-query view — the moment the user types, the
+    /// fuzzy score re-ranks): sessions that *want the user* float to the
+    /// top so the switcher doubles as "jump to what needs me" — `blocked`
+    /// first, then `done` (both `NeedsInput`), then everything else
+    /// (`working` / `idle` sessions, tool launches, offline pins) in the
+    /// recency/kind order below. Each session carries the sidebar's
+    /// `attention_glyph` / `attention_word` / themed colour as its
+    /// [`SwitchStatus`] so the list reads with the same vocabulary as the
+    /// dashboard.
     fn quickswitch_entries(&self) -> Vec<SwitchEntry> {
-        let mut entries = Vec::new();
+        // `(rank, entry)` — a stable sort by `rank` at the end floats
+        // needs-user sessions up while preserving the within-rank order
+        // each group is pushed in (tools, then sessions by recency, then
+        // offline pins). `rank`: 0 = blocked, 1 = done, 2 = everything else.
+        let mut ranked: Vec<(u8, SwitchEntry)> = Vec::new();
 
-        // Tool launches first — short-lived panes the user often bounces
-        // back to mid-task.
+        // Tool launches — short-lived panes the user often bounces back
+        // to mid-task. No attention state (rank 2, no status prefix).
         for launch in self.tool_launches.launches() {
             let project = project_basename(&launch.project_dir);
-            entries.push(SwitchEntry {
-                label: launch.name.clone(),
-                context: format!("{project}  ·  {}", launch.host.as_str()),
-                haystack: format!("{} {project} {}", launch.name, launch.host.as_str())
-                    .to_lowercase(),
-                target: SwitchTarget::Tool {
-                    tmux_session: launch.tmux_session.clone(),
+            ranked.push((
+                2,
+                SwitchEntry {
+                    label: launch.name.clone(),
+                    context: format!("{project}  ·  {}", launch.host.as_str()),
+                    haystack: format!("{} {project} {}", launch.name, launch.host.as_str())
+                        .to_lowercase(),
+                    target: SwitchTarget::Tool {
+                        tmux_session: launch.tmux_session.clone(),
+                    },
+                    status: None,
                 },
-            });
+            ));
         }
 
-        // Live sessions, most-recently-active first so the unfiltered
-        // view opens on the likeliest target.
+        // Live sessions, most-recently-active first within their rank.
         let mut sessions: Vec<&Session> = self.catalog.sessions().iter().collect();
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         for s in sessions {
             let name_override = self.session_names.get(&s.host, &s.id);
             let label = quickswitch_label(name_override, s.title.as_deref(), &s.id);
             let project = project_basename(&s.project_dir);
-            entries.push(SwitchEntry {
-                label: label.clone(),
-                context: format!("{project}  ·  {}", s.host.as_str()),
-                haystack: format!("{label} {project} {}", s.host.as_str()).to_lowercase(),
-                target: SwitchTarget::Session {
-                    id: s.id.clone(),
-                    in_favorites: self.favorites.contains(&s.host, &s.id),
+            let (rank, status) = switch_status_for(s, &self.theme);
+            ranked.push((
+                rank,
+                SwitchEntry {
+                    label: label.clone(),
+                    context: format!("{project}  ·  {}", s.host.as_str()),
+                    haystack: format!("{label} {project} {}", s.host.as_str()).to_lowercase(),
+                    target: SwitchTarget::Session {
+                        id: s.id.clone(),
+                        in_favorites: self.favorites.contains(&s.host, &s.id),
+                    },
+                    status: Some(status),
                 },
-            });
+            ));
         }
 
         // Offline favorites — pinned but their host isn't live this
         // frame. Picking one re-seats onto its placeholder row and
-        // surfaces "waiting for host" rather than attaching. Note these
-        // inherit any *active sidebar search* filter (via
-        // `favorite_placeholders`) while the live sessions above don't —
-        // a benign asymmetry, since the switcher's own query re-filters
-        // everything the moment the user types, and the placeholder set
-        // is a handful of offline pins.
+        // surfaces "waiting for host" rather than attaching. No live
+        // attention (rank 2, no status prefix). Note these inherit any
+        // *active sidebar search* filter (via `favorite_placeholders`)
+        // while the live sessions above don't — a benign asymmetry, since
+        // the switcher's own query re-filters everything the moment the
+        // user types, and the placeholder set is a handful of offline pins.
         for ph in self.favorite_placeholders() {
             let label = quickswitch_label(None, ph.title.as_deref(), &ph.id);
-            entries.push(SwitchEntry {
-                label: label.clone(),
-                context: format!("{}  ·  offline", ph.host.as_str()),
-                haystack: format!("{label} {}", ph.host.as_str()).to_lowercase(),
-                target: SwitchTarget::Placeholder {
-                    host: ph.host,
-                    id: ph.id,
+            ranked.push((
+                2,
+                SwitchEntry {
+                    label: label.clone(),
+                    context: format!("{}  ·  offline", ph.host.as_str()),
+                    haystack: format!("{label} {}", ph.host.as_str()).to_lowercase(),
+                    target: SwitchTarget::Placeholder {
+                        host: ph.host,
+                        id: ph.id,
+                    },
+                    status: None,
                 },
-            });
+            ));
         }
 
-        entries
+        // Stable sort: needs-user sessions rise to the top; each group
+        // keeps the order it was pushed in.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, entry)| entry).collect()
     }
 
     /// Skip `git worktree add` and spawn claude directly in the picked
@@ -1932,6 +1991,10 @@ impl App {
                             prev,
                             update.attention,
                             update.mtime,
+                            // Heuristic transitions carry no prompt
+                            // text; the body falls back to project
+                            // context in the formatter.
+                            None,
                         );
                     }
                 }
@@ -1939,6 +2002,7 @@ impl App {
                     id,
                     received_at,
                     blocking_prompt,
+                    message,
                 } => {
                     // A Claude Code Notification hook fired for `id`.
                     // Force NeedsInput regardless of what the
@@ -1965,6 +2029,7 @@ impl App {
                             prev,
                             agent_mux::session::Attention::NeedsInput,
                             Some(received_at),
+                            message.as_deref(),
                         );
                     }
                 }
@@ -2011,12 +2076,21 @@ impl App {
     /// pre-date the current run. `None` means "no timestamp known,
     /// treat as live" — used by call sites without a source clock
     /// (e.g. the heuristic path whose `mtime` is often unavailable).
+    ///
+    /// `message` is the Claude Code hook's prompt text on the hook path
+    /// (surfaced as the toast body), `None` on the heuristic path.
+    /// `blocking` is read from the session's own `blocking_prompt` flag
+    /// — the catalog set it just before this call (`apply_hook_event`
+    /// on the hook path, `apply_heuristic_attention` clears it on the
+    /// heuristic path) — so both the title wording and the Linux
+    /// urgency hint reflect the current state without a second param.
     fn fire_attention_notification(
         &mut self,
         id: &SessionId,
         prev: Attention,
         new: Attention,
         source_at: Option<SystemTime>,
+        message: Option<&str>,
     ) {
         let Some(session) = self.catalog.sessions().iter().find(|s| s.id == *id) else {
             return;
@@ -2026,6 +2100,7 @@ impl App {
             resolve_notification_title(name_override, session.title.as_deref(), &session.id);
         let host = session.host.clone();
         let project = session.project_dir.clone();
+        let blocking = session.blocking_prompt;
         let actively_viewed = compute_actively_viewed(
             self.focus,
             self.terminal_focused,
@@ -2040,6 +2115,8 @@ impl App {
                 title,
                 host: &host,
                 project: &project,
+                blocking,
+                message,
                 actively_viewed,
                 source_at,
             },
@@ -2254,6 +2331,26 @@ impl App {
         match leader_chord_transition(self.focus, key) {
             LeaderChordTransition::EscapeToSidebar => {
                 self.focus = Focus::Sidebar;
+            }
+            LeaderChordTransition::OpenQuickSwitcher => {
+                // Move focus off the terminal so the main loop routes
+                // keys to the overlay (the `Focus::Terminal` branch
+                // would otherwise swallow them into the PTY). The
+                // embedded session stays alive underneath; the stored
+                // return-focus lets a cancel restore it — *disarmed*, so
+                // the leader doesn't carry over. If the switcher couldn't
+                // open (nothing to switch to), stay in the session rather
+                // than stranding the user in the sidebar.
+                let back_to_session = Focus::Terminal {
+                    leader_armed: false,
+                };
+                self.focus = Focus::Sidebar;
+                self.quickswitch_return_focus = Some(back_to_session);
+                self.open_quickswitcher();
+                if self.quickswitcher.is_none() {
+                    self.quickswitch_return_focus = None;
+                    self.focus = back_to_session;
+                }
             }
             LeaderChordTransition::ForwardBothToPty => {
                 let leader_event = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
@@ -3180,6 +3277,17 @@ fn leader_chord_transition(focus: Focus, key: &KeyEvent) -> LeaderChordTransitio
         if key.code == KeyCode::Esc {
             return LeaderChordTransition::EscapeToSidebar;
         }
+        // `Ctrl-a p` opens the quickswitcher over the live session —
+        // the one-gesture "switch from inside a session" the sidebar's
+        // `Ctrl-P` mirrors. A plain `p` (no Ctrl/Alt); `Ctrl-a Ctrl-p`
+        // still falls through to the inner tmux as prefix-passthrough.
+        if key.code == KeyCode::Char('p')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return LeaderChordTransition::OpenQuickSwitcher;
+        }
         return LeaderChordTransition::ForwardBothToPty;
     }
     if is_pty_leader(key) {
@@ -3191,6 +3299,7 @@ fn leader_chord_transition(focus: Focus, key: &KeyEvent) -> LeaderChordTransitio
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaderChordTransition {
     EscapeToSidebar,
+    OpenQuickSwitcher,
     ForwardBothToPty,
     ArmLeader,
     EncodeAndForward,
@@ -4405,6 +4514,41 @@ fn attention_glyph(a: Attention, blocked: bool) -> &'static str {
     }
 }
 
+/// Build a session's quickswitcher status + sort rank from the same
+/// attention derivation the sidebar uses, so the switcher reads with the
+/// identical `! blocked` / `✓ done` / `◐ working` / `○ idle` vocabulary
+/// and colours. Rank floats needs-user sessions to the top of the
+/// switcher's empty-query view: `0` = blocked, `1` = done (both
+/// `NeedsInput`), `2` = working / idle / unknown.
+fn switch_status_for(session: &Session, theme: &Theme) -> (u8, SwitchStatus) {
+    let attention = effective_attention(session);
+    let blocked = session.blocking_prompt && attention == Attention::NeedsInput;
+    let needs_user = attention == Attention::NeedsInput;
+    let rank = if blocked {
+        0
+    } else if needs_user {
+        1
+    } else {
+        2
+    };
+    let color = if blocked {
+        theme.blocked_color()
+    } else {
+        attention_color(attention, theme)
+    };
+    (
+        rank,
+        SwitchStatus {
+            glyph: attention_glyph(attention, blocked),
+            word: attention_word(attention, blocked),
+            color,
+            // The sidebar bolds the needs-user words (done / blocked);
+            // mirror that so they pop at the top of the switcher.
+            bold: needs_user,
+        },
+    )
+}
+
 fn display_path(path: &Path, home: Option<&Path>) -> String {
     if let Some(h) = home
         && let Ok(suffix) = path.strip_prefix(h)
@@ -4567,6 +4711,59 @@ mod tests {
             leader_chord_transition(focus, &key),
             LeaderChordTransition::ForwardBothToPty,
         );
+    }
+
+    #[test]
+    fn leader_chord_armed_p_opens_quickswitcher() {
+        // `Ctrl-a p` from inside a session opens the switcher rather
+        // than forwarding prefix+p to the inner tmux.
+        let focus = Focus::Terminal { leader_armed: true };
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(
+            leader_chord_transition(focus, &key),
+            LeaderChordTransition::OpenQuickSwitcher,
+        );
+    }
+
+    #[test]
+    fn leader_chord_armed_ctrl_p_still_forwards_to_pty() {
+        // Only *plain* `p` opens the switcher; `Ctrl-a Ctrl-p` stays a
+        // tmux prefix passthrough so nested-tmux users keep it.
+        let focus = Focus::Terminal { leader_armed: true };
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(
+            leader_chord_transition(focus, &key),
+            LeaderChordTransition::ForwardBothToPty,
+        );
+    }
+
+    #[test]
+    fn switch_status_reuses_sidebar_vocabulary_and_ranks_needs_user_first() {
+        // The switcher status mirrors the sidebar's glyph+word, and the
+        // rank floats blocked above done above the rest so opening the
+        // switcher lands on what wants the user. `last_activity = now`
+        // so the 1h idle overlay in `effective_attention` doesn't fire.
+        let theme = theme_default_resolved();
+        let mut blocked = mock_session("a");
+        blocked.last_activity = SystemTime::now();
+        blocked.attention = Attention::NeedsInput;
+        blocked.blocking_prompt = true;
+        let (rank, st) = switch_status_for(&blocked, &theme);
+        assert_eq!((rank, st.glyph, st.word), (0, "!", "blocked"));
+        assert!(st.bold, "blocked is a needs-user state → bold");
+
+        let mut done = mock_session("b");
+        done.last_activity = SystemTime::now();
+        done.attention = Attention::NeedsInput;
+        let (rank, st) = switch_status_for(&done, &theme);
+        assert_eq!((rank, st.glyph, st.word), (1, "✓", "done"));
+
+        let mut working = mock_session("c");
+        working.last_activity = SystemTime::now();
+        working.attention = Attention::Working;
+        let (rank, st) = switch_status_for(&working, &theme);
+        assert_eq!((rank, st.glyph, st.word), (2, "◐", "working"));
+        assert!(!st.bold, "working is not a needs-user state");
     }
 
     #[test]

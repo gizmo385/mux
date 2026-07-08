@@ -108,6 +108,14 @@ pub struct HookEvent {
     /// session's `blocking_prompt` flag and the sidebar's "answer me"
     /// glyph; does not change whether a notification fires.
     pub blocking_prompt: bool,
+    /// The Claude Code `Notification` payload's `message` field — the
+    /// human-readable prompt text (e.g. "Claude needs your permission
+    /// to use Bash", or an elicitation question). `None` when the
+    /// payload carried no non-empty `message`. Surfaced as the
+    /// notification body, which is far more informative than the old
+    /// `<host> · <project>`. Trimmed but not otherwise reshaped here;
+    /// the notifier collapses/clips it for display.
+    pub message: Option<String>,
     /// The raw payload as it landed on stdin (or whatever the subset
     /// of fields the subcommand chose to persist). Carried so future
     /// readers can extract more without changing the marker format.
@@ -259,6 +267,22 @@ fn parse_notification_type(payload: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Pull the `message` field out of the hook JSON — the human-readable
+/// prompt text Claude Code surfaces ("Claude needs your permission to
+/// use Bash", or an elicitation question). Returns `None` when absent,
+/// non-string, or empty after trimming; the notifier then falls back to
+/// project context for the body.
+#[must_use]
+fn parse_message(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let raw = v.as_object()?.get("message")?.as_str()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Pull `session_id` out of the hook JSON. Tolerant of surrounding
 /// whitespace and accepts both `"session_id"` and `"sessionId"`
 /// spellings (Claude Code documents the `snake_case` form but a
@@ -368,6 +392,7 @@ pub fn parse_marker_content(path: &Path, raw: &str) -> io::Result<HookEvent> {
         session_id: SessionId(session_id),
         received_at,
         blocking_prompt: is_blocking_prompt(parse_notification_type(raw).as_deref()),
+        message: parse_message(raw),
         raw_json: raw.to_string(),
     })
 }
@@ -449,6 +474,7 @@ fn ingest_marker(hook_dir: &Path, path: &Path, tx: &Sender<WatcherEvent>) {
         id: event.session_id,
         received_at: event.received_at,
         blocking_prompt: event.blocking_prompt,
+        message: event.message,
     });
     let _ = fs::remove_file(path);
 }
@@ -585,6 +611,35 @@ mod tests {
         assert!(!is_blocking_prompt(Some("idle_prompt")));
         assert!(!is_blocking_prompt(Some("auth_success")));
         assert!(!is_blocking_prompt(None));
+    }
+
+    #[test]
+    fn parse_marker_content_extracts_message_for_the_toast_body() {
+        // The `message` field is the human-readable prompt text; it
+        // becomes the notification body. Absent/empty → None so the
+        // notifier falls back to project context.
+        let path = Path::new("/x/1700000000000-a.json");
+        let with_msg = parse_marker_content(
+            path,
+            r#"{"session_id":"a","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_msg.message.as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+        let without = parse_marker_content(
+            path,
+            r#"{"session_id":"a","notification_type":"idle_prompt"}"#,
+        )
+        .unwrap();
+        assert_eq!(without.message, None);
+        let empty = parse_marker_content(
+            path,
+            r#"{"session_id":"a","notification_type":"idle_prompt","message":"   "}"#,
+        )
+        .unwrap();
+        assert_eq!(empty.message, None, "whitespace-only message is None");
     }
 
     #[test]

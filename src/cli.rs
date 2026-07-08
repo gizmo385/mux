@@ -502,6 +502,13 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
 /// backend label is included in the confirmation line so a misfiring
 /// auto-probe is immediately visible.
 ///
+/// `blocking` (the `--blocking` flag) previews the sticky "needs your
+/// input" variant: it flips the title's state suffix, feeds a sample
+/// prompt through as the body (so the user sees the hook-`message`
+/// shape, not the project-basename fallback), and — on Linux — raises
+/// the toast to `Critical` urgency. Without it, the default "finished"
+/// preview fires.
+///
 /// # Errors
 ///
 /// Propagates any `io::Error` from `out`, or a non-empty error string
@@ -510,11 +517,18 @@ pub fn print_notify_test<W: Write>(
     out: &mut W,
     notifier: &Notifier,
     backend_label: &str,
+    blocking: bool,
 ) -> io::Result<()> {
+    // A sample prompt so the blocking preview shows the hook-`message`
+    // body shape a real permission prompt would carry; the non-blocking
+    // preview passes `None` and falls back to the project basename.
+    let message = blocking.then_some("Claude needs your permission to run `git push`");
     let payload = notifier.test_payload(
         "test notification",
         "local",
         Path::new("/agent-mux/notify-test"),
+        blocking,
+        message,
     );
     write_notify_test_confirmation(out, &payload, backend_label)?;
     notifier
@@ -571,7 +585,7 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  agent-mux notify-test    Fire one test notification using the current config."
+        "  agent-mux notify-test    Fire one test notification using the current config (--blocking previews the sticky 'needs your input' variant)."
     )?;
     writeln!(
         out,
@@ -861,6 +875,7 @@ mod tests {
         let payload = Payload {
             title: "agent-mux: x".into(),
             body: "local · /p".into(),
+            blocking: false,
             sound: false,
             sound_file: Some(PathBuf::from("/abs/ping.mp3")),
         };
@@ -876,6 +891,7 @@ mod tests {
         let payload = Payload {
             title: "x".into(),
             body: "y".into(),
+            blocking: false,
             sound: true,
             sound_file: None,
         };
@@ -891,6 +907,7 @@ mod tests {
         let payload = Payload {
             title: "x".into(),
             body: "y".into(),
+            blocking: false,
             sound: false,
             sound_file: None,
         };

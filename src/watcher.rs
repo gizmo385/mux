@@ -10,7 +10,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::attachment::{LivePaneSnapshot, list_live_panes};
 use crate::host::Host;
-use crate::session::{Attention, HostId, SessionId};
+use crate::session::{Attention, EDITED_FILES_CAP, HostId, SessionId};
 
 /// How much of the transcript's tail to read when deriving attention.
 /// Transcripts are append-only JSONL; reading the last few KB is enough
@@ -47,6 +47,12 @@ pub struct AttentionUpdate {
     /// matches what's already stored, so the prime case (where the
     /// mtime equals discovery's) costs nothing.
     pub mtime: Option<SystemTime>,
+    /// Files edited within the scanned tail, most-recent-first (see
+    /// [`AttentionDerivation::edited_files`]). The catalog unions these
+    /// into `Session.edited_files` via `merge_edited_files` so the picker
+    /// stays current as the conversation runs. Empty when the tail held
+    /// no edits or couldn't be read.
+    pub edited_files: Vec<PathBuf>,
 }
 
 /// Events emitted by the watcher. `Attention` flows from filesystem events
@@ -199,6 +205,7 @@ impl TranscriptWatcher {
                 attention: detail.attention,
                 from_tool_use: detail.from_tool_use,
                 mtime,
+                edited_files: detail.edited_files,
             }));
         }
 
@@ -252,6 +259,7 @@ impl TranscriptWatcher {
                             attention: detail.attention,
                             from_tool_use: detail.from_tool_use,
                             mtime,
+                            edited_files: detail.edited_files,
                         })
                     } else {
                         // Stat now so the main thread doesn't have to;
@@ -312,6 +320,7 @@ impl TranscriptWatcher {
             attention: detail.attention,
             from_tool_use: detail.from_tool_use,
             mtime,
+            edited_files: detail.edited_files,
         }));
         Ok(())
     }
@@ -564,6 +573,7 @@ fn poll_once(
                         attention: detail.attention,
                         from_tool_use: detail.from_tool_use,
                         mtime: Some(stat.mtime),
+                        edited_files: detail.edited_files,
                     }))
                     .is_err()
                 {
@@ -597,6 +607,7 @@ fn poll_once(
                 attention: detail.attention,
                 from_tool_use: detail.from_tool_use,
                 mtime: Some(stat.mtime),
+                edited_files: detail.edited_files,
             }))
             .is_err()
         {
@@ -627,7 +638,14 @@ fn is_top_level_transcript(path: &Path, projects_root: &Path) -> bool {
 /// triggered a hook's "blocked" pin would clobber that pin back to
 /// "working" the moment its file mtime edged a millisecond past the
 /// hook's timestamp. See [`crate::catalog::SessionCatalog::apply_heuristic_attention`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Also carries the files edited within the scanned window (see
+/// `edited_files`). Bundling it here means the watcher's single tail read
+/// and discovery's single full-buffer read each yield attention *and* the
+/// edit list without a second `read_tail` — which on a remote host would
+/// be a second SSH round-trip per poll tick. Not `Copy` for that reason
+/// (the `Vec` field); the previous `Copy` was incidental.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionDerivation {
     pub attention: Attention,
     /// `true` iff the last classified entry was an assistant `tool_use`
@@ -635,6 +653,12 @@ pub struct AttentionDerivation {
     /// permission prompt — the two are indistinguishable from the
     /// transcript alone, which is exactly why the hook exists).
     pub from_tool_use: bool,
+    /// Absolute paths of files edited within the scanned buffer, most
+    /// recently edited first, deduplicated, capped at [`EDITED_FILES_CAP`].
+    /// For the tail-read path this is the *recent* window; for discovery's
+    /// full-buffer read it is the session's complete edit history. The
+    /// catalog unions these into `Session.edited_files`.
+    pub edited_files: Vec<PathBuf>,
 }
 
 /// Larger escalation window for [`derive_attention_detail`] when the
@@ -670,6 +694,7 @@ pub fn derive_attention_detail(host: &dyn Host, transcript_path: &Path) -> Atten
         return AttentionDerivation {
             attention: Attention::Unknown,
             from_tool_use: false,
+            edited_files: Vec::new(),
         };
     };
     let detail = derive_attention_detail_from_content(&tail);
@@ -720,6 +745,85 @@ pub fn derive_attention_detail_from_content(transcript: &str) -> AttentionDeriva
     AttentionDerivation {
         attention,
         from_tool_use: matches!(last, Some(EntryKind::AssistantToolUse)),
+        edited_files: derive_edited_files_from_content(transcript),
+    }
+}
+
+/// Tool names whose `tool_use` blocks represent a file edit. `Read`,
+/// `Bash`, `Grep`, etc. are deliberately excluded — the picker is "files
+/// Claude *changed*", not "files Claude looked at". `MultiEdit` is the
+/// legacy batch-edit tool; `NotebookEdit` targets `.ipynb` cells and
+/// carries the path under `notebook_path` rather than `file_path`.
+const EDIT_TOOL_NAMES: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Extract the files edited in `transcript`, most recently edited first,
+/// deduplicated, capped at [`EDITED_FILES_CAP`]. Walks every parseable
+/// JSONL line for assistant `tool_use` blocks whose tool name is in
+/// [`EDIT_TOOL_NAMES`] and pulls the target path (`input.file_path`, or
+/// `input.notebook_path` for `NotebookEdit`).
+///
+/// Pure — no I/O. Discovery calls it on the full transcript buffer (full
+/// history); the watcher's tail read calls it on the last few KB (recent
+/// window). The catalog reconciles the two via
+/// [`crate::catalog::SessionCatalog::merge_edited_files`].
+#[must_use]
+pub fn derive_edited_files_from_content(transcript: &str) -> Vec<PathBuf> {
+    // Accumulate in chronological (oldest-first) order, then dedup
+    // keeping each path's *most recent* occurrence, then reverse to
+    // most-recent-first. Doing the dedup after the walk (rather than a
+    // HashSet during it) is what lets a re-edited file move to the front.
+    let mut chronological: Vec<PathBuf> = Vec::new();
+    for line in transcript.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        collect_edited_paths(&value, &mut chronological);
+    }
+    let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    let mut recent_first: Vec<PathBuf> = Vec::new();
+    for path in chronological.iter().rev() {
+        if seen.insert(path.as_path()) {
+            recent_first.push(path.clone());
+            if recent_first.len() >= EDITED_FILES_CAP {
+                break;
+            }
+        }
+    }
+    recent_first
+}
+
+/// Append the edit-target path(s) from one JSONL entry's `tool_use`
+/// blocks to `acc`, in the order they appear. A single assistant entry
+/// can carry several `tool_use` blocks, so this pushes each match.
+fn collect_edited_paths(value: &serde_json::Value, acc: &mut Vec<PathBuf>) {
+    let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(serde_json::Value::as_str);
+        if !name.is_some_and(|n| EDIT_TOOL_NAMES.contains(&n)) {
+            continue;
+        }
+        let Some(input) = block.get("input") else {
+            continue;
+        };
+        // `NotebookEdit` uses `notebook_path`; every other edit tool uses
+        // `file_path`. Try `file_path` first (the common case), fall back
+        // to `notebook_path`.
+        let path = input
+            .get("file_path")
+            .or_else(|| input.get("notebook_path"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(p) = path {
+            acc.push(PathBuf::from(p));
+        }
     }
 }
 
@@ -993,6 +1097,111 @@ mod tests {
         );
         assert_eq!(done.attention, Attention::NeedsInput);
         assert!(!done.from_tool_use);
+    }
+
+    /// Build one assistant JSONL line invoking `tool` on `path`.
+    fn edit_line(tool: &str, path_key: &str, path: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{tool}","input":{{"{path_key}":"{path}"}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn edited_files_extracts_edit_and_write_paths_most_recent_first() {
+        let content = [
+            edit_line("Edit", "file_path", "/w/a.rs"),
+            edit_line("Write", "file_path", "/w/b.rs"),
+        ]
+        .join("\n");
+        // Newest edit (b.rs) leads.
+        assert_eq!(
+            derive_edited_files_from_content(&content),
+            vec![PathBuf::from("/w/b.rs"), PathBuf::from("/w/a.rs")]
+        );
+    }
+
+    #[test]
+    fn edited_files_ignores_read_and_bash() {
+        let content = [
+            edit_line("Read", "file_path", "/w/looked.rs"),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
+            edit_line("Edit", "file_path", "/w/changed.rs"),
+        ]
+        .join("\n");
+        assert_eq!(
+            derive_edited_files_from_content(&content),
+            vec![PathBuf::from("/w/changed.rs")]
+        );
+    }
+
+    #[test]
+    fn edited_files_dedups_and_moves_reedited_to_front() {
+        let content = [
+            edit_line("Edit", "file_path", "/w/a.rs"),
+            edit_line("Edit", "file_path", "/w/b.rs"),
+            edit_line("Edit", "file_path", "/w/a.rs"), // a re-edited last
+        ]
+        .join("\n");
+        // a.rs is most-recent (edited last), b.rs after, each once.
+        assert_eq!(
+            derive_edited_files_from_content(&content),
+            vec![PathBuf::from("/w/a.rs"), PathBuf::from("/w/b.rs")]
+        );
+    }
+
+    #[test]
+    fn edited_files_reads_notebook_path_for_notebook_edit() {
+        let content = edit_line("NotebookEdit", "notebook_path", "/w/nb.ipynb");
+        assert_eq!(
+            derive_edited_files_from_content(&content),
+            vec![PathBuf::from("/w/nb.ipynb")]
+        );
+    }
+
+    #[test]
+    fn edited_files_handles_multiple_tool_use_blocks_in_one_entry() {
+        // A single assistant entry can carry several tool_use blocks.
+        let content = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/w/a.rs"}},{"type":"text","text":"and"},{"type":"tool_use","name":"Write","input":{"file_path":"/w/b.rs"}}]}}"#;
+        // Within one entry, blocks are chronological; b.rs is later so leads.
+        assert_eq!(
+            derive_edited_files_from_content(content),
+            vec![PathBuf::from("/w/b.rs"), PathBuf::from("/w/a.rs")]
+        );
+    }
+
+    #[test]
+    fn edited_files_empty_when_no_edits() {
+        assert!(derive_edited_files_from_content(user_line()).is_empty());
+        assert!(derive_edited_files_from_content("not json").is_empty());
+    }
+
+    #[test]
+    fn edited_files_caps_at_the_limit() {
+        let content: String = (0..(EDITED_FILES_CAP + 50))
+            .map(|i| edit_line("Edit", "file_path", &format!("/w/f{i}.rs")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let files = derive_edited_files_from_content(&content);
+        assert_eq!(files.len(), EDITED_FILES_CAP);
+        // Most-recent-first: the last-written file leads.
+        assert_eq!(
+            files[0],
+            PathBuf::from(format!("/w/f{}.rs", EDITED_FILES_CAP + 49))
+        );
+    }
+
+    #[test]
+    fn derive_attention_detail_carries_edited_files() {
+        // The bundled derivation path the watcher relies on: attention +
+        // edits fall out of one buffer walk.
+        let content = [
+            edit_line("Edit", "file_path", "/w/a.rs"),
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[]}}"#.to_string(),
+        ]
+        .join("\n");
+        let detail = derive_attention_detail_from_content(&content);
+        assert_eq!(detail.attention, Attention::NeedsInput);
+        assert_eq!(detail.edited_files, vec![PathBuf::from("/w/a.rs")]);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::session::{Attention, HostId, Session, SessionId};
+use crate::session::{Attention, EDITED_FILES_CAP, HostId, Session, SessionId};
 
 #[derive(Debug, Default)]
 pub struct SessionCatalog {
@@ -202,6 +202,44 @@ impl SessionCatalog {
         false
     }
 
+    /// Union `recent` (the watcher's tail-derived edited files for a
+    /// session, most-recent-first) into the session's tracked
+    /// `edited_files`, preserving most-recent-first order and dropping the
+    /// oldest beyond [`EDITED_FILES_CAP`]. Returns `true` if the stored
+    /// list changed.
+    ///
+    /// The merge keeps `recent` at the front (it *is* the most recent
+    /// window) and appends any previously-known paths not in it — so a
+    /// file edited early in a long session survives even after it scrolls
+    /// out of the transcript tail (discovery seeded the full history at
+    /// startup), and a file re-edited in the recent window moves back to
+    /// the front. Independent of attention: called on every `Attention`
+    /// event regardless of whether the attention update itself was
+    /// hook-suppressed, since the edit list is its own signal. An empty
+    /// `recent` (the common no-edits-in-tail case) is a no-op.
+    pub fn merge_edited_files(&mut self, id: &SessionId, recent: Vec<PathBuf>) -> bool {
+        if recent.is_empty() {
+            return false;
+        }
+        for session in &mut self.sessions {
+            if session.id == *id {
+                let mut combined = recent;
+                for p in &session.edited_files {
+                    if !combined.contains(p) {
+                        combined.push(p.clone());
+                    }
+                }
+                combined.truncate(EDITED_FILES_CAP);
+                if combined == session.edited_files {
+                    return false;
+                }
+                session.edited_files = combined;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Apply a fresh pane-presence snapshot from the pane poller for
     /// one host. Two-stage match per session, mirroring the attach
     /// path's `resolve_pane_target` so the indicator agrees with what
@@ -310,6 +348,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 
@@ -786,5 +825,65 @@ mod tests {
             c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, None, true);
         assert_eq!(prev, None);
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
+    }
+
+    fn pb(p: &str) -> PathBuf {
+        PathBuf::from(p)
+    }
+
+    #[test]
+    fn merge_edited_files_seeds_then_unions_recent_at_front() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        // Discovery-style seed of history (oldest below).
+        assert!(c.merge_edited_files(&SessionId("a".into()), vec![pb("/w/b.rs"), pb("/w/a.rs")]));
+        // A newer tail with a fresh file plus a re-edit of an old one.
+        assert!(c.merge_edited_files(&SessionId("a".into()), vec![pb("/w/c.rs"), pb("/w/a.rs")]));
+        // Recent (c, a) lead; b (only in history, not the tail) trails;
+        // a appears once (moved to front, not duplicated).
+        assert_eq!(
+            c.sessions()[0].edited_files,
+            vec![pb("/w/c.rs"), pb("/w/a.rs"), pb("/w/b.rs")]
+        );
+    }
+
+    #[test]
+    fn merge_edited_files_empty_recent_is_noop() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        c.merge_edited_files(&SessionId("a".into()), vec![pb("/w/a.rs")]);
+        assert!(!c.merge_edited_files(&SessionId("a".into()), Vec::new()));
+        assert_eq!(c.sessions()[0].edited_files, vec![pb("/w/a.rs")]);
+    }
+
+    #[test]
+    fn merge_edited_files_returns_false_when_unchanged() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        assert!(c.merge_edited_files(&SessionId("a".into()), vec![pb("/w/a.rs")]));
+        // Re-merging the same single recent file yields no change.
+        assert!(!c.merge_edited_files(&SessionId("a".into()), vec![pb("/w/a.rs")]));
+    }
+
+    #[test]
+    fn merge_edited_files_caps_and_drops_oldest() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let history: Vec<PathBuf> = (0..EDITED_FILES_CAP)
+            .map(|i| pb(&format!("/w/h{i}.rs")))
+            .collect();
+        c.merge_edited_files(&SessionId("a".into()), history);
+        // A brand-new recent edit pushes the list over the cap; the
+        // oldest history entry drops, the new file leads.
+        c.merge_edited_files(&SessionId("a".into()), vec![pb("/w/fresh.rs")]);
+        let files = &c.sessions()[0].edited_files;
+        assert_eq!(files.len(), EDITED_FILES_CAP);
+        assert_eq!(files[0], pb("/w/fresh.rs"));
+    }
+
+    #[test]
+    fn merge_edited_files_unknown_id_is_false() {
+        let mut c = SessionCatalog::new();
+        assert!(!c.merge_edited_files(&SessionId("missing".into()), vec![pb("/w/a.rs")]));
     }
 }

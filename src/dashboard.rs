@@ -653,6 +653,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 

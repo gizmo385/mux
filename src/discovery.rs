@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::host::Host;
 use crate::session::{Attention, HostId, Session, SessionId};
-use crate::watcher::derive_attention_from_content;
+use crate::watcher::{derive_attention_from_content, derive_edited_files_from_content};
 use crate::worktree;
 
 #[must_use]
@@ -263,6 +263,10 @@ fn assemble_session(
         // transitions re-stamp this in the catalog.
         attention_entered_at: Some(mtime),
         started_at,
+        // Full edit history from the whole transcript buffer in hand —
+        // the watcher's tail-derived updates union onto this as the
+        // conversation continues (see `merge_edited_files`).
+        edited_files: derive_edited_files_from_content(transcript_content),
     })
 }
 
@@ -621,6 +625,32 @@ mod tests {
         let missing = tmp.path().join("does-not-exist");
         let sessions = discover_local(&missing).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn discovers_edited_files_from_transcript() {
+        // End-to-end: an Edit/Write tool_use in the transcript surfaces
+        // on Session.edited_files, most-recent-first, so the picker has a
+        // seeded list from the first frame.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        fs::write(
+            entry.join("abc.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{cwd}\",\"message\":\"go\"}}\n\
+                 {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Edit\",\"input\":{{\"file_path\":\"{cwd}/a.rs\"}}}}]}}}}\n\
+                 {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Write\",\"input\":{{\"file_path\":\"{cwd}/b.rs\"}}}}]}}}}\n",
+                cwd = cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = discover_local(&projects).unwrap();
+        assert_eq!(
+            sessions[0].edited_files,
+            vec![cwd.join("b.rs"), cwd.join("a.rs")]
+        );
     }
 
     #[test]

@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Upper bound on how many edited-file paths a session tracks. A cap
+/// keeps [`Session::edited_files`] bounded on a long-lived conversation
+/// that touches thousands of files; the most-recent-first ordering means
+/// the truncation drops the oldest edits, which are the least likely to
+/// be what the user wants to jump back into. Shared by the watcher's
+/// derivation (per-scan cap) and the catalog's merge (post-merge cap) so
+/// the two agree on the ceiling.
+pub const EDITED_FILES_CAP: usize = 200;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
 
@@ -130,4 +139,19 @@ pub struct Session {
     /// filed follow-up — it needs a date parser). Stable, so it *is*
     /// serialized into the disk cache.
     pub started_at: Option<SystemTime>,
+    /// Absolute paths of files this session's Claude has edited, most
+    /// recently edited first, deduplicated, capped at [`EDITED_FILES_CAP`].
+    /// Derived from the transcript's `Edit` / `Write` / `MultiEdit` /
+    /// `NotebookEdit` `tool_use` blocks (`Read`/`Bash`/etc. are excluded)
+    /// — see [`crate::watcher::derive_edited_files_from_content`]. Seeded
+    /// with the session's full history at discovery time (the whole
+    /// transcript is in hand there) and kept current as the conversation
+    /// runs by [`crate::catalog::SessionCatalog::merge_edited_files`],
+    /// which unions the watcher's tail-derived recent edits into this
+    /// list. Drives the `{file}`-tool edited-files picker overlay.
+    ///
+    /// Derived + ephemeral like `has_live_pane` / `blocking_prompt`: not
+    /// serialized into the disk cache. A cache-seeded row starts empty and
+    /// fills in once discovery reads the transcript.
+    pub edited_files: Vec<PathBuf>,
 }

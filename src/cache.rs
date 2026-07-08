@@ -161,6 +161,9 @@ impl CachedSession {
             // shows a plausible "time in state" until live updates land.
             attention_entered_at: Some(epoch_secs_to_systemtime(self.last_activity_secs)),
             started_at: self.started_at_secs.map(epoch_secs_to_systemtime),
+            // Derived from the transcript, not cached; discovery fills it
+            // once it reads the file. Same rationale as `has_live_pane`.
+            edited_files: Vec::new(),
         }
     }
 }
@@ -224,6 +227,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 

@@ -39,6 +39,7 @@ use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
 };
 use agent_mux::discovery::{build_session, claude_projects_dir, discover};
+use agent_mux::edited_files_modal::{EditedFileEntry, EditedFilesModal, EditedFilesOutcome};
 use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
 };
@@ -381,6 +382,13 @@ struct App {
     /// query + selection; on Enter it yields a [`SwitchTarget`] that the
     /// run loop re-seats the sidebar cursor onto and attaches.
     quickswitcher: Option<QuickSwitcher>,
+    /// Open edited-files picker. A sibling overlay of `quickswitcher` —
+    /// at most one overlay up at a time, enforced by the open-time guard
+    /// in `open_edited_files`. Opened by pressing a file-scoped
+    /// `[[tools]]` key (one whose command references `{file}`); on Enter
+    /// it yields the picked path, which the run loop substitutes into the
+    /// tool and launches via the normal `spawn_tool` path.
+    edited_files_modal: Option<EditedFilesModal>,
     create_tx: Sender<NewSessionResult>,
     create_rx: Receiver<NewSessionResult>,
     creating: Option<CreatingSession>,
@@ -765,6 +773,7 @@ impl App {
             modal: None,
             delete_modal: None,
             quickswitcher: None,
+            edited_files_modal: None,
             create_tx,
             create_rx,
             delete_tx,
@@ -1369,7 +1378,11 @@ impl App {
     /// the modal filters that snapshot in memory and never touches the
     /// catalog, so it honours "switching never blocks on I/O."
     fn open_quickswitcher(&mut self) {
-        if self.modal.is_some() || self.delete_modal.is_some() || self.quickswitcher.is_some() {
+        if self.modal.is_some()
+            || self.delete_modal.is_some()
+            || self.quickswitcher.is_some()
+            || self.edited_files_modal.is_some()
+        {
             return;
         }
         let entries = self.quickswitch_entries();
@@ -1405,6 +1418,89 @@ impl App {
                 let anchor = switch_target_anchor(target);
                 self.reseat_selection_to(Some(&anchor));
                 self.attach_under_cursor()
+            }
+        }
+    }
+
+    /// Open the edited-files picker for the selected session, scoped to
+    /// the file-scoped `[[tools]]` binding at `idx`. No-op (with a status
+    /// hint) if another overlay is already up, no session is selected, or
+    /// the session has edited no files yet. Snapshots the session's
+    /// `edited_files` at open time — the modal filters that snapshot in
+    /// memory and never touches the catalog, honouring "switching never
+    /// blocks on I/O."
+    fn open_edited_files(&mut self, idx: usize) {
+        if self.modal.is_some()
+            || self.delete_modal.is_some()
+            || self.quickswitcher.is_some()
+            || self.edited_files_modal.is_some()
+        {
+            return;
+        }
+        let Some(tool) = self.config.tools.get(idx) else {
+            return;
+        };
+        let label = tool.name.clone().unwrap_or_else(|| {
+            tool.command
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("tool {idx}"))
+        });
+        let Some(session) = self.selected_session() else {
+            self.status = Some("select a session first".to_string());
+            return;
+        };
+        if session.edited_files.is_empty() {
+            let who = session.title.as_deref().unwrap_or(session.id.0.as_str());
+            self.status = Some(format!("no files edited yet in {who}"));
+            return;
+        }
+        let cwd = session.project_dir.clone();
+        let entries: Vec<EditedFileEntry> = session
+            .edited_files
+            .iter()
+            .map(|path| {
+                // Show a path relative to the session cwd when it lives
+                // under it (the common case — most edits are in-project),
+                // else the absolute path. The `haystack` folds the display
+                // string so a fuzzy query hits either form.
+                let display = path.strip_prefix(&cwd).map_or_else(
+                    |_| path.to_string_lossy().into_owned(),
+                    |rel| rel.to_string_lossy().into_owned(),
+                );
+                EditedFileEntry {
+                    haystack: display.to_lowercase(),
+                    display,
+                    path: path.clone(),
+                }
+            })
+            .collect();
+        self.edited_files_modal = Some(EditedFilesModal::new(idx, label, entries));
+        self.status = None;
+    }
+
+    /// Route a key to the open edited-files picker. Returns an
+    /// [`ActionOutcome`] because a `Pick` launches the file-scoped tool
+    /// immediately, and the non-embedded launch path may hand back a
+    /// [`SuspendCommand`] the run loop must execute (same as a manual tool
+    /// launch). Esc / no-match Enter just close or keep the modal.
+    fn handle_edited_files_key(&mut self, key: KeyEvent) -> ActionOutcome {
+        let Some(mut modal) = self.edited_files_modal.take() else {
+            return ActionOutcome::Continue;
+        };
+        match modal.handle_key(key) {
+            EditedFilesOutcome::Handled => {
+                self.edited_files_modal = Some(modal);
+                ActionOutcome::Continue
+            }
+            // Modal dropped (not re-stored) on Cancel and Pick.
+            EditedFilesOutcome::Cancel => ActionOutcome::Continue,
+            EditedFilesOutcome::Pick(path) => {
+                let idx = modal.tool_idx();
+                match self.launch_tool(idx, Some(&path)) {
+                    Some(cmd) => ActionOutcome::Suspend(cmd),
+                    None => ActionOutcome::Continue,
+                }
             }
         }
     }
@@ -1810,6 +1906,13 @@ impl App {
                         // would freeze at the discovery-time mtime.
                         self.catalog.touch_activity(&update.id, mtime);
                     }
+                    // Union the tail-derived recent edits into the
+                    // session's tracked list, independent of whether the
+                    // attention update above was hook-suppressed — the
+                    // edit list is its own signal. Empty (the common
+                    // no-edits-in-tail case) is a cheap no-op.
+                    self.catalog
+                        .merge_edited_files(&update.id, update.edited_files);
                     if let Some(prev) = prev {
                         // `update.mtime` flows through to the notifier
                         // as `source_at` so the startup-replay gate
@@ -2360,12 +2463,37 @@ impl App {
     }
 
     /// Fire a user-configured `[[tools]]` keybind against the selected
-    /// session. Resolves `{cwd}` / `{host}` placeholders against the
-    /// session, then routes through the attachment driver's
-    /// `spawn_tool` (same dispatch family as `t: terminal`).
-    /// Returns a `SuspendCommand` for the outside-tmux path; `None`
-    /// when nothing to suspend (`Done`, `EmbedPty`, errors).
-    fn launch_tool(&mut self, idx: usize) -> Option<SuspendCommand> {
+    /// session. Resolves `{cwd}` / `{host}` / `{file}` placeholders
+    /// against the session (and the picked `file`, for a file-scoped
+    /// tool), then routes through the attachment driver's `spawn_tool`
+    /// (same dispatch family as `t: terminal`). Returns a `SuspendCommand`
+    /// for the outside-tmux path; `None` when nothing to suspend (`Done`,
+    /// `EmbedPty`, errors).
+    ///
+    /// `file` is `None` for a plain launch and `Some(path)` when the
+    /// edited-files picker (`handle_edited_files_key`) resolved a
+    /// file-scoped tool to a concrete file.
+    /// Dispatch a `[[tools]]` keypress. A file-scoped tool (command
+    /// references `{file}`) opens the edited-files picker instead of
+    /// launching immediately; the picked file is substituted when the tool
+    /// finally runs. A plain tool launches directly.
+    fn dispatch_tool(&mut self, idx: usize) -> ActionOutcome {
+        if self
+            .config
+            .tools
+            .get(idx)
+            .is_some_and(ToolBinding::is_file_scoped)
+        {
+            self.open_edited_files(idx);
+            return ActionOutcome::Continue;
+        }
+        match self.launch_tool(idx, None) {
+            Some(cmd) => ActionOutcome::Suspend(cmd),
+            None => ActionOutcome::Continue,
+        }
+    }
+
+    fn launch_tool(&mut self, idx: usize, file: Option<&Path>) -> Option<SuspendCommand> {
         let tool = self.config.tools.get(idx)?.clone();
         let (outcome, label, cwd, session_id, host_id) = {
             let session = self.selected_session()?;
@@ -2374,7 +2502,7 @@ impl App {
             let id = session.id.clone();
             let host_id = session.host.clone();
             let host_str = session.host.as_str().to_string();
-            let cmd = tool.substitute(&cwd, &host_str);
+            let cmd = tool.substitute(&cwd, &host_str, file);
             (
                 self.driver.spawn_tool(session, host.as_ref(), &cmd),
                 tool.name.clone().unwrap_or_else(|| {
@@ -2578,6 +2706,27 @@ impl App {
     }
 }
 
+/// Fold an overlay picker's [`ActionOutcome`] into the run loop's shared
+/// handling: `Quit` → return `Ok(true)` (caller returns from `run`),
+/// `Suspend` → run the command (stashing any error in the status line),
+/// `Continue` → nothing. Returns `true` iff the run loop should exit.
+fn run_overlay_outcome(
+    terminal: &mut Tui,
+    app: &mut App,
+    outcome: ActionOutcome,
+) -> io::Result<bool> {
+    match outcome {
+        ActionOutcome::Quit => return Ok(true),
+        ActionOutcome::Continue => {}
+        ActionOutcome::Suspend(cmd) => {
+            if let Some(err) = suspend_and_run(terminal, &cmd, app.embedded_mode)? {
+                app.status = Some(err);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
@@ -2657,19 +2806,24 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                 app.handle_delete_modal_key(key);
                 continue;
             }
-            // Quickswitcher owns the keyboard while open. Routed through
-            // ActionOutcome (not a bare handler) because a `Pick`
-            // attaches immediately and the non-embedded path may return
-            // a SuspendCommand the loop must run — same as Enter below.
+            // Overlay pickers own the keyboard while open. Both route
+            // through ActionOutcome (not a bare handler) because a `Pick`
+            // acts immediately — the quickswitcher attaches, the
+            // edited-files picker launches a file-scoped tool — and the
+            // non-embedded path may return a SuspendCommand the loop must
+            // run. `run_overlay_outcome` folds the shared Quit / Suspend
+            // handling.
             if app.quickswitcher.is_some() {
-                match app.handle_quickswitcher_key(key) {
-                    ActionOutcome::Quit => return Ok(()),
-                    ActionOutcome::Continue => {}
-                    ActionOutcome::Suspend(cmd) => {
-                        if let Some(err) = suspend_and_run(terminal, &cmd, app.embedded_mode)? {
-                            app.status = Some(err);
-                        }
-                    }
+                let outcome = app.handle_quickswitcher_key(key);
+                if run_overlay_outcome(terminal, app, outcome)? {
+                    return Ok(());
+                }
+                continue;
+            }
+            if app.edited_files_modal.is_some() {
+                let outcome = app.handle_edited_files_key(key);
+                if run_overlay_outcome(terminal, app, outcome)? {
+                    return Ok(());
                 }
                 continue;
             }
@@ -2868,10 +3022,7 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
             app.toggle_favorite_selected();
             ActionOutcome::Continue
         }
-        Action::LaunchTool(idx) => match app.launch_tool(idx) {
-            Some(cmd) => ActionOutcome::Suspend(cmd),
-            None => ActionOutcome::Continue,
-        },
+        Action::LaunchTool(idx) => app.dispatch_tool(idx),
     }
 }
 
@@ -3368,6 +3519,9 @@ fn draw_modal_overlay(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     }
     if let Some(sw) = app.quickswitcher.as_mut() {
         sw.draw(frame);
+    }
+    if let Some(modal) = app.edited_files_modal.as_mut() {
+        modal.draw(frame);
     }
 }
 
@@ -4456,6 +4610,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 
@@ -5532,6 +5687,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 

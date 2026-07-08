@@ -6,6 +6,7 @@ pub mod config;
 pub mod dashboard;
 pub mod delete_worktree_modal;
 pub mod discovery;
+pub mod edited_files_modal;
 pub mod embedded_pty;
 pub mod favorites;
 pub mod hook_ingest;

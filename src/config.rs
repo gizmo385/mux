@@ -289,18 +289,42 @@ impl<'de> Deserialize<'de> for ToolBinding {
 }
 
 impl ToolBinding {
-    /// Apply `{cwd}` / `{host}` substitutions against a session's
-    /// `project_dir` and host id, returning the launchable token list.
-    /// Tokens without placeholders pass through unchanged; substitution
-    /// is plain string-replace (no shell parsing) because the result
-    /// is shell-quoted as a unit downstream.
+    /// Apply `{cwd}` / `{host}` / `{file}` substitutions against a
+    /// session's `project_dir`, host id, and (for a file-scoped tool) the
+    /// picked file, returning the launchable token list. Tokens without
+    /// placeholders pass through unchanged; substitution is plain
+    /// string-replace (no shell parsing) because the result is
+    /// shell-quoted as a unit downstream.
+    ///
+    /// `file` is the path chosen in the edited-files picker for a
+    /// file-scoped tool (see [`Self::is_file_scoped`]); pass `None` for a
+    /// plain launch, in which case a stray `{file}` (there should be
+    /// none) collapses to empty.
     #[must_use]
-    pub fn substitute(&self, cwd: &Path, host: &str) -> Vec<String> {
+    pub fn substitute(&self, cwd: &Path, host: &str, file: Option<&Path>) -> Vec<String> {
         let cwd_str = cwd.to_string_lossy();
+        let file_str = file.map(|f| f.to_string_lossy().into_owned());
         self.command
             .iter()
-            .map(|tok| tok.replace("{cwd}", &cwd_str).replace("{host}", host))
+            .map(|tok| {
+                let tok = tok.replace("{cwd}", &cwd_str).replace("{host}", host);
+                match &file_str {
+                    Some(f) => tok.replace("{file}", f),
+                    None => tok.replace("{file}", ""),
+                }
+            })
             .collect()
+    }
+
+    /// True when any command token references `{file}` — the marker that
+    /// turns a `[[tools]]` binding into a *file-scoped* tool. Pressing a
+    /// file-scoped tool's key opens the edited-files picker for the
+    /// selected session rather than launching immediately; the picked
+    /// file is substituted for `{file}` when the tool finally runs. A
+    /// tool with no `{file}` token launches directly as before.
+    #[must_use]
+    pub fn is_file_scoped(&self) -> bool {
+        self.command.iter().any(|tok| tok.contains("{file}"))
     }
 }
 
@@ -2003,7 +2027,7 @@ command = ["zsh"]
                 "literal {host}-and-{cwd}".into(),
             ],
         };
-        let subbed = t.substitute(Path::new("/work/proj"), "alpenglow");
+        let subbed = t.substitute(Path::new("/work/proj"), "alpenglow", None);
         assert_eq!(
             subbed,
             vec![
@@ -2014,5 +2038,56 @@ command = ["zsh"]
                 "literal alpenglow-and-/work/proj".into(),
             ]
         );
+    }
+
+    #[test]
+    fn tool_binding_substitutes_file_token() {
+        let t = ToolBinding {
+            key: 'e',
+            name: Some("edit".into()),
+            command: vec!["vim".into(), "{file}".into()],
+        };
+        let subbed = t.substitute(
+            Path::new("/work/proj"),
+            "local",
+            Some(Path::new("/work/proj/src/main.rs")),
+        );
+        assert_eq!(
+            subbed,
+            vec!["vim".to_string(), "/work/proj/src/main.rs".into()]
+        );
+    }
+
+    #[test]
+    fn tool_binding_file_token_collapses_to_empty_without_a_file() {
+        // A file-scoped tool launched with no file (shouldn't happen, but
+        // be defensive) drops the token rather than passing the literal
+        // `{file}` through to the shell.
+        let t = ToolBinding {
+            key: 'e',
+            name: None,
+            command: vec!["vim".into(), "{file}".into()],
+        };
+        assert_eq!(
+            t.substitute(Path::new("/work/proj"), "local", None),
+            vec!["vim".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn is_file_scoped_detects_the_file_token() {
+        let scoped = ToolBinding {
+            key: 'e',
+            name: None,
+            command: vec!["vim".into(), "{file}".into()],
+        };
+        assert!(scoped.is_file_scoped());
+
+        let plain = ToolBinding {
+            key: 'g',
+            name: None,
+            command: vec!["lazygit".into(), "{cwd}".into()],
+        };
+        assert!(!plain.is_file_scoped());
     }
 }

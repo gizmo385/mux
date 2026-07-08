@@ -88,12 +88,21 @@ Presets set five attention accents (`needs_input`, `blocked`, `working`, `idle`,
 
 ### Custom tool keybinds
 
-Add `[[tools]]` entries to bind a key that launches a terminal tool in the selected session's cwd. `{cwd}`/`{host}` are substituted at fire time; collisions with built-in keys are rejected at load.
+Add `[[tools]]` entries to bind a key that launches a terminal tool in the selected session's cwd. `{cwd}`/`{host}` are substituted at fire time (and `{file}` marks a *file-scoped* tool — see below); collisions with built-in keys are rejected at load.
 
 ```toml
 [[tools]]
 key = "g"
 command = ["lazygit"]   # opens lazygit in the selected worktree
+```
+
+**Open a file Claude edited.** If a tool's `command` references `{file}`, it becomes *file-scoped*: pressing its key opens a picker listing the files that session's Claude has edited (most-recently-edited first), and the file you pick is substituted for `{file}` when the tool launches. Fuzzy-filter by typing, `⏎` to open, `Esc` to cancel. The list is read from the conversation transcript.
+
+```toml
+[[tools]]
+key = "e"
+name = "edit"
+command = ["vim", "{file}"]   # pick from the files Claude edited, open in vim
 ```
 
 ### Remote sessions

@@ -1220,11 +1220,18 @@ pub fn find_pane_local(
 ///    sessions share a cwd. This is what keeps same-directory rows from
 ///    collapsing onto one pane via the cwd fallback below.
 ///
-/// 2. First pane whose `pane_current_path` matches `session.project_dir`.
-///    Catches sessions with no `agent-mux-<id>` tmux session — chiefly
-///    those `claude` was started for *outside* agent-mux (a bare
-///    terminal, the user's own tmux), which never got the id-derived
-///    name.
+/// 2. First pane whose `pane_current_path` matches `session.project_dir`
+///    *and* whose tmux session is **not** `agent-mux-`-named. Catches
+///    sessions with no `agent-mux-<id>` tmux session — chiefly those
+///    `claude` was started for *outside* agent-mux (a bare terminal, the
+///    user's own tmux), which never got the id-derived name. The
+///    `agent-mux-` exclusion is load-bearing: such a pane belongs to a
+///    *specific* id (reachable only via stage 1), so letting the cwd
+///    fallback return it would collapse an un-named row onto a named
+///    row's pane whenever they share a cwd — the "selecting session A
+///    opens session B" bug. A skipped row falls through to `NotFound` →
+///    `claude --resume`, which spawns it into its own `agent-mux-<id>`
+///    session.
 ///
 /// `excluded_tmux_sessions` carries the tmux *session names* of live
 /// `[[tools]]` launches (lazygit, nvim, a shell). Each such launch runs
@@ -1236,12 +1243,15 @@ pub fn find_pane_local(
 /// fallback: stage 1's `agent-mux-<id>` match can't collide with a
 /// tmux-auto-named tool session, so it needs no filtering.
 ///
-/// Residual limitation: two *externally-started* sessions sharing one
-/// cwd (both lacking an `agent-mux-<id>` name) still collide on the
-/// first cwd match. agent-mux-spawned sessions no longer hit this —
-/// they carry the id-derived name from birth (stage 1). Fully
-/// disambiguating externally-started dupes would need transcript→pane
-/// process matching; filed in TODO.
+/// Residual limitation: two sessions with *no* `agent-mux-<id>` name
+/// sharing one cwd — both externally-started, or both live in un-named
+/// panes — still collide on the first cwd match, since neither the
+/// name pin (stage 1) nor the `agent-mux-` skip (stage 2) can tell them
+/// apart. agent-mux-spawned sessions no longer hit this (they carry the
+/// id-derived name from birth), and a named + un-named pair no longer
+/// collides (stage 2 skips the named pane). Fully disambiguating the
+/// remaining un-named/un-named case would need transcript→pane process
+/// matching; filed in TODO.
 #[must_use]
 fn resolve_pane_target(
     tmux_output: &str,
@@ -1261,6 +1271,18 @@ fn resolve_pane_target(
         // session-name segment against the tool-launch exclusion set.
         let session_name = target.split_once(':').map_or(target, |(name, _)| name);
         if excluded_tmux_sessions.iter().any(|e| e == session_name) {
+            continue;
+        }
+        // Any `agent-mux-<id>` session belongs to *that* id and is
+        // reachable only via stage 1's exact match above. If we reach
+        // here it's a *different* session's pinned pane, so the cwd
+        // fallback must never hand it to this row — otherwise an
+        // un-named row (externally-started, or spawned before it earned
+        // its name) collapses onto a named row's pane whenever they
+        // share a cwd. Skipping it lets this row fall through to
+        // `NotFound` → `claude --resume`, which spawns it into its own
+        // `agent-mux-<id>` session instead of hijacking the neighbour's.
+        if session_name.starts_with("agent-mux-") {
             continue;
         }
         if cwd_match.is_none() && Path::new(path) == session.project_dir {
@@ -1355,6 +1377,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 
@@ -1458,6 +1481,33 @@ mod tests {
         let s = test_session("missing-named", "/home/u/proj");
         let got = resolve_pane_target(out, &s, &[]);
         assert_eq!(got, Some("other:0.0".to_string()));
+    }
+
+    #[test]
+    fn resolve_pane_target_cwd_fallback_skips_another_sessions_agent_mux_pane() {
+        // Regression (2026-07-08): the "selecting session A opens session
+        // B" mix-up. Row `unnamed-id` has no `agent-mux-<id>` pane of its
+        // own; the only pane in its cwd belongs to a *different* session
+        // (`agent-mux-other-id`, e.g. the conversation the user is
+        // actively in). The cwd fallback must NOT hand that neighbour's
+        // pinned pane to this row — it returns None so the caller resumes
+        // into a fresh, own-named session rather than hijacking the
+        // neighbour.
+        let out = "agent-mux-other-id:0.0 /home/u/proj\n";
+        let s = test_session("unnamed-id", "/home/u/proj");
+        assert_eq!(resolve_pane_target(out, &s, &[]), None);
+    }
+
+    #[test]
+    fn resolve_pane_target_cwd_fallback_prefers_unnamed_pane_over_neighbours_named_pane() {
+        // Same cwd holds a neighbour's `agent-mux-<id>` pane *and* an
+        // un-named pane. The row skips the neighbour's pinned pane and
+        // resolves to the un-named one — regardless of list order.
+        let out = "agent-mux-neighbour:0.0 /home/u/proj\n\
+             mine:1.0 /home/u/proj\n";
+        let s = test_session("unnamed-id", "/home/u/proj");
+        let got = resolve_pane_target(out, &s, &[]);
+        assert_eq!(got, Some("mine:1.0".to_string()));
     }
 
     #[test]
@@ -1963,6 +2013,7 @@ mod tests {
             blocking_prompt: false,
             attention_entered_at: None,
             started_at: None,
+            edited_files: Vec::new(),
         }
     }
 

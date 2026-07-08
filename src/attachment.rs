@@ -855,23 +855,25 @@ impl PtyDriver {
     }
 
     /// Spawn a fresh `claude` into a detached local tmux session and
-    /// build the embedded-attach spec for it. Two tmux calls:
-    /// (1) `tmux new-session -d -P -F '#{session_name}' -c <cwd> claude`
-    /// creates the detached session and prints the assigned name on
-    /// stdout — letting tmux pick the name guarantees no collision
-    /// with the user's existing sessions; (2) the embed spec attaches
-    /// to that exact name.
+    /// build the embedded-attach spec for it. The session is minted with
+    /// a fresh uuid used for *both* its tmux session name
+    /// (`agent-mux-<uuid>`) and `claude --session-id <uuid>`, so Claude's
+    /// transcript lands at `<uuid>.jsonl` and the `SessionId` discovery
+    /// later derives equals the tmux name. Two tmux calls:
+    /// (1) `tmux new-session -d -s agent-mux-<uuid> -c <cwd> claude
+    /// --session-id <uuid>` creates the detached session; (2) the embed
+    /// spec attaches to that exact name. Because the name is
+    /// id-derived, re-attaching from a discovered row later resolves by
+    /// name (stage 1) instead of guessing by cwd — so several sessions
+    /// sharing one directory never collapse onto the same pane.
     fn spawn_session_local(cwd: &Path) -> Result<AttachOutcome, AttachError> {
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let spawn_argv = tmux_new_detached_argv(&cwd_str);
+        let session_uuid = new_session_uuid()?;
+        let session_name = agent_mux_session_name(&session_uuid);
+        let spawn_argv = tmux_new_claude_session_argv(&session_name, &cwd_str, &session_uuid);
         let (program, rest) = spawn_argv.split_first().expect("non-empty argv");
-        let stdout = run_for_stdout(Command::new(program).args(rest))?;
-        let session_name = stdout.trim().to_string();
-        if session_name.is_empty() {
-            return Err(AttachError::TmuxCommandFailed(
-                "tmux new-session returned empty session name".into(),
-            ));
-        }
+        // `-d` prints nothing; `run_for_stdout` just checks exit status.
+        run_for_stdout(Command::new(program).args(rest))?;
         Ok(AttachOutcome::EmbedPty(EmbedSpec {
             argv: tmux_attach_argv(&session_name),
             cwd: None,
@@ -881,25 +883,25 @@ impl PtyDriver {
     }
 
     /// Remote analogue of [`spawn_session_local`]. One ssh round-trip
-    /// to create the detached remote tmux session and capture its
-    /// assigned name; the embed spec then wraps `tmux attach -t <name>`
-    /// in `Host::ssh_argv(true, …)` so the embedded pane drives the
-    /// remote attach over the same `ControlMaster`.
+    /// to create the detached remote tmux session named
+    /// `agent-mux-<uuid>` (with `claude --session-id <uuid>`); the embed
+    /// spec then wraps `tmux attach -t <name>` in `Host::ssh_argv(true,
+    /// …)` so the embedded pane drives the remote attach over the same
+    /// `ControlMaster`. The name is id-derived rather than tmux-assigned
+    /// for the same reason as the local path — re-attach resolves by
+    /// name, so same-directory remote sessions stay distinct.
     fn spawn_session_remote(cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let spawn_remote_cmd = tmux_new_detached_argv(&cwd_str);
+        let session_uuid = new_session_uuid()?;
+        let session_name = agent_mux_session_name(&session_uuid);
+        let spawn_remote_cmd = tmux_new_claude_session_argv(&session_name, &cwd_str, &session_uuid);
         let spawn_refs: Vec<&str> = spawn_remote_cmd.iter().map(String::as_str).collect();
         let spawn_argv = host
             .ssh_argv(false, &spawn_refs)
             .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
         let (program, rest) = spawn_argv.split_first().expect("non-empty ssh argv");
-        let stdout = run_for_stdout(Command::new(program).args(rest))?;
-        let session_name = stdout.trim().to_string();
-        if session_name.is_empty() {
-            return Err(AttachError::TmuxCommandFailed(
-                "remote tmux new-session returned empty session name".into(),
-            ));
-        }
+        // `-d` prints nothing; `run_for_stdout` just checks exit status.
+        run_for_stdout(Command::new(program).args(rest))?;
         let attach_remote_cmd = tmux_attach_argv(&session_name);
         let attach_refs: Vec<&str> = attach_remote_cmd.iter().map(String::as_str).collect();
         let argv = host
@@ -968,36 +970,100 @@ fn tmux_attach_argv(target: &str) -> Vec<String> {
 }
 
 /// The tmux command for "create a detached session running `claude` in
-/// `cwd` and print the assigned session name." Used by
+/// `cwd`, pinned to `session_uuid`." Used by
 /// [`PtyDriver::spawn_session_local`] and `_remote` to spawn the
-/// new-session target the embedded pane will then attach to. `-d`
-/// keeps the spawning client detached (the embed becomes the only
-/// attached client); `-P -F '#{session_name}'` prints the tmux-assigned
-/// name on stdout, so callers don't need to invent a unique name and
-/// risk collisions with the user's existing sessions.
+/// new-session target the embedded pane then attaches to.
+///
+/// `-d` keeps the spawning client detached (the embed becomes the only
+/// attached client). `-s <tmux_session>` gives the session a
+/// deterministic name (`agent-mux-<uuid>`) instead of tmux's auto-name,
+/// and `claude --session-id <uuid>` makes Claude Code write its
+/// transcript as `<uuid>.jsonl` — so the `SessionId` discovery later
+/// derives from the transcript stem equals the tmux session name. That
+/// link is what lets [`resolve_pane_target`]'s stage-1 name match
+/// re-attach to *this* session on every later Enter, rather than the
+/// cwd fallback picking whichever pane sorts first (which collapsed
+/// several same-directory sessions onto one pane). A freshly-minted v4
+/// uuid can't collide with an existing session, so `-s` is safe here.
 #[must_use]
-fn tmux_new_detached_argv(cwd: &str) -> Vec<String> {
+fn tmux_new_claude_session_argv(tmux_session: &str, cwd: &str, session_uuid: &str) -> Vec<String> {
     vec![
         "tmux".into(),
         "new-session".into(),
         "-d".into(),
-        "-P".into(),
-        "-F".into(),
-        "#{session_name}".into(),
+        "-s".into(),
+        tmux_session.into(),
         "-c".into(),
         cwd.into(),
         "claude".into(),
+        "--session-id".into(),
+        session_uuid.into(),
     ]
+}
+
+/// The deterministic tmux session name for a Claude session id — the
+/// convention [`resolve_pane_target`]'s stage-1 match and
+/// [`tmux_resume_argv`] both key on. Kept as one helper so the
+/// `agent-mux-` prefix lives in a single place.
+#[must_use]
+fn agent_mux_session_name(session_uuid: &str) -> String {
+    format!("agent-mux-{session_uuid}")
+}
+
+/// Mint a fresh random v4 UUID (lowercase, hyphenated) for a
+/// newly-spawned session. Read straight from the OS CSPRNG
+/// (`/dev/urandom`, present on both Linux and macOS) so we take no new
+/// crate dependency and spawn no subprocess. The value names the
+/// session's tmux session *and* is handed to `claude --session-id`, so
+/// the two agree on identity before Claude has written a byte of
+/// transcript.
+///
+/// # Errors
+/// [`AttachError::TmuxCommandFailed`] if the CSPRNG can't be read —
+/// effectively unreachable, but surfaced rather than papered over so a
+/// genuinely broken host fails loudly instead of spawning an
+/// unidentifiable session.
+fn new_session_uuid() -> Result<String, AttachError> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| {
+            AttachError::TmuxCommandFailed(format!("reading /dev/urandom for uuid: {e}"))
+        })?;
+    Ok(format_uuid_v4(bytes))
+}
+
+/// Format 16 random bytes as an RFC 4122 v4 UUID string, stamping the
+/// version (`4`) and variant (`10xx`) bits. Split from
+/// [`new_session_uuid`] so the formatting is unit-testable against
+/// fixed input without touching the CSPRNG.
+#[must_use]
+fn format_uuid_v4(mut bytes: [u8; 16]) -> String {
+    use std::fmt::Write as _;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10xx
+    let hex = bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32],
+    )
 }
 
 /// The tmux command for "create a detached session running an
 /// arbitrary command (a `[[tools]]` keybind's joined argv) in `cwd`
 /// and print the assigned session name." Used by
 /// `spawn_tool_local_embed` and `spawn_tool_remote_embed` so tool
-/// launches survive PTY swaps in the embedded pane. Same `-d -P -F
-/// '#{session_name}' -c <cwd>` shape as [`tmux_new_detached_argv`];
-/// the difference is the trailing command — `claude` for new
-/// sessions, the user's tool for this path.
+/// launches survive PTY swaps in the embedded pane. Tool sessions keep
+/// the `-d -P -F '#{session_name}'` auto-name shape — they aren't Claude
+/// sessions, so they need no session-id pin, just a fresh unique name.
 #[must_use]
 fn tmux_new_detached_tool_argv(cwd: &str, joined_cmd: &str) -> Vec<String> {
     vec![
@@ -1145,18 +1211,20 @@ pub fn find_pane_local(
 /// Two-stage lookup, in priority order:
 ///
 /// 1. Pane in a tmux session named `agent-mux-<session.id.0>`. That's
-///    the deterministic name `tmux_resume_argv` uses, so once a
-///    session has been re-attached at least once (taking the resume
-///    fallback path) we have an unambiguous pin from `session_id` to
-///    tmux session — even when multiple sessions share a cwd. This
-///    resolves the "two rows collapse onto the same pane" bug from
-///    the cwd-only fallback below.
+///    the deterministic name both `tmux_resume_argv` and the initial
+///    `spawn_session_local`/`_remote` use (the latter pins it via
+///    `claude --session-id <uuid>` so the transcript stem — and hence
+///    the discovered `SessionId` — equals the tmux name). Every
+///    agent-mux-spawned session therefore has an unambiguous pin from
+///    `session_id` to tmux session from birth — even when multiple
+///    sessions share a cwd. This is what keeps same-directory rows from
+///    collapsing onto one pane via the cwd fallback below.
 ///
 /// 2. First pane whose `pane_current_path` matches `session.project_dir`.
-///    Catches externally-created sessions and agent-mux sessions
-///    whose user-side embedded pane is still on the auto-named tmux
-///    session from the initial `spawn_session_local` (before any
-///    re-attach has consolidated onto the deterministic name).
+///    Catches sessions with no `agent-mux-<id>` tmux session — chiefly
+///    those `claude` was started for *outside* agent-mux (a bare
+///    terminal, the user's own tmux), which never got the id-derived
+///    name.
 ///
 /// `excluded_tmux_sessions` carries the tmux *session names* of live
 /// `[[tools]]` launches (lazygit, nvim, a shell). Each such launch runs
@@ -1168,10 +1236,12 @@ pub fn find_pane_local(
 /// fallback: stage 1's `agent-mux-<id>` match can't collide with a
 /// tmux-auto-named tool session, so it needs no filtering.
 ///
-/// Sessions sharing one cwd that *also* lack a deterministic name
-/// will still collide on the first cwd match. That's a known
-/// limitation; the affordance to fully disambiguate them is filed in
-/// TODO.
+/// Residual limitation: two *externally-started* sessions sharing one
+/// cwd (both lacking an `agent-mux-<id>` name) still collide on the
+/// first cwd match. agent-mux-spawned sessions no longer hit this —
+/// they carry the id-derived name from birth (stage 1). Fully
+/// disambiguating externally-started dupes would need transcript→pane
+/// process matching; filed in TODO.
 #[must_use]
 fn resolve_pane_target(
     tmux_output: &str,
@@ -1447,27 +1517,73 @@ mod tests {
     }
 
     #[test]
-    fn tmux_new_detached_argv_has_session_name_capture_and_claude_command() {
+    fn tmux_new_claude_session_argv_names_session_and_pins_session_id() {
         // The shape is load-bearing: `-d` keeps the spawning client
-        // detached (the embed becomes the only attached client), `-P
-        // -F '#{session_name}'` makes tmux print the assigned name on
-        // stdout, `-c <cwd>` sets the working directory, and the final
-        // argument is the command tmux runs in the new session.
-        let got = tmux_new_detached_argv("/work/agent-mux-fix-bug");
+        // detached (the embed becomes the only attached client), `-s
+        // <name>` gives the session its id-derived name, `-c <cwd>` sets
+        // the working directory, and `claude --session-id <uuid>` pins
+        // Claude's transcript stem to the same uuid — the link that lets
+        // re-attach resolve by name instead of by cwd.
+        let got = tmux_new_claude_session_argv(
+            "agent-mux-11111111-2222-4333-8444-555555555555",
+            "/work/agent-mux-fix-bug",
+            "11111111-2222-4333-8444-555555555555",
+        );
         assert_eq!(
             got,
             vec![
                 "tmux".to_string(),
                 "new-session".to_string(),
                 "-d".to_string(),
-                "-P".to_string(),
-                "-F".to_string(),
-                "#{session_name}".to_string(),
+                "-s".to_string(),
+                "agent-mux-11111111-2222-4333-8444-555555555555".to_string(),
                 "-c".to_string(),
                 "/work/agent-mux-fix-bug".to_string(),
                 "claude".to_string(),
+                "--session-id".to_string(),
+                "11111111-2222-4333-8444-555555555555".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn format_uuid_v4_stamps_version_and_variant_bits() {
+        // All-zero input isolates the bit-stamping: byte 6's high nibble
+        // becomes 4 (version), byte 8's top two bits become 10 (variant
+        // → 0x80), everything else stays 0. Confirms the canonical
+        // 8-4-4-4-12 hyphenation too.
+        assert_eq!(
+            format_uuid_v4([0u8; 16]),
+            "00000000-0000-4000-8000-000000000000"
+        );
+        // All-0xff input drives the other side of the masks: the version
+        // nibble pins to 4 and the variant nibble pins to b (0b1011).
+        assert_eq!(
+            format_uuid_v4([0xffu8; 16]),
+            "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        );
+    }
+
+    #[test]
+    fn new_session_uuid_is_valid_v4_and_unique() {
+        // Reads the real CSPRNG — exercises the whole path end to end.
+        let a = new_session_uuid().expect("uuid mint");
+        let b = new_session_uuid().expect("uuid mint");
+        assert_ne!(a, b, "two mints must not collide");
+        for u in [&a, &b] {
+            assert_eq!(u.len(), 36);
+            let parts: Vec<&str> = u.split('-').collect();
+            assert_eq!(
+                parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12]
+            );
+            assert!(u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+            assert_eq!(&u[14..15], "4", "version nibble");
+            assert!(
+                matches!(&u[19..20], "8" | "9" | "a" | "b"),
+                "variant nibble"
+            );
+        }
     }
 
     #[test]
@@ -1481,30 +1597,32 @@ mod tests {
     }
 
     #[test]
-    fn pty_driver_spawn_session_remote_invokes_ssh_with_detached_new_session() {
-        // The remote spawn must hand `tmux new-session -d -P -F
-        // '#{session_name}' -c <cwd> claude` to ssh_argv(false, …) —
-        // no tty needed because we're only reading back the session
-        // name. The ssh process spawned from the fake host's argv will
-        // fail to connect; we don't care, we just want to observe the
-        // first ssh_argv call.
+    fn pty_driver_spawn_session_remote_invokes_ssh_with_named_session_id() {
+        // The remote spawn must hand `tmux new-session -d -s
+        // agent-mux-<uuid> -c <cwd> claude --session-id <uuid>` to
+        // ssh_argv(false, …) — no tty needed for the detached create.
+        // The ssh process spawned from the fake host's argv fails to
+        // connect, so `spawn_session_remote` errors out before the
+        // second (attach) ssh_argv call; `last_call` is therefore the
+        // create call. The uuid is random, so we assert the fixed shape
+        // plus the name↔session-id linkage rather than an exact string.
         let host = FakeRemoteHost::new();
         let _ = PtyDriver::spawn_session_remote(Path::new("/srv/work/proj"), &host);
         let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
-        assert!(!tty, "spawn capture does not need a tty");
+        assert!(!tty, "detached create does not need a tty");
+        assert_eq!(&remote_cmd[0..4], &["tmux", "new-session", "-d", "-s"]);
+        let tmux_name = &remote_cmd[4];
+        assert!(
+            tmux_name.starts_with("agent-mux-"),
+            "session name is id-derived, got {tmux_name}"
+        );
+        assert_eq!(&remote_cmd[5..8], &["-c", "/srv/work/proj", "claude"]);
+        assert_eq!(&remote_cmd[8], "--session-id");
+        let session_uuid = &remote_cmd[9];
         assert_eq!(
-            remote_cmd,
-            vec![
-                "tmux",
-                "new-session",
-                "-d",
-                "-P",
-                "-F",
-                "#{session_name}",
-                "-c",
-                "/srv/work/proj",
-                "claude",
-            ]
+            tmux_name,
+            &format!("agent-mux-{session_uuid}"),
+            "tmux name and claude --session-id must share the uuid"
         );
     }
 

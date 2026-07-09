@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/gizmo385/mux/compare/v0.1.6...v0.1.7) - 2026-07-08
+
+### Added
+
+- *(notifications)* richer toast content + attention-sorted quickswitcher
+- *(tools)* open a Claude-edited file in your editor via {file}-scoped tools
+
+### Fixed
+
+- *(attachment)* cwd fallback skips other sessions' agent-mux panes
+- *(attachment)* pin spawned sessions to agent-mux-<uuid> so same-dir sessions don't collide
+
+### Other
+
+- More README upates
+
 ## [0.1.6](https://github.com/gizmo385/mux/compare/v0.1.5...v0.1.6) - 2026-07-04
 
 ### Added

@@ -8,9 +8,12 @@
 //! rust-v0.144.1). Each line is `{"timestamp","type","payload"}` with
 //! `type` ∈ `session_meta | response_item | compacted | turn_context |
 //! world_state | event_msg | inter_agent_communication…`. The one field we
-//! anchor attention on — the `turn_started` / `turn_complete` /
-//! `turn_aborted` events, nested under an `event_msg` payload — is
-//! persisted in *both* history modes (legacy and paginated), which is the
+//! anchor attention on — the turn-lifecycle events nested under an
+//! `event_msg` payload, spelled `task_started` / `task_complete` /
+//! `task_aborted` in the shipping 0.142.5 writer (verified 2026-07-10) and
+//! `turn_started` / `turn_complete` / `turn_aborted` in the rust-v0.144.1
+//! research; the parser matches both — is persisted in *both* history modes
+//! (legacy and paginated), which is the
 //! churn-resilience bet: Codex releases ~daily and the rollout schema has
 //! already broken compatibly several times, so the parser ignores every
 //! record type and event type it does not recognise *silently* and keys
@@ -293,12 +296,12 @@ fn normalize_for_title(raw: &str) -> String {
 /// in both history modes, so this is the churn-stable attention signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnState {
-    /// An open `turn_started` with no later `turn_complete`/`turn_aborted`
-    /// — the agent is working (or blocked on an approval, which the
-    /// rollout can't distinguish; §2.5).
+    /// An open `task_started`/`turn_started` with no later
+    /// complete/abort — the agent is working (or blocked on an approval,
+    /// which the rollout can't distinguish; §2.5).
     Working,
-    /// `turn_complete` or `turn_aborted` — the turn ended, the session is
-    /// awaiting the next human prompt.
+    /// `task_complete`/`turn_complete` or `task_aborted`/`turn_aborted` —
+    /// the turn ended, the session is awaiting the next human prompt.
     NeedsInput,
 }
 
@@ -323,8 +326,18 @@ fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
             continue;
         };
         match event_type {
-            "turn_started" => last_turn = Some(TurnState::Working),
-            "turn_complete" | "turn_aborted" => last_turn = Some(TurnState::NeedsInput),
+            // Turn-lifecycle events. Codex has renamed these across releases:
+            // the plan's Appendix-A research (rust-v0.144.1) named `turn_*`,
+            // but the shipping 0.142.5 writer emits `task_started` /
+            // `task_complete` (each carrying a `turn_id` field) — confirmed
+            // 2026-07-10 against a real `codex exec` rollout. Both spellings
+            // are matched so attention survives the rename in either
+            // direction, which is exactly the ~daily schema churn this parser
+            // is built to absorb.
+            "turn_started" | "task_started" => last_turn = Some(TurnState::Working),
+            "turn_complete" | "turn_aborted" | "task_complete" | "task_aborted" => {
+                last_turn = Some(TurnState::NeedsInput);
+            }
             // Legacy mode: `patch_apply_end` carries a `changes` map keyed
             // by edited path.
             "patch_apply_end" => collect_changes(event, cwd, &mut chronological),
@@ -802,6 +815,59 @@ mod tests {
             ev("turn_started"),
             ev("turn_complete"),
             ev("turn_started"),
+        );
+        assert_eq!(derive(&content).attention, Attention::Working);
+    }
+
+    // ---- derive: real 0.142.5 `task_*` event names (regression) ----
+    //
+    // The shipping 0.142.5 writer emits `task_started` / `task_complete`
+    // (not the `turn_*` the rust-v0.144.1 research named). These lines are
+    // copied verbatim from a real `codex exec` rollout captured 2026-07-10;
+    // before the fix, `derive_from_content` matched only `turn_*`, so a
+    // completed real session derived `Attention::Unknown` and rendered as
+    // `· unknown` in the sidebar instead of `needs input`. Keep both spellings
+    // matched — Codex renames these across releases and the parser must
+    // survive the churn in either direction.
+
+    /// A real `task_started` event line from codex 0.142.5.
+    const REAL_TASK_STARTED: &str = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"019f4cd2-58b4-7033-87f4-2ddebb646c18","started_at":1783700281,"model_context_window":258400,"collaboration_mode_kind":"default"}}"#;
+    /// A real `task_complete` event line from codex 0.142.5.
+    const REAL_TASK_COMPLETE: &str = r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"019f4cd2-58b4-7033-87f4-2ddebb646c18","last_agent_message":null,"completed_at":1783700298,"duration_ms":17336}}"#;
+
+    #[test]
+    fn derive_real_task_started_is_working() {
+        let d = derive(&format!("{REAL_TASK_STARTED}\n"));
+        assert_eq!(d.attention, Attention::Working);
+        // An open task, like an open turn, is the semantic twin of claude's
+        // `tool_use` wait — it must protect a live hook pin.
+        assert!(d.from_tool_use);
+    }
+
+    #[test]
+    fn derive_real_task_complete_is_needs_input() {
+        // The exact regression: task_started then task_complete, real shapes.
+        let content = format!("{REAL_TASK_STARTED}\n{REAL_TASK_COMPLETE}\n");
+        let d = derive(&content);
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert!(!d.from_tool_use);
+    }
+
+    #[test]
+    fn derive_task_aborted_is_needs_input() {
+        let content = format!("{}\n{}\n", ev("task_started"), ev("task_aborted"));
+        assert_eq!(derive(&content).attention, Attention::NeedsInput);
+    }
+
+    #[test]
+    fn derive_uses_last_event_across_mixed_task_and_turn_spellings() {
+        // A rollout that straddles a rename (turn_* then task_*) still tracks
+        // the last lifecycle event regardless of spelling.
+        let content = format!(
+            "{}\n{}\n{}\n",
+            ev("turn_started"),
+            ev("turn_complete"),
+            ev("task_started"),
         );
         assert_eq!(derive(&content).attention, Attention::Working);
     }

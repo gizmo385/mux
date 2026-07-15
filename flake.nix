@@ -20,6 +20,14 @@
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # On aarch64-darwin, some nixpkgs revisions ship a legacy cctools
+          # `ld` that SIGTRAPs (Trace/BPT trap: 5 → exit 133) while linking
+          # this binary — it takes down `nix build` for any downstream flake
+          # consumer even though the Rust code is fine. Route the final link
+          # through LLVM's lld (already in the closure) instead. Darwin-only;
+          # no effect on Linux, where the default linker links cleanly.
+          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.lld ];
+          RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.isDarwin "-C link-arg=-fuse-ld=lld";
           # Tests shell out to git/ssh and assume a real environment (cf. host::tests
           # exercising ControlMaster lifecycle). They're CI's job — release.yml builds
           # without tests too. The flake produces a binary; the binary's correctness

@@ -46,7 +46,7 @@ The dashboard discovers local agent sessions (Claude Code by default; Codex/Pi w
 | `↑`/`↓` or `j`/`k` | Navigate the list |
 | `J`/`K` | Jump to next / previous **project** |
 | `Ctrl-j`/`Ctrl-k` | Jump to next / previous top-level **section** (Favorites, Tools, or a host) |
-| `Ctrl-P` | **Quickswitcher**: fuzzy-jump modal over everything attachable. Rows show each session's status (`! blocked`, `✓ done`, `◐ working`, `○ idle`) and float the ones that need you to the top; type to filter |
+| `Ctrl-P` | **Quickswitcher**: fuzzy-jump modal over everything attachable. Rows show each session's status (`! blocked`, `✓ done`, `◐ working`, `○ idle`); `blocked` pins to the top, everything else is newest-first; type to filter |
 | `Enter` | Attach to the selected session in the embedded pane |
 | `t` | Open `$SHELL` in the session's cwd inside the embedded pane |
 | `n` | New  worktree session |

@@ -1646,20 +1646,24 @@ impl App {
     /// any of them.
     ///
     /// Ordering (the empty-query view — the moment the user types, the
-    /// fuzzy score re-ranks): sessions that *want the user* float to the
-    /// top so the switcher doubles as "jump to what needs me" — `blocked`
-    /// first, then `done` (both `NeedsInput`), then everything else
-    /// (`working` / `idle` sessions, tool launches, offline pins) in the
-    /// recency/kind order below. Each session carries the sidebar's
-    /// `attention_glyph` / `attention_word` / themed colour as its
-    /// [`SwitchStatus`] so the list reads with the same vocabulary as the
-    /// dashboard.
+    /// fuzzy score re-ranks): `blocked` sessions pin to the top (the agent
+    /// has halted on a permission prompt — genuinely time-sensitive), then
+    /// *everything else* — `done`, `working`, `idle` sessions, tool
+    /// launches, offline pins — interleaves by recency, newest first. A
+    /// just-finished `done` still floats high (its `last_activity` is
+    /// frozen at the stop event), but an actively-`working` session that
+    /// pinged more recently now outranks a *stale* `done` one rather than
+    /// sitting under the whole `done` tier. Each session carries the
+    /// sidebar's `attention_glyph` / `attention_word` / themed colour as
+    /// its [`SwitchStatus`] so the list reads with the same vocabulary as
+    /// the dashboard.
     fn quickswitch_entries(&self) -> Vec<SwitchEntry> {
-        // `(rank, entry)` — a stable sort by `rank` at the end floats
-        // needs-user sessions up while preserving the within-rank order
-        // each group is pushed in (tools, then sessions by recency, then
-        // offline pins). `rank`: 0 = blocked, 1 = done, 2 = everything else.
-        let mut ranked: Vec<(u8, SwitchEntry)> = Vec::new();
+        // `(tier, recency, entry)` — sorted by `(tier, recency-desc)` at
+        // the end. `tier`: 0 = blocked (pinned top), 1 = everything else.
+        // `recency` is `last_activity` for sessions, `launched_at` for tool
+        // launches, and `UNIX_EPOCH` for offline pins (no live activity →
+        // they sink to the bottom of tier 1).
+        let mut ranked: Vec<(u8, SystemTime, SwitchEntry)> = Vec::new();
 
         // Same ≥2 gate as the sidebar rows: with a single enabled agent the
         // tag is noise, so it's omitted and the switcher reads exactly as it
@@ -1673,7 +1677,8 @@ impl App {
         for launch in self.tool_launches.launches() {
             let project = project_basename(&launch.project_dir);
             ranked.push((
-                2,
+                1,
+                launch.launched_at,
                 SwitchEntry {
                     label: launch.name.clone(),
                     context: format!("{project}  ·  {}", launch.host.as_str()),
@@ -1687,14 +1692,14 @@ impl App {
             ));
         }
 
-        // Live sessions, most-recently-active first within their rank.
-        let mut sessions: Vec<&Session> = self.catalog.sessions().iter().collect();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
-        for s in sessions {
+        // Live sessions. The final `(tier, recency-desc)` sort orders them
+        // by `last_activity`, so no pre-sort is needed here.
+        for s in self.catalog.sessions() {
             let name_override = self.session_names.get(&s.host, &s.id);
             let label = quickswitch_label(name_override, s.title.as_deref(), &s.id);
             let project = project_basename(&s.project_dir);
-            let (rank, status) = switch_status_for(s, &self.theme);
+            let (blocked, status) = switch_status_for(s, &self.theme);
+            let tier = u8::from(!blocked);
             // Agent tag rides the dim context cell (` · <label>`) and the
             // haystack, both gated the same as the sidebar tag — appending
             // the label to the single-agent haystack would let a stray
@@ -1708,7 +1713,8 @@ impl App {
                 (String::new(), String::new())
             };
             ranked.push((
-                rank,
+                tier,
+                s.last_activity,
                 SwitchEntry {
                     label: label.clone(),
                     context: format!("{project}  ·  {}{agent_cell}", s.host.as_str()),
@@ -1734,7 +1740,8 @@ impl App {
         for ph in self.favorite_placeholders() {
             let label = quickswitch_label(None, ph.title.as_deref(), &ph.id);
             ranked.push((
-                2,
+                1,
+                SystemTime::UNIX_EPOCH,
                 SwitchEntry {
                     label: label.clone(),
                     context: format!("{}  ·  offline", ph.host.as_str()),
@@ -1748,10 +1755,7 @@ impl App {
             ));
         }
 
-        // Stable sort: needs-user sessions rise to the top; each group
-        // keeps the order it was pushed in.
-        ranked.sort_by_key(|(rank, _)| *rank);
-        ranked.into_iter().map(|(_, entry)| entry).collect()
+        order_switch_entries(ranked)
     }
 
     /// Skip `git worktree add` and spawn the agent directly in the picked
@@ -4824,30 +4828,23 @@ fn attention_glyph(a: Attention, blocked: bool) -> &'static str {
     }
 }
 
-/// Build a session's quickswitcher status + sort rank from the same
+/// Build a session's quickswitcher status + blocked flag from the same
 /// attention derivation the sidebar uses, so the switcher reads with the
 /// identical `! blocked` / `✓ done` / `◐ working` / `○ idle` vocabulary
-/// and colours. Rank floats needs-user sessions to the top of the
-/// switcher's empty-query view: `0` = blocked, `1` = done (both
-/// `NeedsInput`), `2` = working / idle / unknown.
-fn switch_status_for(session: &Session, theme: &Theme) -> (u8, SwitchStatus) {
+/// and colours. The `blocked` flag pins a halted-on-permission-prompt
+/// session to the top of the switcher's empty-query view; every other
+/// state orders purely by recency (see `quickswitch_entries`).
+fn switch_status_for(session: &Session, theme: &Theme) -> (bool, SwitchStatus) {
     let attention = effective_attention(session);
     let blocked = session.blocking_prompt && attention == Attention::NeedsInput;
     let needs_user = attention == Attention::NeedsInput;
-    let rank = if blocked {
-        0
-    } else if needs_user {
-        1
-    } else {
-        2
-    };
     let color = if blocked {
         theme.blocked_color()
     } else {
         attention_color(attention, theme)
     };
     (
-        rank,
+        blocked,
         SwitchStatus {
             glyph: attention_glyph(attention, blocked),
             word: attention_word(attention, blocked),
@@ -4857,6 +4854,17 @@ fn switch_status_for(session: &Session, theme: &Theme) -> (u8, SwitchStatus) {
             bold: needs_user,
         },
     )
+}
+
+/// Order the quickswitcher's empty-query landing view: `blocked` entries
+/// (`tier == 0`) pin to the top, everything else — done, working, idle
+/// sessions, tool launches, offline pins — interleaves by `recency`
+/// (`SystemTime`, newest first). Stable, so equal-recency ties keep the
+/// order entries were pushed in. Split out of `quickswitch_entries` so the
+/// ordering can be unit-tested without standing up a full `App`.
+fn order_switch_entries(mut ranked: Vec<(u8, SystemTime, SwitchEntry)>) -> Vec<SwitchEntry> {
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    ranked.into_iter().map(|(_, _, entry)| entry).collect()
 }
 
 fn display_path(path: &Path, home: Option<&Path>) -> String {
@@ -5048,32 +5056,96 @@ mod tests {
     }
 
     #[test]
-    fn switch_status_reuses_sidebar_vocabulary_and_ranks_needs_user_first() {
-        // The switcher status mirrors the sidebar's glyph+word, and the
-        // rank floats blocked above done above the rest so opening the
-        // switcher lands on what wants the user. `last_activity = now`
-        // so the 1h idle overlay in `effective_attention` doesn't fire.
+    fn switch_status_reuses_sidebar_vocabulary_and_pins_blocked() {
+        // The switcher status mirrors the sidebar's glyph+word, and only
+        // `blocked` sets the pin flag — done/working order by recency, not
+        // by a status tier (see `quickswitch_entries`). `last_activity =
+        // now` so the 1h idle overlay in `effective_attention` doesn't fire.
         let theme = theme_default_resolved();
         let mut blocked = mock_session("a");
         blocked.last_activity = SystemTime::now();
         blocked.attention = Attention::NeedsInput;
         blocked.blocking_prompt = true;
-        let (rank, st) = switch_status_for(&blocked, &theme);
-        assert_eq!((rank, st.glyph, st.word), (0, "!", "blocked"));
+        let (is_blocked, st) = switch_status_for(&blocked, &theme);
+        assert_eq!((is_blocked, st.glyph, st.word), (true, "!", "blocked"));
         assert!(st.bold, "blocked is a needs-user state → bold");
 
         let mut done = mock_session("b");
         done.last_activity = SystemTime::now();
         done.attention = Attention::NeedsInput;
-        let (rank, st) = switch_status_for(&done, &theme);
-        assert_eq!((rank, st.glyph, st.word), (1, "✓", "done"));
+        let (is_blocked, st) = switch_status_for(&done, &theme);
+        assert_eq!((is_blocked, st.glyph, st.word), (false, "✓", "done"));
+        assert!(st.bold, "done is a needs-user state → bold");
 
         let mut working = mock_session("c");
         working.last_activity = SystemTime::now();
         working.attention = Attention::Working;
-        let (rank, st) = switch_status_for(&working, &theme);
-        assert_eq!((rank, st.glyph, st.word), (2, "◐", "working"));
+        let (is_blocked, st) = switch_status_for(&working, &theme);
+        assert_eq!((is_blocked, st.glyph, st.word), (false, "◐", "working"));
         assert!(!st.bold, "working is not a needs-user state");
+    }
+
+    fn switch_entry(label: &str) -> SwitchEntry {
+        SwitchEntry {
+            label: label.to_string(),
+            context: String::new(),
+            haystack: label.to_lowercase(),
+            target: SwitchTarget::Session {
+                id: SessionId(label.to_string()),
+                in_favorites: false,
+            },
+            status: None,
+        }
+    }
+
+    #[test]
+    fn order_switch_entries_pins_blocked_then_interleaves_by_recency() {
+        // The reported inversion: a session that pinged seconds ago should
+        // outrank a `done` one that finished long before it, instead of
+        // sitting under the whole `done` tier. Blocked still pins on top
+        // even when it's the oldest of the three.
+        let now = SystemTime::now();
+        let fresh = now;
+        let stale = now - Duration::from_mins(40);
+        let ancient = now - Duration::from_hours(3);
+
+        // Push order deliberately does NOT match the desired output, so the
+        // sort — not the insertion order — is what's under test.
+        let ranked = vec![
+            (1u8, stale, switch_entry("stale-done")),
+            (0u8, ancient, switch_entry("ancient-blocked")),
+            (1u8, fresh, switch_entry("fresh-working")),
+        ];
+
+        let ordered: Vec<String> = order_switch_entries(ranked)
+            .into_iter()
+            .map(|e| e.label)
+            .collect();
+
+        assert_eq!(
+            ordered,
+            vec![
+                "ancient-blocked".to_string(), // tier 0 pins top regardless of age
+                "fresh-working".to_string(),   // then newest-first, across states
+                "stale-done".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn order_switch_entries_is_stable_on_equal_recency() {
+        // Equal-recency ties keep the order they were pushed in (a tool
+        // launch and a session stamped the same instant, say).
+        let t = SystemTime::now();
+        let ranked = vec![
+            (1u8, t, switch_entry("first")),
+            (1u8, t, switch_entry("second")),
+        ];
+        let ordered: Vec<String> = order_switch_entries(ranked)
+            .into_iter()
+            .map(|e| e.label)
+            .collect();
+        assert_eq!(ordered, vec!["first".to_string(), "second".to_string()]);
     }
 
     #[test]

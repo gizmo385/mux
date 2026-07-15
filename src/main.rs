@@ -21,6 +21,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use agent_mux::adoption::{ADOPTION_WINDOW, PendingSpawns};
+use agent_mux::agent::{AgentKind, agent};
 use agent_mux::attachment::{
     AttachOutcome, AttachmentDriver, EmbedSpec, PtyDriver, SuspendCommand, TmuxDriver,
     find_pane_local, probe_live_writer,
@@ -38,7 +40,7 @@ use agent_mux::dashboard::{
 use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
 };
-use agent_mux::discovery::{build_session, claude_projects_dir, discover};
+use agent_mux::discovery::{build_session, discover};
 use agent_mux::edited_files_modal::{EditedFileEntry, EditedFilesModal, EditedFilesOutcome};
 use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
@@ -163,27 +165,47 @@ fn main() -> io::Result<()> {
             cli::print_notify_test(&mut stdout, &notifier, backend_label, blocking)
         }
         Some("hook") => {
-            // Producer side of the Claude Code Notification hook
-            // ingress. Reads payload from stdin; if the event is
-            // input-required (permission/idle/elicitation prompt),
-            // writes a marker file to
-            // `<transcripts-root>/.agent-mux-hooks/<unix-millis>-<sid>.json`.
-            // The transcripts root comes from the payload's
-            // `transcript_path` field — same path shape on local and
-            // remote machines, so the local watcher and the remote
-            // poller find markers at the same relative location. The
-            // cache-dir fallback only fires for malformed payloads
-            // missing `transcript_path` (production payloads always
-            // include it).
-            let fallback = agent_mux::hook_ingest::fallback_hook_dir()
-                .ok_or_else(|| io::Error::other("no cache directory resolved on this platform"))?;
+            // Producer side of the agent hook ingress. Reads the event
+            // JSON from stdin and (if attention-relevant) writes a marker
+            // file into `<transcripts-root>/.agent-mux-hooks/`. Default is
+            // Claude Code; `--agent codex` selects the codex vocabulary.
             let mut stderr = io::stderr();
-            match agent_mux::hook_ingest::receive_hook_from_stdin(
-                &mut io::stdin().lock(),
-                &fallback,
-                SystemTime::now(),
-                &mut stderr,
-            )? {
+            let written = if arg_agent_is_codex(&argv) {
+                // Codex payloads carry no `transcript_path`, so resolve the
+                // marker dir from the codex transcript root (config override
+                // → agent default), which is exactly what the local hook
+                // watcher + remote poller drain. Best-effort config load —
+                // the hook is a short-lived fire-and-forget subprocess.
+                let cfg = Config::load().unwrap_or_default();
+                let root = cfg
+                    .transcript_root_for(None, AgentKind::Codex)
+                    .map(|r| config::expand_tilde(&r))
+                    .ok_or_else(|| {
+                        io::Error::other("no codex transcript root resolved on this platform")
+                    })?;
+                let hooks_dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
+                agent_mux::hook_ingest::receive_codex_hook_from_stdin(
+                    &mut io::stdin().lock(),
+                    &hooks_dir,
+                    SystemTime::now(),
+                    &mut stderr,
+                )?
+            } else {
+                // Claude: the transcripts root comes from the payload's
+                // `transcript_path` field — same path shape on local and
+                // remote machines. The cache-dir fallback only fires for
+                // malformed payloads missing `transcript_path`.
+                let fallback = agent_mux::hook_ingest::fallback_hook_dir().ok_or_else(|| {
+                    io::Error::other("no cache directory resolved on this platform")
+                })?;
+                agent_mux::hook_ingest::receive_hook_from_stdin(
+                    &mut io::stdin().lock(),
+                    &fallback,
+                    SystemTime::now(),
+                    &mut stderr,
+                )?
+            };
+            match written {
                 Some(path) => writeln!(
                     stdout,
                     "agent-mux: hook marker written to {}",
@@ -193,16 +215,33 @@ fn main() -> io::Result<()> {
             }
         }
         Some("install-hooks") => {
-            // Mutates ~/.claude/settings.json to wire the Notification
-            // hook command at this binary's path. Idempotent; updates
-            // a stale entry in place; preserves everything else in the
-            // user's settings file. `--dry-run` prints the planned
-            // content without writing.
+            // Wires the agent's hook command at this binary's path.
+            // Idempotent; updates a stale entry in place; preserves
+            // everything else in the file. `--dry-run` prints the planned
+            // content without writing. Default target is Claude Code's
+            // `~/.claude/settings.json`; `--agent codex` targets
+            // `~/.codex/hooks.json` with the PermissionRequest + Stop
+            // handlers.
             let dry_run = argv.iter().any(|s| s == "--dry-run");
-            let settings = agent_mux::hook_install::default_settings_path()
-                .ok_or_else(|| io::Error::other("no home directory resolved on this platform"))?;
             let binary = std::env::current_exe()?;
-            agent_mux::hook_install::install_hooks_at(&settings, &binary, dry_run, &mut stdout)
+            if arg_agent_is_codex(&argv) {
+                let hooks =
+                    agent_mux::hook_install::default_codex_hooks_path().ok_or_else(|| {
+                        io::Error::other("no home directory resolved on this platform")
+                    })?;
+                agent_mux::hook_install::install_codex_hooks_at(
+                    &hooks,
+                    &binary,
+                    dry_run,
+                    &mut stdout,
+                )
+            } else {
+                let settings =
+                    agent_mux::hook_install::default_settings_path().ok_or_else(|| {
+                        io::Error::other("no home directory resolved on this platform")
+                    })?;
+                agent_mux::hook_install::install_hooks_at(&settings, &binary, dry_run, &mut stdout)
+            }
         }
         Some("help" | "--help" | "-h") => cli::print_help(&mut stdout),
         Some(other) => {
@@ -212,6 +251,17 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// Whether a `hook` / `install-hooks` invocation carried `--agent codex`.
+/// The only non-claude agent with a hook producer/installer today; a
+/// missing (or any other) `--agent` value falls through to the claude
+/// path, so zero-config behaviour is unchanged.
+fn arg_agent_is_codex(argv: &[String]) -> bool {
+    argv.iter()
+        .position(|s| s == "--agent")
+        .and_then(|i| argv.get(i + 1))
+        .is_some_and(|a| a == "codex")
 }
 
 fn run_tui(embedded: bool) -> io::Result<()> {
@@ -509,7 +559,7 @@ struct App {
     /// `~/.cache/agent-mux/session_names.json`. The `r` keybind opens
     /// an inline edit overlay (see [`Self::rename`]) whose result
     /// flows through this store. Overrides take precedence over the
-    /// transcript's `aiTitle` / `task.toml` title.
+    /// transcript's the agent title / `task.toml` title.
     session_names: SessionNameStore,
     /// User-pinned sessions surfaced in the `── favorites ──` group
     /// at the very top of the sidebar. Keyed by `(host, session_id)`;
@@ -526,15 +576,22 @@ struct App {
     /// Armed confirmation for the parallel-resume gate. Set when the
     /// user presses Enter on a session with no detectable tmux pane
     /// AND `lsof` reports that another process is currently holding
-    /// the transcript file open (typically a `claude` running outside
+    /// the transcript file open (typically the agent running outside
     /// agent-mux's reach — bare terminal, separate tmux server). A
     /// second Enter on the same session id proceeds with the normal
     /// `tmux_resume_argv` fallback; Esc clears the state. The point
-    /// is to avoid silently spawning a parallel `claude --resume`
+    /// is to avoid silently spawning a parallel the agent resume command
     /// against a transcript a live process is already writing to —
-    /// which races the original Claude and risks transcript
+    /// which races the original agent and risks transcript
     /// interleaving.
     attach_confirm: Option<AttachConfirmState>,
+    /// Outstanding `DiscoverAfterSpawn` (codex) launches awaiting their
+    /// rollout. Populated on `spawn_session` dispatch in [`Self::drain_creates`]
+    /// and consumed by [`Self::try_adopt_spawn`] when the correlated
+    /// `NewTranscript` arrives; expired entries are swept opportunistically
+    /// (plan §2.4). Empty for claude/pi (which pin their id at spawn), so
+    /// the whole adoption path is zero-cost for the common case.
+    pending_spawns: PendingSpawns,
 }
 
 /// Captures the session a parallel-resume confirmation is armed for.
@@ -607,9 +664,18 @@ struct CreatingSession {
 /// `Created` carries both the worktree path and the `HostId` it was
 /// created on so the main thread can route `spawn_session` through the
 /// right `Arc<dyn Host>` — the path alone doesn't tell us whether to
-/// invoke claude locally or via SSH.
+/// invoke the agent locally or via SSH.
 enum NewSessionResult {
-    Created { host_id: HostId, path: PathBuf },
+    Created {
+        host_id: HostId,
+        path: PathBuf,
+        /// Which agent CLI to spawn in the new worktree. Threaded through
+        /// to `spawn_session` so a `DiscoverAfterSpawn` agent (codex) gets
+        /// its provisional tmux name + pending-spawn registration. Set by
+        /// the `n`/`N` picker's agent step when ≥2 agents are enabled;
+        /// otherwise the sole enabled agent (Claude in the default build).
+        agent: AgentKind,
+    },
     Failed(String),
 }
 
@@ -666,7 +732,11 @@ enum RemoteDiscoveryResult {
     Connected {
         host_id: HostId,
         host: Arc<dyn Host>,
-        transcript_root: PathBuf,
+        /// One (agent, remote root) pair per enabled agent, resolved
+        /// through this host's precedence chain. The transcript poller
+        /// ticks each; roots whose directory doesn't exist fold into empty
+        /// listings (the agent isn't installed on this host).
+        roots: Vec<(AgentKind, PathBuf)>,
     },
     Ready {
         host_id: HostId,
@@ -692,13 +762,30 @@ impl App {
         let cache_dir = cache::default_dir();
 
         let local_host: Arc<dyn Host> = Arc::new(LocalHost::new());
-        let projects_root = claude_projects_dir();
+        // One (agent, local root) pair per enabled agent. The local host is
+        // implicit (no `[hosts.<name>]` entry), so roots resolve against the
+        // global `[agents]` table / agent defaults, tilde-expanded against
+        // the local home. With no `[agents]` table this is exactly
+        // `[(Claude, ~/.claude/projects)]` — byte-identical to pre-WP2.
+        let local_roots: Vec<(AgentKind, PathBuf)> = config
+            .enabled_agents()
+            .into_iter()
+            .filter_map(|kind| {
+                config
+                    .transcript_root_for(None, kind)
+                    .map(|root| (kind, config::expand_tilde(&root)))
+            })
+            .collect();
         let mut catalog = SessionCatalog::new();
-        if let Some(root) = projects_root.as_ref()
-            && let Ok(sessions) = discover(local_host.as_ref(), root)
-        {
-            catalog.replace_all(sessions);
+        let mut discovered = Vec::new();
+        for (kind, root) in &local_roots {
+            // A missing root folds into an empty listing (the agent isn't
+            // installed here) rather than an error.
+            if let Ok(sessions) = discover(local_host.as_ref(), root, *kind) {
+                discovered.extend(sessions);
+            }
         }
+        catalog.replace_all(discovered);
 
         // Seed the catalog with cached remote sessions so the
         // dashboard renders them on first paint, instead of waiting
@@ -727,10 +814,10 @@ impl App {
             .sessions()
             .iter()
             .filter(|s| s.host.is_local())
-            .map(|s| (s.id.clone(), s.transcript_path.clone()))
+            .map(|s| (s.id.clone(), s.transcript_path.clone(), s.agent))
             .collect();
         let (watcher, updates) =
-            TranscriptWatcher::start(Arc::clone(&local_host), targets, projects_root.as_deref())
+            TranscriptWatcher::start(Arc::clone(&local_host), targets, &local_roots)
                 .map_err(io::Error::other)?;
 
         let mut list_state = ListState::default();
@@ -749,20 +836,26 @@ impl App {
 
         let (remote_tx, remote_rx) = channel();
         let pending_hosts = config.hosts.len();
+        let enabled_agents = config.enabled_agents();
         for (name, host_config) in &config.hosts {
             let host_id = HostId(name.clone());
             let ssh_target = host_config.ssh.clone();
-            let transcript_root = host_config.transcript_root.clone();
+            // One (agent, remote root) pair per enabled agent, resolved
+            // through the per-host precedence chain. Tildes are kept
+            // unexpanded — the *remote* shell resolves them against the
+            // remote user's home.
+            let roots: Vec<(AgentKind, PathBuf)> = enabled_agents
+                .iter()
+                .filter_map(|&kind| {
+                    config
+                        .transcript_root_for(Some(host_config), kind)
+                        .map(|root| (kind, root))
+                })
+                .collect();
             let tx = remote_tx.clone();
             let cache_dir_for_thread = cache_dir.clone();
             std::thread::spawn(move || {
-                connect_and_discover(
-                    host_id,
-                    ssh_target,
-                    &transcript_root,
-                    cache_dir_for_thread,
-                    &tx,
-                );
+                connect_and_discover(host_id, ssh_target, &roots, cache_dir_for_thread, &tx);
             });
         }
         drop(remote_tx); // close channel once every thread Sender clone is gone
@@ -779,7 +872,7 @@ impl App {
             list_state,
             home: dirs::home_dir(),
             hosts,
-            _hook_watcher: init_hook_watcher(&watcher.event_sender()),
+            _hook_watcher: init_hook_watcher(&watcher.event_sender(), &local_roots),
             watcher,
             updates,
             driver,
@@ -815,6 +908,7 @@ impl App {
             favorites: load_favorites_or_empty(),
             rename: None,
             attach_confirm: None,
+            pending_spawns: PendingSpawns::default(),
         })
     }
 
@@ -1222,7 +1316,7 @@ impl App {
                 RemoteDiscoveryResult::Connected {
                     host_id,
                     host,
-                    transcript_root,
+                    roots,
                 } => {
                     // Register the host as soon as its `ControlMaster`
                     // is up so cached remote sessions become attachable
@@ -1247,7 +1341,7 @@ impl App {
                     self.hosts.insert(host_id.clone(), Arc::clone(&host));
                     self.watcher.start_polling_host(
                         Arc::clone(&host),
-                        transcript_root,
+                        roots,
                         poll_seed,
                         REMOTE_POLL_INTERVAL,
                     );
@@ -1331,7 +1425,7 @@ impl App {
     /// Open the picker in no-worktree mode (bound to `N`). Same picker
     /// UI as [`open_new_session`]; the only difference is the modal
     /// constructor — `new_no_worktree` short-circuits Filling and emits
-    /// `SubmitNoWorktree` so claude launches in the repo root.
+    /// `SubmitNoWorktree` so the agent launches in the repo root.
     fn open_new_session_no_worktree(&mut self) {
         self.open_picker(ModalOpenMode::NoWorktree);
     }
@@ -1365,9 +1459,15 @@ impl App {
             ),
         });
         let repos = self.registry.repos().to_vec();
+        // The enabled agents drive the picker's agent-selection step:
+        // ≥2 → the step is shown, exactly one → it's skipped (Claude-only
+        // stays a single-step pick). `agents[0]` is the default.
+        let agents = self.config.enabled_agents();
         let modal = match mode {
-            ModalOpenMode::Worktree => NewSessionModal::new(repos, ready_hosts, seed),
-            ModalOpenMode::NoWorktree => NewSessionModal::new_no_worktree(repos, ready_hosts, seed),
+            ModalOpenMode::Worktree => NewSessionModal::new(repos, ready_hosts, seed, agents),
+            ModalOpenMode::NoWorktree => {
+                NewSessionModal::new_no_worktree(repos, ready_hosts, seed, agents)
+            }
         };
         self.modal = Some(modal);
         self.status = None;
@@ -1384,8 +1484,11 @@ impl App {
                 repo,
                 task,
                 base_branch,
-            } => self.start_creating(repo, task, base_branch),
-            KeyOutcome::SubmitNoWorktree { repo } => self.start_no_worktree_session(repo),
+                agent,
+            } => self.start_creating(repo, task, base_branch, agent),
+            KeyOutcome::SubmitNoWorktree { repo, agent } => {
+                self.start_no_worktree_session(repo, agent);
+            }
         }
     }
 
@@ -1558,6 +1661,13 @@ impl App {
         // offline pins). `rank`: 0 = blocked, 1 = done, 2 = everything else.
         let mut ranked: Vec<(u8, SwitchEntry)> = Vec::new();
 
+        // Same ≥2 gate as the sidebar rows: with a single enabled agent the
+        // tag is noise, so it's omitted and the switcher reads exactly as it
+        // did pre-WP7. When shown, the label joins both the visible context
+        // cell and the fuzzy haystack, so typing "codex" filters to codex
+        // sessions.
+        let show_agent_tags = self.config.enabled_agents().len() >= 2;
+
         // Tool launches — short-lived panes the user often bounces back
         // to mid-task. No attention state (rank 2, no status prefix).
         for launch in self.tool_launches.launches() {
@@ -1585,12 +1695,25 @@ impl App {
             let label = quickswitch_label(name_override, s.title.as_deref(), &s.id);
             let project = project_basename(&s.project_dir);
             let (rank, status) = switch_status_for(s, &self.theme);
+            // Agent tag rides the dim context cell (` · <label>`) and the
+            // haystack, both gated the same as the sidebar tag — appending
+            // the label to the single-agent haystack would let a stray
+            // "cl…" query match every row, so it's omitted there too.
+            let (agent_cell, agent_hay) = if show_agent_tags {
+                (
+                    format!("  ·  {}", s.agent.label()),
+                    format!(" {}", s.agent.label()),
+                )
+            } else {
+                (String::new(), String::new())
+            };
             ranked.push((
                 rank,
                 SwitchEntry {
                     label: label.clone(),
-                    context: format!("{project}  ·  {}", s.host.as_str()),
-                    haystack: format!("{label} {project} {}", s.host.as_str()).to_lowercase(),
+                    context: format!("{project}  ·  {}{agent_cell}", s.host.as_str()),
+                    haystack: format!("{label} {project} {}{agent_hay}", s.host.as_str())
+                        .to_lowercase(),
                     target: SwitchTarget::Session {
                         id: s.id.clone(),
                         in_favorites: self.favorites.contains(&s.host, &s.id),
@@ -1631,14 +1754,14 @@ impl App {
         ranked.into_iter().map(|(_, entry)| entry).collect()
     }
 
-    /// Skip `git worktree add` and spawn claude directly in the picked
+    /// Skip `git worktree add` and spawn the agent directly in the picked
     /// repo's root. Reuses the create-channel pipeline so `drain_creates`
     /// handles the spawn the same way it does for worktree-backed
     /// sessions — the only difference is that no background work runs
     /// (no `self.creating` indicator), and the synthetic `Created`
     /// carries the repo root path rather than a freshly-`git worktree
     /// add`ed path.
-    fn start_no_worktree_session(&mut self, repo: Repo) {
+    fn start_no_worktree_session(&mut self, repo: Repo, agent: AgentKind) {
         if !self.hosts.contains_key(&repo.host) {
             self.status = Some(format!(
                 "host {} not connected yet — wait and try again",
@@ -1649,6 +1772,9 @@ impl App {
         let _ = self.create_tx.send(NewSessionResult::Created {
             host_id: repo.host,
             path: repo.path,
+            // The agent the picker resolved — the chosen kind when the
+            // agent step ran (≥2 enabled), else the sole enabled agent.
+            agent,
         });
         self.status = None;
     }
@@ -1657,7 +1783,7 @@ impl App {
     /// never blocks on I/O" discipline applies to *any* user action, not
     /// just session-switching — `git worktree add` can take seconds on a
     /// large repo, and that must not stall the dashboard.
-    fn start_creating(&mut self, repo: Repo, task: String, base_branch: String) {
+    fn start_creating(&mut self, repo: Repo, task: String, base_branch: String, agent: AgentKind) {
         // Worktree creation now routes through `Host::run` so the same
         // code path serves local and remote — the trait dispatches.
         // The host must be registered (i.e. for SSH targets, the
@@ -1681,7 +1807,14 @@ impl App {
         std::thread::spawn(move || {
             let outcome =
                 match WorktreeManager.create(host.as_ref(), &repo.path, &base_branch, &task) {
-                    Ok(path) => NewSessionResult::Created { host_id, path },
+                    // The agent the picker resolved rides into the spawn so
+                    // a `DiscoverAfterSpawn` agent (codex) gets its
+                    // provisional tmux name + pending-spawn registration.
+                    Ok(path) => NewSessionResult::Created {
+                        host_id,
+                        path,
+                        agent,
+                    },
                     Err(e) => NewSessionResult::Failed(format!("create worktree: {e}")),
                 };
             let _ = tx.send(outcome);
@@ -1696,9 +1829,13 @@ impl App {
         while let Ok(result) = self.create_rx.try_recv() {
             self.creating = None;
             match result {
-                NewSessionResult::Created { host_id, path } => {
+                NewSessionResult::Created {
+                    host_id,
+                    path,
+                    agent: agent_kind,
+                } => {
                     // `spawn_session` needs the host to know whether to
-                    // run claude locally or wrap it in `ssh -t target
+                    // run the agent locally or wrap it in `ssh -t target
                     // tmux new-session …`. The host should still be in
                     // `App.hosts` (we held an Arc during the create
                     // thread); the lookup-miss path is defensive.
@@ -1710,7 +1847,7 @@ impl App {
                         ));
                         continue;
                     };
-                    match self.driver.spawn_session(&path, host.as_ref()) {
+                    match self.driver.spawn_session(&path, host.as_ref(), agent_kind) {
                         Ok(AttachOutcome::Done) => {
                             self.status =
                                 Some(format!("started new session in {}", path.display()));
@@ -1727,7 +1864,7 @@ impl App {
                             // hasn't been written), so synthesise one
                             // from the worktree path — it's unique per
                             // spawn and unlikely to collide with a
-                            // real Claude conversation id. Discovery
+                            // real agent conversation id. Discovery
                             // will surface the real session later;
                             // pressing Enter on that row then routes
                             // through `find_pane_local`, finds the
@@ -1735,9 +1872,23 @@ impl App {
                             // (one PTY respawn against the same tmux
                             // session — content is preserved
                             // server-side).
-                            let synthetic_id =
-                                SessionId(format!("agent-mux-spawn:{}", path.display()));
-                            self.install_embedded(&spec, synthetic_id);
+                            let placeholder = spawn_placeholder_id(&path);
+                            // A `DiscoverAfterSpawn` agent (codex) carries
+                            // its adoption nonce here: record a pending
+                            // spawn keyed on cwd so the rollout that
+                            // appears within `ADOPTION_WINDOW` adopts the
+                            // real id and renames the provisional tmux
+                            // session (plan §2.4). `None` for pinned-id
+                            // agents, so this is a no-op for claude/pi.
+                            if let Some(nonce) = spec.adopt_pending.clone() {
+                                self.pending_spawns.record(
+                                    path.clone(),
+                                    nonce,
+                                    agent_kind,
+                                    SystemTime::now(),
+                                );
+                            }
+                            self.install_embedded(&spec, placeholder);
                         }
                         Err(e) => {
                             self.status = Some(format!(
@@ -1769,7 +1920,7 @@ impl App {
         };
         if session.parent_repo.is_none() {
             // Sessions started outside a worktree (a plain checkout,
-            // or `claude` against an arbitrary cwd) aren't deletable
+            // or the agent against an arbitrary cwd) aren't deletable
             // through this path — there's no parent repo to run
             // `git worktree remove` against. Surface that rather than
             // opening a modal whose Enter would always fail.
@@ -2033,8 +2184,22 @@ impl App {
                         );
                     }
                 }
-                WatcherEvent::NewTranscript { host, path, mtime } => {
-                    self.handle_new_transcript(&host, &path, mtime);
+                WatcherEvent::NewTranscript {
+                    host,
+                    agent,
+                    path,
+                    mtime,
+                } => {
+                    // Adoption keys off the RAW event, *before* and
+                    // independent of `handle_new_transcript`'s stillborn
+                    // filter: a brand-new codex rollout carrying only
+                    // `session_meta` (no user prompt yet) is dropped by
+                    // discovery's stillborn guard, so a successfully
+                    // assembled `Session` may not surface until the first
+                    // prompt — too late to correlate the spawn (WP2/WP3
+                    // handoff, plan §2.4).
+                    self.try_adopt_spawn(&host, agent, &path);
+                    self.handle_new_transcript(&host, agent, &path, mtime);
                 }
                 WatcherEvent::LivePanes {
                     host,
@@ -2130,11 +2295,17 @@ impl App {
     /// yet) and we silently drop it — the next event re-fires
     /// `NewTranscript` and we retry until the file has enough content to
     /// build a session from.
-    fn handle_new_transcript(&mut self, host_id: &HostId, path: &Path, mtime: SystemTime) {
+    fn handle_new_transcript(
+        &mut self,
+        host_id: &HostId,
+        kind: AgentKind,
+        path: &Path,
+        mtime: SystemTime,
+    ) {
         let Some(host) = self.hosts.get(host_id).cloned() else {
             return;
         };
-        let Ok(Some(session)) = build_session(host.as_ref(), path, mtime) else {
+        let Ok(Some(session)) = build_session(host.as_ref(), path, kind, mtime) else {
             return;
         };
         let id = session.id.clone();
@@ -2148,9 +2319,95 @@ impl App {
         }
         if let Err(e) = self
             .watcher
-            .track_new_transcript(host_id, id, transcript_path)
+            .track_new_transcript(host_id, id, transcript_path, kind)
         {
             self.status = Some(format!("watch new transcript: {e}"));
+        }
+    }
+
+    /// Codex spawn-correlation (plan §2.4). On a `NewTranscript` for a
+    /// `DiscoverAfterSpawn` agent, correlate the freshly-appeared rollout
+    /// to an outstanding [`pending_spawns`](Self::pending_spawns) entry by
+    /// cwd; on a match, rename the provisional `agent-mux-pending-<nonce>`
+    /// tmux session to the durable `agent-mux-<id>` through the driver and
+    /// re-key the embedded pane from the spawn placeholder to the real id.
+    ///
+    /// Cheap for the common case: the head read only fires while a spawn is
+    /// actually outstanding (the [`PendingSpawns::is_empty`] gate), and
+    /// claude/pi never register a pending, so a claude `NewTranscript`
+    /// returns after the sweep without touching the disk.
+    fn try_adopt_spawn(&mut self, host_id: &HostId, kind: AgentKind, path: &Path) {
+        // Sweep expired pendings opportunistically (no timer thread; plan
+        // §2.4 step 4). Every arriving transcript is a sweep trigger; the
+        // tick loop is the backstop when none arrive.
+        self.sweep_pending_spawns();
+        if self.pending_spawns.is_empty() {
+            return;
+        }
+        let cli = agent(kind);
+        // A non-rollout path (codex's `session_id_from_path` strictly
+        // validates the `rollout-` prefix + trailing uuid) yields `None`
+        // and is ignored.
+        let Some(adopted_id) = cli.session_id_from_path(path) else {
+            return;
+        };
+        let Some(host) = self.hosts.get(host_id).cloned() else {
+            return;
+        };
+        // Cheap head read for the rollout's `cwd`. `Host` exposes no
+        // head-only primitive (only `read_tail` / `read_to_string`), and a
+        // rollout eligible for adoption is brand-new and tiny
+        // (`session_meta` + maybe one line), so a full `read_to_string` is
+        // bounded in practice — and it only runs while a spawn is
+        // outstanding (the `is_empty` gate above). Noted as the deliberate
+        // choice per the WP5 handoff.
+        let Ok(content) = host.read_to_string(path) else {
+            return;
+        };
+        let Some(cwd) = cli.parse_meta(&content).cwd else {
+            return;
+        };
+        let Some(pending) = self.pending_spawns.adopt(kind, &cwd, SystemTime::now()) else {
+            return;
+        };
+        // Rename `agent-mux-pending-<nonce>` → `agent-mux-<id>` through the
+        // driver (tmux stays behind the Attachment Driver; remote routes
+        // via ssh_argv). Restores the durable name→id link every
+        // downstream mechanism (pane resolution stage 1, the resume
+        // fallback, the pane-presence indicator) relies on.
+        if let Err(e) =
+            self.driver
+                .adopt_pending_session(host.as_ref(), &pending.nonce, &adopted_id)
+        {
+            self.status = Some(format!("codex adopt: rename failed: {e}"));
+        }
+        // Re-key the embedded pane from the spawn placeholder to the real
+        // id — mirrors how the pinned flow's discovered row already carries
+        // the real id. Keeps notification-suppression / actively-viewed
+        // keyed on the true session, and makes the discovered row's Enter a
+        // no-op re-attach rather than a respawn.
+        let placeholder = spawn_placeholder_id(&pending.cwd);
+        if let Some(emb) = self.embedded.as_mut()
+            && emb.session_id == placeholder
+        {
+            emb.session_id = adopted_id.clone();
+        }
+    }
+
+    /// Drop pending spawns whose adoption window has elapsed, surfacing
+    /// each as a footer/status spawn error (plan §2.4 step 4). The tmux
+    /// session, if it launched at all, is still reachable via the cwd
+    /// fallback — this only reports that the id could not be adopted.
+    /// Called on every tick and every `NewTranscript`; a no-op when
+    /// nothing is outstanding.
+    fn sweep_pending_spawns(&mut self) {
+        let expired = self.pending_spawns.sweep_expired(SystemTime::now());
+        if let Some(last) = expired.last() {
+            self.status = Some(format!(
+                "codex spawn in {} produced no rollout within {}s — dropped",
+                last.cwd.display(),
+                ADOPTION_WINDOW.as_secs(),
+            ));
         }
     }
 
@@ -2211,9 +2468,9 @@ impl App {
 
         // Parallel-resume gate: when the host is local AND there's no
         // tmux pane for the session (so the driver would fall through
-        // to `tmux_resume_argv` and spawn a brand-new `claude --resume`)
+        // to `tmux_resume_argv` and spawn a brand-new the agent resume command)
         // AND `lsof` reports another process is currently holding the
-        // transcript file open (typically a Claude running outside
+        // transcript file open (typically the agent running outside
         // agent-mux's reach), arm a one-shot confirmation and return
         // without attaching. Second Enter on the same session id
         // bypasses the gate — `already_armed` is the contract.
@@ -2694,6 +2951,7 @@ impl App {
             cwd: None,
             label: format!("⚒ {} · {} · [{}]", launch.name, project, launch.host),
             tmux_session: Some(launch.tmux_session.clone()),
+            adopt_pending: None,
         };
         let synthetic_id = SessionId(format!("agent-mux-tool-attach:{}", launch.tmux_session));
         self.install_embedded(&spec, synthetic_id);
@@ -2845,6 +3103,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             app.status = Some(err);
         }
         app.drain_deletes();
+        // Backstop for pending-spawn expiry: `try_adopt_spawn` sweeps on
+        // every arriving transcript, but a codex spawn that produces *no*
+        // rollout (crashed, wrong binary) would otherwise never expire
+        // without an unrelated event. Cheap no-op when nothing's pending.
+        app.sweep_pending_spawns();
         if has_event {
             let raw = event::read()?;
             match raw {
@@ -2977,7 +3240,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
 fn connect_and_discover(
     host_id: HostId,
     ssh_target: String,
-    transcript_root: &Path,
+    roots: &[(AgentKind, PathBuf)],
     cache_dir: Option<PathBuf>,
     tx: &Sender<RemoteDiscoveryResult>,
 ) {
@@ -3001,22 +3264,30 @@ fn connect_and_discover(
         .send(RemoteDiscoveryResult::Connected {
             host_id: host_id.clone(),
             host: Arc::clone(&host),
-            transcript_root: transcript_root.to_path_buf(),
+            roots: roots.to_vec(),
         })
         .is_err()
     {
         return;
     }
-    let sessions = match discover(host.as_ref(), transcript_root) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(RemoteDiscoveryResult::Failed {
-                host_id,
-                error: format!("discovery: {e}"),
-            });
-            return;
+    // One (agent, root) discovery per enabled agent — one `find` per root,
+    // batched reads within each. A root that isn't installed on this host
+    // folds into an empty listing (see `Host::list_transcripts`), so a
+    // missing agent costs one cheap `find` and yields nothing rather than
+    // erroring the whole host.
+    let mut sessions = Vec::new();
+    for (kind, root) in roots {
+        match discover(host.as_ref(), root, *kind) {
+            Ok(s) => sessions.extend(s),
+            Err(e) => {
+                let _ = tx.send(RemoteDiscoveryResult::Failed {
+                    host_id,
+                    error: format!("discovery: {e}"),
+                });
+                return;
+            }
         }
-    };
+    }
     // No second pass for attention: `discover` now derives initial
     // attention from the same bulk-fetched transcript content it used
     // for cwd/title extraction, so the row paints with a real state
@@ -3125,7 +3396,7 @@ fn dispatch_action(app: &mut App, action: Option<Action>) -> ActionOutcome {
 
 /// Which constructor `open_picker` hands to the modal. `Worktree` runs
 /// the standard pick → fill task/branch → `git worktree add` → spawn
-/// flow; `NoWorktree` skips the fill stage and spawns claude in the
+/// flow; `NoWorktree` skips the fill stage and spawns the agent in the
 /// repo root.
 #[derive(Debug, Clone, Copy)]
 enum ModalOpenMode {
@@ -3148,7 +3419,7 @@ enum Action {
     Attach,
     SpawnTerminal,
     NewSession,
-    /// `N` — pick a repo, spawn claude in its root, no worktree.
+    /// `N` — pick a repo, spawn the agent in its root, no worktree.
     NewSessionNoWorktree,
     OpenSearch,
     /// `Ctrl-P` — open the quickswitcher fuzzy-jump modal.
@@ -3324,6 +3595,7 @@ fn build_sidebar_items(
     tool_launches: &[ToolLaunch],
     session_names: &SessionNameStore,
     favorites: &FavoritesStore,
+    show_agent_tags: bool,
 ) -> Vec<ListItem<'static>> {
     rows.iter()
         .map(|row| match row {
@@ -3340,6 +3612,7 @@ fn build_sidebar_items(
                     name_override,
                     is_favorite,
                     false,
+                    show_agent_tags,
                 ))
             }
             DisplayRow::FavoriteSessionRow(i) => {
@@ -3349,7 +3622,14 @@ fn build_sidebar_items(
                 // favorited — pass `true` directly rather than
                 // round-tripping through the store (which would also
                 // be correct but reads as a tautology).
-                ListItem::new(format_session_row(s, theme, name_override, true, true))
+                ListItem::new(format_session_row(
+                    s,
+                    theme,
+                    name_override,
+                    true,
+                    true,
+                    show_agent_tags,
+                ))
             }
             DisplayRow::FavoritePlaceholderRow(i) => {
                 ListItem::new(format_favorite_placeholder_row(&placeholders[*i]))
@@ -3383,27 +3663,33 @@ fn sidebar_border_style(app: &App) -> Style {
 #[must_use]
 fn init_hook_watcher(
     event_tx: &std::sync::mpsc::Sender<WatcherEvent>,
+    local_roots: &[(AgentKind, PathBuf)],
 ) -> Option<notify::RecommendedWatcher> {
-    // Watch <local-transcripts-root>/.agent-mux-hooks/. The hook
-    // subcommand derives this same path from the payload's
-    // `transcript_path` so local and remote producers + consumers
-    // share one path convention.
-    let Some(root) = claude_projects_dir() else {
-        let msg = "hook watcher disabled (no Claude Code transcripts dir resolved); \
+    // WP8: one watcher over every enabled agent's
+    // `<local-root>/.agent-mux-hooks/` dir (claude + codex today),
+    // mirroring WP2's single transcript watcher over all roots. Each
+    // producer (`agent-mux hook [--agent <label>]`) writes markers into
+    // the same per-agent dir, so local producers + consumers share one
+    // path convention. The recursive transcript watch already *sees*
+    // these dirs but filters their `.json` markers out (only `.jsonl` is
+    // a transcript), so this dedicated watcher owns their ingestion.
+    let hook_dirs: Vec<PathBuf> = local_roots
+        .iter()
+        .map(|(_, root)| agent_mux::hook_ingest::hook_dir_for_transcripts_root(root))
+        .collect();
+    if hook_dirs.is_empty() {
+        let msg = "hook watcher disabled (no enabled agent transcript roots resolved); \
                    heuristic-only attention path stays in effect";
         eprintln!("agent-mux: {msg}");
         agent_mux::logging::log_line(msg);
         return None;
-    };
-    let dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
-    match agent_mux::hook_ingest::spawn_hook_watcher(&dir, event_tx) {
+    }
+    match agent_mux::hook_ingest::spawn_hook_watcher(&hook_dirs, event_tx) {
         Ok(w) => Some(w),
         Err(e) => {
             let msg = format!(
-                "hook watcher disabled ({} on {}); \
-                 heuristic-only attention path stays in effect",
-                e,
-                dir.display()
+                "hook watcher disabled ({e}); \
+                 heuristic-only attention path stays in effect"
             );
             eprintln!("agent-mux: {msg}");
             agent_mux::logging::log_line(&msg);
@@ -3527,6 +3813,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .filter(|r| matches!(r, DisplayRow::SessionRow(_)))
         .count();
     let title = compose_sidebar_title(app.catalog.len(), visible_sessions, app.search.is_some());
+    // Agent tags on rows appear only when ≥2 agents are enabled — the
+    // Claude-only sidebar renders byte-identically to pre-WP7.
+    let show_agent_tags = app.config.enabled_agents().len() >= 2;
     let items = build_sidebar_items(
         &rows,
         app.catalog.sessions(),
@@ -3536,6 +3825,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         app.tool_launches.launches(),
         &app.session_names,
         &app.favorites,
+        show_agent_tags,
     );
     let mut sidebar_block = Block::default()
         .borders(Borders::ALL)
@@ -3705,10 +3995,10 @@ fn compose_footer(
     // landing between arm-time and the user's next keystroke can't
     // overwrite the warning. The banner is the dashboard's only
     // affordance for this state — if the user misses it they'll spawn
-    // the parallel `claude --resume` they were trying to avoid.
+    // the parallel the agent resume command they were trying to avoid.
     if let Some(c) = attach_confirm {
         return format!(
-            " ⚠  live claude detected for {}  ·  ⏎ spawn parallel resume anyway  ·  any other key cancels ",
+            " ⚠  live agent session detected for {}  ·  ⏎ spawn parallel resume anyway  ·  any other key cancels ",
             c.project_dir.display()
         );
     }
@@ -3931,11 +4221,11 @@ fn compute_actively_viewed(
 /// Mirrors the sidebar's precedence so a rename a user already sees on
 /// the row appears verbatim in the toast — the prior version skipped
 /// straight to the catalog's `session.title` and surfaced the
-/// transcript-derived `aiTitle` (often the first user-message line) in
+/// transcript-derived the agent title (often the first user-message line) in
 /// the notification even after the user had renamed the session.
 ///
 /// Precedence: user rename override (the value the `r` overlay writes
-/// into `SessionNameStore`) → catalog-resolved title (`aiTitle` /
+/// into `SessionNameStore`) → catalog-resolved title (the agent title /
 /// `task.toml`) → trailing chunk of the session id so two unnamed
 /// sessions remain distinguishable in the notification stream.
 ///
@@ -4067,8 +4357,8 @@ fn pick_reseat_target(
 ///   doesn't trip.
 /// - `live_writer` — `lsof` reports another process holds the
 ///   transcript file open. Without this signal we can't distinguish
-///   "user has no Claude running" (resume is the right thing) from
-///   "user has a Claude running outside our reach" (resume races).
+///   "user has no agent running" (resume is the right thing) from
+///   "user has an agent running outside our reach" (resume races).
 /// - `!already_armed` — the user already saw the banner on the
 ///   previous Enter. Same-session re-fire proceeds.
 ///
@@ -4087,6 +4377,16 @@ fn should_gate_attach(
     already_armed: bool,
 ) -> bool {
     !already_armed && host_is_local && !pane_present && live_writer
+}
+
+/// The placeholder [`SessionId`] a freshly-spawned session's embedded pane
+/// is keyed on before discovery surfaces the real id. Synthesised from the
+/// worktree path — unique per spawn, and namespaced so it can't collide
+/// with a real agent conversation id. Shared by [`App::drain_creates`]
+/// (which installs the embed under it) and [`App::try_adopt_spawn`] (which
+/// re-keys it to the adopted codex id) so the two agree on the key.
+fn spawn_placeholder_id(path: &Path) -> SessionId {
+    SessionId(format!("agent-mux-spawn:{}", path.display()))
 }
 
 /// What `drain_pty_events` does when an embedded child exits.
@@ -4329,7 +4629,7 @@ fn project_basename(dir: &Path) -> String {
 }
 
 /// The display title for a quickswitcher row, mirroring the sidebar's
-/// precedence: a user rename wins, then the `aiTitle` / task title, then
+/// precedence: a user rename wins, then the the agent title / task title, then
 /// a short id suffix in parentheses for a still-untitled session.
 fn quickswitch_label(name_override: Option<&str>, title: Option<&str>, id: &SessionId) -> String {
     if let Some(name) = name_override {
@@ -4353,6 +4653,7 @@ fn format_session_row(
     name_override: Option<&str>,
     is_favorite: bool,
     in_favorites_group: bool,
+    show_agent_tags: bool,
 ) -> Vec<Line<'static>> {
     let attention = effective_attention(session);
     // A hook-confirmed blocking prompt (permission / elicitation) reads
@@ -4382,7 +4683,7 @@ fn format_session_row(
     if is_favorite {
         l1.push(Span::styled("★ ", dim));
     }
-    // User overrides take precedence over both `aiTitle` and the
+    // User overrides take precedence over both the agent title and the
     // task-toml-derived title (the 2026-05-21 rename feature). A
     // newly-arriving AI title does *not* clobber the override.
     if let Some(name) = name_override {
@@ -4449,6 +4750,15 @@ fn format_session_row(
         detail.push_str(" · [");
         detail.push_str(session.host.as_str());
         detail.push(']');
+    }
+    // Agent tag last, at the very end of line 2 — only when ≥2 agents are
+    // enabled, so the Claude-only dashboard stays pixel-identical. Bare
+    // `label()` ("codex"/"pi"/"claude"), carried on the same dim `detail`
+    // span as the other muted cells so it recedes behind the attention
+    // glyph/word (the altitude rule) and never claims the signal position.
+    if show_agent_tags {
+        detail.push_str(" · ");
+        detail.push_str(session.agent.label());
     }
 
     let l2 = vec![
@@ -4794,6 +5104,7 @@ mod tests {
         Session {
             id: SessionId("audit".into()),
             host: HostId::local(),
+            agent: agent_mux::agent::AgentKind::Claude,
             project_dir: PathBuf::from("/proj"),
             transcript_path: PathBuf::from("/t/x.jsonl"),
             last_activity: SystemTime::now()
@@ -5181,7 +5492,7 @@ mod tests {
     #[test]
     fn footer_attach_confirm_banner_outranks_status() {
         // The parallel-resume gate is the dashboard's only affordance
-        // for "do you really want to spawn a parallel claude" — a
+        // for "do you really want to spawn a parallel agent" — a
         // background event that lands between arm-time and the
         // user's next keystroke must not paint over the warning.
         let confirm = AttachConfirmState {
@@ -5200,7 +5511,7 @@ mod tests {
             Focus::Sidebar,
             &[],
         );
-        assert!(s.contains("live claude"), "got: {s}");
+        assert!(s.contains("live agent"), "got: {s}");
         assert!(s.contains("/work/proj"), "got: {s}");
         assert!(
             !s.contains("attach: boom"),
@@ -5234,7 +5545,7 @@ mod tests {
             &[],
         );
         assert!(s.contains("creating worktree"), "got: {s}");
-        assert!(!s.contains("live claude"), "got: {s}");
+        assert!(!s.contains("live agent"), "got: {s}");
     }
 
     #[test]
@@ -5820,12 +6131,12 @@ mod tests {
     #[test]
     fn resolve_notification_title_prefers_user_override_over_catalog_title() {
         // The dogfood bug 2026-05-24: notifications were surfacing the
-        // transcript-derived `aiTitle` (often the first user-message
+        // transcript-derived the agent title (often the first user-message
         // line — the "original commit title" the user described) even
         // after they had renamed the session via the `r` overlay.
         let id = sid("session-id");
         assert_eq!(
-            resolve_notification_title(Some("my rename"), Some("aiTitle"), &id),
+            resolve_notification_title(Some("my rename"), Some("agent title"), &id),
             "my rename"
         );
     }
@@ -5834,8 +6145,8 @@ mod tests {
     fn resolve_notification_title_falls_back_to_catalog_title_when_no_override() {
         let id = sid("session-id");
         assert_eq!(
-            resolve_notification_title(None, Some("aiTitle"), &id),
-            "aiTitle"
+            resolve_notification_title(None, Some("agent title"), &id),
+            "agent title"
         );
     }
 
@@ -5856,7 +6167,7 @@ mod tests {
     #[test]
     fn resolve_notification_title_override_takes_effect_even_when_catalog_title_is_none() {
         // A renamed session whose transcript hasn't produced an
-        // `aiTitle` yet (early in the conversation) should still
+        // the agent title yet (early in the conversation) should still
         // surface the user's rename rather than the id suffix.
         let id = sid("abcdef");
         assert_eq!(
@@ -5873,6 +6184,7 @@ mod tests {
         Session {
             id: sid(id_str),
             host: HostId::local(),
+            agent: agent_mux::agent::AgentKind::Claude,
             project_dir: PathBuf::from("/p"),
             transcript_path: PathBuf::from(format!("/t/{id_str}.jsonl")),
             last_activity: SystemTime::UNIX_EPOCH,
@@ -6269,7 +6581,7 @@ mod tests {
         s.last_activity = now; // keep effective_attention out of the idle overlay
         s.attention_entered_at = Some(now - Duration::from_mins(18)); // 18m
         s.started_at = Some(now - Duration::from_mins(45)); // running 45m
-        let lines = format_session_row(&s, &Theme::default(), None, false, false);
+        let lines = format_session_row(&s, &Theme::default(), None, false, false, false);
         assert_eq!(lines.len(), 2, "session rows are two lines now");
         let l1 = line_text(&lines[0]);
         let l2 = line_text(&lines[1]);
@@ -6297,7 +6609,7 @@ mod tests {
         s.blocking_prompt = true;
         s.last_activity = now;
         s.attention_entered_at = Some(now - Duration::from_mins(2));
-        let lines = format_session_row(&s, &Theme::default(), None, false, false);
+        let lines = format_session_row(&s, &Theme::default(), None, false, false, false);
         let l2 = line_text(&lines[1]);
         assert!(l2.contains("blocked"), "line 2 says blocked: {l2:?}");
         assert!(
@@ -6305,6 +6617,54 @@ mod tests {
             "blocked must not read as done: {l2:?}"
         );
         assert!(l2.contains('!'), "blocked shows the ! icon: {l2:?}");
+    }
+
+    #[test]
+    fn format_session_row_single_agent_has_no_agent_tag() {
+        // The pixel-identical guarantee: with `show_agent_tags = false`
+        // (one enabled agent) line 2 carries no agent label — the
+        // Claude-only dashboard is unchanged from pre-WP7.
+        let now = SystemTime::now();
+        let mut s = mock_session("abc");
+        s.agent = agent_mux::agent::AgentKind::Codex;
+        s.title = Some("t".into());
+        s.attention = Attention::Working;
+        s.last_activity = now;
+        s.attention_entered_at = Some(now - Duration::from_mins(5));
+        let l2 =
+            line_text(&format_session_row(&s, &Theme::default(), None, false, false, false)[1]);
+        assert!(
+            !l2.contains("codex"),
+            "single-agent rows carry no agent tag: {l2:?}"
+        );
+    }
+
+    #[test]
+    fn format_session_row_multi_agent_appends_agent_tag_at_line_end() {
+        // With `show_agent_tags = true` the bare agent label lands at the
+        // very end of line 2, after the durations — the attention glyph
+        // keeps its leading position.
+        let now = SystemTime::now();
+        let mut s = mock_session("abc");
+        s.agent = agent_mux::agent::AgentKind::Codex;
+        s.title = Some("t".into());
+        s.attention = Attention::Working;
+        s.last_activity = now;
+        s.attention_entered_at = Some(now - Duration::from_mins(5));
+        s.started_at = Some(now - Duration::from_mins(10));
+        let l2 = line_text(&format_session_row(&s, &Theme::default(), None, false, false, true)[1]);
+        assert!(
+            l2.contains("codex"),
+            "multi-agent row shows the tag: {l2:?}"
+        );
+        assert!(
+            l2.trim_end().ends_with("codex"),
+            "agent tag sits at the end of line 2, after the durations: {l2:?}"
+        );
+        // The attention glyph/word still leads the line.
+        let working = l2.find("working").expect("state word present");
+        let codex = l2.find("codex").expect("agent tag present");
+        assert!(working < codex, "attention signal precedes the tag: {l2:?}");
     }
 
     /// Foreground colour of the line-2 span whose text contains `needle`
@@ -6327,7 +6687,8 @@ mod tests {
         done.title = Some("finished".into());
         done.attention = Attention::NeedsInput;
         done.last_activity = now;
-        let done_lines = format_session_row(&done, &theme_default_resolved(), None, false, false);
+        let done_lines =
+            format_session_row(&done, &theme_default_resolved(), None, false, false, false);
         assert_eq!(
             state_span_fg(&done_lines[1], "done"),
             Some(ratatui::style::Color::Green),
@@ -6339,8 +6700,14 @@ mod tests {
         blocked.attention = Attention::NeedsInput;
         blocked.blocking_prompt = true;
         blocked.last_activity = now;
-        let blocked_lines =
-            format_session_row(&blocked, &theme_default_resolved(), None, false, false);
+        let blocked_lines = format_session_row(
+            &blocked,
+            &theme_default_resolved(),
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             state_span_fg(&blocked_lines[1], "blocked"),
             Some(ratatui::style::Color::Red),
@@ -6364,7 +6731,8 @@ mod tests {
         s.last_activity = now;
         s.attention_entered_at = Some(now - Duration::from_mins(1));
         s.started_at = None; // e.g. externally-started session, no task.toml
-        let l2 = line_text(&format_session_row(&s, &Theme::default(), None, false, false)[1]);
+        let l2 =
+            line_text(&format_session_row(&s, &Theme::default(), None, false, false, false)[1]);
         assert!(l2.contains("done"), "still names the state: {l2:?}");
         assert!(
             !l2.contains(" old"),

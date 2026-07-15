@@ -1,3 +1,6 @@
+pub mod adoption;
+pub mod agent;
+pub mod agents;
 pub mod attachment;
 pub mod cache;
 pub mod catalog;

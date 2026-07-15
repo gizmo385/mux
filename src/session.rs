@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use crate::agent::AgentKind;
+
 /// Upper bound on how many edited-file paths a session tracks. A cap
 /// keeps [`Session::edited_files`] bounded on a long-lived conversation
 /// that touches thousands of files; the most-recent-first ordering means
@@ -61,14 +63,20 @@ pub enum Attention {
 pub struct Session {
     pub id: SessionId,
     pub host: HostId,
+    /// Which agent CLI backs this session. Selects the parser, the
+    /// spawn/resume argv, and the transcript-tree shape via
+    /// [`crate::agent::agent`]. Tagged per-root by discovery/the watcher:
+    /// each (host × enabled-agent) root the session was found under sets
+    /// this to the owning agent.
+    pub agent: AgentKind,
     pub project_dir: PathBuf,
     pub transcript_path: PathBuf,
     pub last_activity: SystemTime,
     pub attention: Attention,
     /// Human-readable label. Resolved in `discovery` from (in precedence)
-    /// `.agent-mux/task.toml` → transcript `ai-title` entries → `None`.
-    /// `None` means "no signal beyond the cwd" and the UI falls back to cwd
-    /// alone.
+    /// `.agent-mux/task.toml` → the agent's transcript title entries →
+    /// `None`. `None` means "no signal beyond the cwd" and the UI falls
+    /// back to cwd alone.
     pub title: Option<String>,
     /// If `project_dir` is a git worktree, the path of the worktree's
     /// parent repo (resolved from the `gitdir: …/.git/worktrees/…`
@@ -81,8 +89,8 @@ pub struct Session {
     /// Whether the session's host has a live tmux pane whose
     /// `pane_current_path` matches `project_dir`. `Some(true)` means
     /// Enter is a fast switch into an existing pane; `Some(false)`
-    /// means it'll fall through to `claude --resume` (spinning up a
-    /// fresh tmux + claude — slower). `None` means the pane poller
+    /// means it'll fall through to the agent's resume command (spinning
+    /// up a fresh tmux + agent — slower). `None` means the pane poller
     /// hasn't yet reported for this host (initial state).
     ///
     /// Deliberately *not* serialized into the disk cache: tmux state

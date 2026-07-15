@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 use ratatui::style::Color;
 use serde::Deserialize;
 
+use crate::agent::{AgentKind, agent};
+
+/// Every [`AgentKind`] in registry order. The set of agents is closed per
+/// release, so a fixed array keeps `[agents]` iteration deterministic
+/// without leaning on an ordering trait.
+const ALL_AGENTS: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi];
+
 /// Reserved host name standing for the local machine. May not be used as a
 /// `[hosts.<name>]` key — the local host is implicit, not configured.
 pub const LOCAL_HOST_NAME: &str = "local";
@@ -66,6 +73,12 @@ pub enum ConfigError {
     /// doesn't expand tildes, so a loud rejection at load time beats a
     /// silent failure at the first notification.
     TildeInSoundFile(PathBuf),
+    /// An `[agents.<label>]` (or `[hosts.<name>.agents.<label>]`) table
+    /// used a label that isn't a recognised agent. Rejected at load with
+    /// the valid set, same discipline as the reserved `local` host name —
+    /// a typo'd agent key silently doing nothing would be worse than a
+    /// loud stop.
+    UnknownAgentLabel(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -130,6 +143,17 @@ impl std::fmt::Display for ConfigError {
                     p.display()
                 )
             }
+            Self::UnknownAgentLabel(label) => {
+                write!(
+                    f,
+                    "agent {label:?} is not a recognised agent (valid: {})",
+                    ALL_AGENTS
+                        .iter()
+                        .map(|k| k.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         }
     }
 }
@@ -155,6 +179,47 @@ pub struct HostConfig {
     /// same convention as [`HostConfig::transcript_root`].
     #[serde(default)]
     pub workspace_folders: Option<Vec<PathBuf>>,
+    /// Per-host, per-agent overrides (`[hosts.<name>.agents.<label>]`).
+    /// Today the only field is `transcript_root`, which sits at the top
+    /// of the precedence chain (see [`Config::transcript_root_for`]). An
+    /// unrecognised `<label>` is rejected at load like an unknown global
+    /// agent. Tildes are kept unexpanded — the remote shell resolves them.
+    #[serde(default)]
+    pub agents: BTreeMap<String, HostAgentConfig>,
+}
+
+/// Per-host, per-agent override table (`[hosts.<name>.agents.<label>]`).
+/// Only `transcript_root` today; kept as its own struct so the schema can
+/// grow (per-host `binary`, `enabled`) without reshaping call sites.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HostAgentConfig {
+    /// Overrides where this agent's transcripts live *on this host*. Wins
+    /// over the legacy per-host `transcript_root`, the global
+    /// `[agents.<label>]` entry, and the agent default. Tilde stays
+    /// unexpanded so the remote shell resolves it against the remote home.
+    pub transcript_root: Option<PathBuf>,
+}
+
+/// Global per-agent configuration (`[agents.<label>]`). Absent table (and
+/// absent fields) means "every agent at its built-in defaults", which is
+/// byte-identical to pre-multi-agent behaviour: Claude enabled, everything
+/// else off.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Whether this agent participates in discovery/watch. `None` (unset)
+    /// falls back to the per-agent default — Claude on, others off — so a
+    /// bare `[agents.codex]` table with no `enabled` key does *not*
+    /// silently turn codex on.
+    pub enabled: Option<bool>,
+    /// PATH override for the agent binary, consumed by the spawn/resume
+    /// paths (WP5/WP6). `None` uses the agent's default binary name.
+    pub binary: Option<String>,
+    /// Overrides the agent's default transcript root globally (all hosts
+    /// that don't set a per-host override). Tilde is expanded for the
+    /// local host and passed through for remote hosts.
+    pub transcript_root: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -194,6 +259,11 @@ pub struct Config {
     /// Sidebar presentation knobs (`[ui]`).
     #[serde(default)]
     pub ui: UiConfig,
+    /// Per-agent configuration (`[agents.<label>]`). Absent → every agent
+    /// at its default: Claude enabled, Codex/Pi off. Unrecognised labels
+    /// are rejected at load.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
 }
 
 /// `[ui]` section — sidebar presentation tuning.
@@ -808,9 +878,22 @@ impl Config {
             if host.ssh.trim().is_empty() {
                 return Err(ConfigError::EmptySshTarget(name.clone()));
             }
+            // Reject a typo'd per-host agent label loudly (same discipline
+            // as the reserved `local` host name) rather than silently
+            // ignoring the override.
+            for label in host.agents.keys() {
+                if AgentKind::from_label(label).is_none() {
+                    return Err(ConfigError::UnknownAgentLabel(label.clone()));
+                }
+            }
             // No tilde expansion here: a remote host's `~/.claude/projects`
             // means the *remote* user's home, not ours. `SshHost` passes
             // the tilde through to the remote shell via `shell_quote_path`.
+        }
+        for label in cfg.agents.keys() {
+            if AgentKind::from_label(label).is_none() {
+                return Err(ConfigError::UnknownAgentLabel(label.clone()));
+            }
         }
         validate_tool_keys(&cfg.tools)?;
         if let Some(path) = &cfg.notifications.sound_file
@@ -820,6 +903,127 @@ impl Config {
         }
         Ok(cfg)
     }
+
+    /// Whether `kind` participates in discovery/watch. An explicit
+    /// `[agents.<label>] enabled = …` wins; otherwise the per-agent
+    /// default (Claude on, others off) applies. With no `[agents]` table
+    /// at all this resolves to "Claude only" — byte-identical to the
+    /// pre-multi-agent build.
+    #[must_use]
+    pub fn agent_enabled(&self, kind: AgentKind) -> bool {
+        self.agents
+            .get(kind.label())
+            .and_then(|a| a.enabled)
+            .unwrap_or_else(|| default_enabled(kind))
+    }
+
+    /// The enabled agents in registry order. The one place discovery and
+    /// the watcher ask "which agents do we look for?" — everything else
+    /// iterates this.
+    #[must_use]
+    pub fn enabled_agents(&self) -> Vec<AgentKind> {
+        ALL_AGENTS
+            .into_iter()
+            .filter(|k| self.agent_enabled(*k))
+            .collect()
+    }
+
+    /// PATH override for `kind`'s binary, if the user set one
+    /// (`[agents.<label>] binary = …`). `None` means "use the agent's
+    /// default binary name". Consumed by the spawn/resume paths (WP5/WP6).
+    #[must_use]
+    pub fn agent_binary(&self, kind: AgentKind) -> Option<&str> {
+        self.agents
+            .get(kind.label())
+            .and_then(|a| a.binary.as_deref())
+    }
+
+    /// Resolve the transcript root for `(host, kind)`. `host` is the
+    /// `[hosts.<name>]` entry for a remote host, or `None` for the local
+    /// (implicit) host.
+    ///
+    /// Precedence, highest first:
+    /// 1. explicit per-host `[hosts.<name>.agents.<label>] transcript_root`
+    /// 2. the legacy per-host `transcript_root` key — a backward-compatible
+    ///    alias for the **claude** entry (it always resolves, since its
+    ///    serde default is the claude root, so for a configured host's
+    ///    claude root levels 3–4 never apply — matching pre-WP2 behaviour)
+    /// 3. global `[agents.<label>] transcript_root`
+    /// 4. the agent default
+    ///
+    /// Tildes are returned unexpanded: the local call site expands via
+    /// [`expand_tilde`], the remote call site passes them to the remote
+    /// shell. The agent default is home-relative (`~/…`) for a remote host
+    /// so the *remote* user's home resolves it, and already-expanded for
+    /// the local host.
+    #[must_use]
+    pub fn transcript_root_for(
+        &self,
+        host: Option<&HostConfig>,
+        kind: AgentKind,
+    ) -> Option<PathBuf> {
+        if let Some(hc) = host {
+            if let Some(root) = hc
+                .agents
+                .get(kind.label())
+                .and_then(|a| a.transcript_root.clone())
+            {
+                return Some(root);
+            }
+            if kind == AgentKind::Claude {
+                return Some(hc.transcript_root.clone());
+            }
+        }
+        if let Some(root) = self
+            .agents
+            .get(kind.label())
+            .and_then(|a| a.transcript_root.clone())
+        {
+            return Some(root);
+        }
+        match host {
+            Some(_) => home_relative_default_root(kind),
+            None => agent(kind).default_transcript_root(),
+        }
+    }
+}
+
+/// Default-enabled state for an agent lacking an explicit `enabled`.
+/// Claude — the reference agent — is on so a zero-config install behaves
+/// exactly as before; every other agent is opt-in.
+fn default_enabled(kind: AgentKind) -> bool {
+    matches!(kind, AgentKind::Claude)
+}
+
+/// The agent's default transcript root re-homed to `~/…` so the *remote*
+/// shell expands it against the remote user's home. `agent().default_transcript_root()`
+/// is already expanded against the *local* home, which would be wrong to
+/// ship to a remote host (the bug the top-level `workspace_folders` tilde
+/// rule also guards against). Yields `~/.claude/projects` for claude —
+/// exactly the legacy per-host `transcript_root` default.
+fn home_relative_default_root(kind: AgentKind) -> Option<PathBuf> {
+    let full = agent(kind).default_transcript_root()?;
+    let home = dirs::home_dir()?;
+    let suffix = full.strip_prefix(&home).ok()?;
+    Some(Path::new("~").join(suffix))
+}
+
+/// Expand a leading `~` / `~/` against the local user's home. Used for the
+/// local host's transcript roots, where a global `[agents.<label>] transcript_root`
+/// may carry a tilde that no remote shell will resolve. Non-tilde paths
+/// (and the case where no home resolves) pass through unchanged.
+#[must_use]
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    path.to_path_buf()
 }
 
 /// Cross-entry validation: every tool must have a unique key, must
@@ -1105,6 +1309,7 @@ workspace_folders = ["~/workspace", "~/src"]
             ssh: "gizmo".into(),
             transcript_root: PathBuf::from("~/.claude/projects"),
             workspace_folders: None,
+            agents: BTreeMap::new(),
         };
         let top_level = vec![PathBuf::from("/work"), PathBuf::from("/src")];
         let effective = host.effective_workspace_folders(&top_level);
@@ -1120,6 +1325,7 @@ workspace_folders = ["~/workspace", "~/src"]
             ssh: "gizmo".into(),
             transcript_root: PathBuf::from("~/.claude/projects"),
             workspace_folders: Some(vec![PathBuf::from("~/scratch")]),
+            agents: BTreeMap::new(),
         };
         let top_level = vec![PathBuf::from("/work")];
         let effective = host.effective_workspace_folders(&top_level);
@@ -2089,5 +2295,200 @@ command = ["zsh"]
             command: vec!["lazygit".into(), "{cwd}".into()],
         };
         assert!(!plain.is_file_scoped());
+    }
+
+    // ---- [agents] schema ----
+
+    #[test]
+    fn no_agents_table_resolves_to_claude_only() {
+        // The load-bearing byte-identical guarantee: with no `[agents]`
+        // table, the only enabled agent is Claude — exactly the
+        // pre-multi-agent behaviour.
+        let cfg = Config::default();
+        assert_eq!(cfg.enabled_agents(), vec![AgentKind::Claude]);
+        assert!(cfg.agent_enabled(AgentKind::Claude));
+        assert!(!cfg.agent_enabled(AgentKind::Codex));
+        assert!(!cfg.agent_enabled(AgentKind::Pi));
+    }
+
+    #[test]
+    fn load_from_enables_codex_when_configured() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[agents.codex]\nenabled = true\n").expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert_eq!(
+            cfg.enabled_agents(),
+            vec![AgentKind::Claude, AgentKind::Codex]
+        );
+    }
+
+    #[test]
+    fn load_from_can_disable_claude_explicitly() {
+        // `enabled = false` on claude overrides its on-by-default.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[agents.claude]\nenabled = false\n").expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert!(!cfg.agent_enabled(AgentKind::Claude));
+        assert!(cfg.enabled_agents().is_empty());
+    }
+
+    #[test]
+    fn bare_agent_table_without_enabled_keeps_the_default() {
+        // A `[agents.codex]` table that sets only `binary` must NOT turn
+        // codex on — `enabled` unset falls back to the per-agent default.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[agents.codex]\nbinary = \"codex-nightly\"\n").expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        assert!(!cfg.agent_enabled(AgentKind::Codex));
+        assert_eq!(cfg.agent_binary(AgentKind::Codex), Some("codex-nightly"));
+    }
+
+    #[test]
+    fn load_from_rejects_unknown_agent_label() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[agents.aider]\nenabled = true\n").expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::UnknownAgentLabel(ref l) if l == "aider"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_rejects_unknown_per_host_agent_label() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[hosts.devbox]\nssh = \"devbox\"\n\n[hosts.devbox.agents.cursor]\ntranscript_root = \"/x\"\n",
+        )
+        .expect("write");
+        let err = Config::load_from(&path).expect_err("should reject");
+        assert!(
+            matches!(err, ConfigError::UnknownAgentLabel(ref l) if l == "cursor"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_per_host_transcript_root_aliases_the_claude_entry() {
+        // The backward-compat contract: an old config that set only the
+        // per-host `transcript_root` keeps mapping that path to claude.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[hosts.gpu]\nssh = \"gpu\"\ntranscript_root = \"/srv/claude/projects\"\n",
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let host = cfg.hosts.get("gpu").expect("gpu host");
+        assert_eq!(
+            cfg.transcript_root_for(Some(host), AgentKind::Claude),
+            Some(PathBuf::from("/srv/claude/projects"))
+        );
+    }
+
+    #[test]
+    fn transcript_root_precedence_per_host_over_legacy_over_global_over_default() {
+        // Full precedence ladder for claude on a host: explicit per-host
+        // agents table beats the legacy per-host key; a host without the
+        // agents override falls to the legacy key; a codex root (no legacy
+        // alias) falls through legacy to global then default.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[agents.claude]
+transcript_root = "/global/claude"
+
+[agents.codex]
+enabled = true
+transcript_root = "/global/codex"
+
+[hosts.a]
+ssh = "a"
+transcript_root = "/legacy/a/claude"
+
+[hosts.a.agents.claude]
+transcript_root = "/explicit/a/claude"
+
+[hosts.b]
+ssh = "b"
+transcript_root = "/legacy/b/claude"
+"#,
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let a = cfg.hosts.get("a").expect("host a");
+        let b = cfg.hosts.get("b").expect("host b");
+
+        // 1. explicit per-host agents table wins for claude on host a.
+        assert_eq!(
+            cfg.transcript_root_for(Some(a), AgentKind::Claude),
+            Some(PathBuf::from("/explicit/a/claude"))
+        );
+        // 2. legacy per-host key wins over global for claude on host b.
+        assert_eq!(
+            cfg.transcript_root_for(Some(b), AgentKind::Claude),
+            Some(PathBuf::from("/legacy/b/claude"))
+        );
+        // 3. codex has no legacy alias, so global applies on host b.
+        assert_eq!(
+            cfg.transcript_root_for(Some(b), AgentKind::Codex),
+            Some(PathBuf::from("/global/codex"))
+        );
+        // 4. local host (no HostConfig): global applies for claude.
+        assert_eq!(
+            cfg.transcript_root_for(None, AgentKind::Claude),
+            Some(PathBuf::from("/global/claude"))
+        );
+    }
+
+    #[test]
+    fn transcript_root_remote_default_is_home_relative() {
+        // A remote codex root with nothing configured must be the
+        // home-relative `~/.codex/sessions` so the *remote* shell expands
+        // it — never the local expanded path (that would ship the local
+        // home to the remote box).
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[agents.codex]\nenabled = true\n\n[hosts.dev]\nssh = \"dev\"\n",
+        )
+        .expect("write");
+        let cfg = Config::load_from(&path).expect("parse");
+        let host = cfg.hosts.get("dev").expect("dev host");
+        assert_eq!(
+            cfg.transcript_root_for(Some(host), AgentKind::Codex),
+            Some(PathBuf::from("~/.codex/sessions"))
+        );
+        // Claude's remote default matches the legacy per-host default.
+        assert_eq!(
+            cfg.transcript_root_for(Some(host), AgentKind::Claude),
+            Some(PathBuf::from("~/.claude/projects"))
+        );
+    }
+
+    #[test]
+    fn expand_tilde_resolves_against_home() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                expand_tilde(Path::new("~/.codex/sessions")),
+                home.join(".codex/sessions")
+            );
+            assert_eq!(expand_tilde(Path::new("~")), home);
+        }
+        // Absolute and relative non-tilde paths pass through untouched.
+        assert_eq!(
+            expand_tilde(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
     }
 }

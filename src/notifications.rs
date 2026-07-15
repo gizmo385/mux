@@ -636,7 +636,7 @@ impl Notifier {
         // pre-dates this `Notifier` is a replay of something that
         // happened while agent-mux wasn't running (canonical case:
         // the hook-marker startup sweep draining files written by
-        // claude before launch). The catalog state was already
+        // the agent before launch). The catalog state was already
         // applied upstream so the row paints `NeedsInput` from frame
         // one; only the toast is suppressed. Deliberately placed
         // before the `enabled`/`disabled_hosts` and `actively_viewed`

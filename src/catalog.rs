@@ -73,7 +73,7 @@ impl SessionCatalog {
     ///
     /// `from_tool_use` is `true` when the heuristic derived `Working`
     /// from a bare assistant `tool_use` last-entry (see
-    /// [`crate::watcher::AttentionDerivation`]). That entry is the
+    /// [`crate::agent::AgentDerivation`]). That entry is the
     /// transcript *signature* of the very prompt a hook pins as
     /// "blocked" — the assistant paused mid-tool to ask — so it is not
     /// evidence the conversation progressed past the prompt, even though
@@ -262,8 +262,8 @@ impl SessionCatalog {
     /// Sessions on other hosts are untouched. A pane poller failure
     /// (no tmux, ssh hiccup) surfaces as empty sets — every session
     /// on that host transitions to `Some(false)`, matching the
-    /// user-visible reality (Enter will fall through to `claude
-    /// --resume`).
+    /// user-visible reality (Enter will fall through to the agent's
+    /// resume command).
     pub fn apply_live_panes(
         &mut self,
         host_id: &HostId,
@@ -337,6 +337,7 @@ mod tests {
         Session {
             id: SessionId(id.to_string()),
             host,
+            agent: crate::agent::AgentKind::Claude,
             project_dir: PathBuf::from("/proj"),
             transcript_path: PathBuf::from(format!("/transcripts/{id}.jsonl")),
             last_activity: SystemTime::UNIX_EPOCH,
@@ -800,6 +801,55 @@ mod tests {
         assert_eq!(s.attention, Attention::Working);
         assert!(!s.blocking_prompt, "answered prompt clears the flag");
         assert!(s.hook_pinned.is_none(), "pin releases on real progress");
+    }
+
+    #[test]
+    fn codex_permission_pin_survives_open_turn_and_clears_on_turn_complete() {
+        // WP8 codex parity, mirroring the two claude clobber tests above.
+        // Codex's rollout can't distinguish an open turn "working" from a
+        // blocked approval, so its WP3 derive reports `from_tool_use = true`
+        // for an open `turn_started` (see `agents/codex.rs`) — the semantic
+        // twin of claude's `tool_use` wait. That is what lets a codex
+        // `PermissionRequest` hook pin survive the open-turn polls that keep
+        // arriving while the user hasn't answered yet.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        // PermissionRequest hook fires → blocked pin at T=10.
+        c.apply_hook_event(&SessionId("a".into()), true, at(10));
+        // A poll during the still-open approval derives Working from the
+        // open turn (`from_tool_use = true`), mtime racing past the pin.
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            Some(at(15)),
+            true,
+        );
+        assert_eq!(
+            prev, None,
+            "open-turn Working during the approval is suppressed"
+        );
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::NeedsInput, "stays blocked");
+        assert!(
+            s.blocking_prompt,
+            "blocking flag survives the open-turn poll"
+        );
+        assert_eq!(s.hook_pinned, Some(at(10)), "pin survives");
+        // The turn completes → NeedsInput, `from_tool_use = false`, newer
+        // mtime — genuine progress past the prompt releases the pin + flag.
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::NeedsInput,
+            Some(at(20)),
+            false,
+        );
+        assert_eq!(prev, Some(Attention::NeedsInput));
+        let s = &c.sessions()[0];
+        assert!(
+            !s.blocking_prompt,
+            "turn_complete clears the answered prompt"
+        );
+        assert!(s.hook_pinned.is_none(), "pin releases on turn_complete");
     }
 
     #[test]

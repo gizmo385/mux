@@ -1,6 +1,18 @@
 # Plan: supporting other agent CLIs (Codex, Pi, …)
 
-Status: **accepted 2026-07-09** — user approved execution of all work packages in sequence on the `multi-agent-cli` branch.
+Status: **executed 2026-07-10** — WP0–WP9 complete on the `multi-agent-cli` branch (accepted 2026-07-09). Live-binary verification of Codex + Pi is deferred (no `codex`/`pi` on the build box; all Codex/Pi paths are synthetic-fixture-tested — see TODO.md "Other agent CLIs"). Per-WP commits:
+
+- WP0 (spec amendment + scope decision) — `8346fd7`
+- WP1 (`AgentCli` trait + Claude extraction, pure refactor) — `e7d3969`
+- WP2 (`[agents]` config + multi-root discovery/watch plumbing) — `47c2572`
+- WP3 (Codex read path — discovery + rollout parser) — `dac4cc9`
+- WP4 (Pi read path — discovery + session parser) — `4370b23`
+- WP5 (Codex spawn via post-launch adoption + resume) — `2d7f51b`
+- WP6 (Pi spawn/resume via pinned session id) — `f190f6c`
+- WP7 (UI: agent tag on rows + new-session agent picker) — `9ed137d`
+- WP8 (Codex hook parity — `PermissionRequest`/`Stop` ingest + installer) — `97d0141`
+- WP9 (docs/ledger close-out) — this commit.
+
 Date: 2026-07-09.
 Origin: user request to investigate what supporting non-Claude agent CLIs would look like, with OpenAI Codex CLI and Pi as the concrete first targets. Backed by a codebase coupling survey and per-agent research briefs (Appendices A–C). Codified in `TODO.md` under "Other agent CLIs".
 

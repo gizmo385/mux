@@ -6,6 +6,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::agent::ListingSpec;
 use crate::session::HostId;
 
 /// One entry returned by [`Host::list_transcripts`]: an absolute transcript
@@ -28,15 +29,21 @@ pub trait Host: Send + Sync {
     /// implicit host).
     fn id(&self) -> &HostId;
 
-    /// Two-level walk under `root` (matches Claude Code's layout:
-    /// `root/<project-hash>/<session-id>.jsonl`). Returns absolute paths
-    /// and mtimes for every `.jsonl` discovered. A missing `root` is not
-    /// an error — returns an empty `Vec` so callers don't have to special-
-    /// case first-run.
+    /// Walk under `root` according to the agent's [`ListingSpec`] —
+    /// files whose depth below `root` falls in `[mindepth, maxdepth]` and
+    /// whose name matches `name_glob`. Claude's spec (`{2, 2, "*.jsonl"}`)
+    /// reproduces the pre-trait depth-2 `.jsonl` walk exactly. Returns
+    /// absolute paths and mtimes. A missing `root` is not an error —
+    /// returns an empty `Vec` so callers don't have to special-case
+    /// first-run.
+    ///
+    /// The `Host` *executes* the listing (local `read_dir`, remote
+    /// `find`); the layout knowledge lives in the agent, keeping SSH
+    /// mechanics here and transcript-tree shape behind `AgentCli`.
     ///
     /// # Errors
     /// Propagates any I/O error other than `NotFound` on `root`.
-    fn list_transcripts(&self, root: &Path) -> io::Result<Vec<TranscriptStat>>;
+    fn list_transcripts(&self, root: &Path, spec: &ListingSpec) -> io::Result<Vec<TranscriptStat>>;
 
     /// Read the whole file as UTF-8. Intended for small files (transcript
     /// metadata extraction, `.agent-mux/task.toml`); use [`Host::read_tail`]
@@ -238,29 +245,18 @@ impl Host for LocalHost {
         &self.id
     }
 
-    fn list_transcripts(&self, root: &Path) -> io::Result<Vec<TranscriptStat>> {
+    fn list_transcripts(&self, root: &Path, spec: &ListingSpec) -> io::Result<Vec<TranscriptStat>> {
         let mut out = Vec::new();
+        // Missing root is folded into "no sessions" here (the trait
+        // contract); a subdirectory that vanishes mid-walk still
+        // propagates, matching the pre-trait two-`read_dir` shape.
         let entries = match fs::read_dir(root) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e),
         };
-        for project_dir in entries {
-            let project_dir = project_dir?;
-            if !project_dir.file_type()?.is_dir() {
-                continue;
-            }
-            for jsonl in fs::read_dir(project_dir.path())? {
-                let jsonl = jsonl?;
-                let path = jsonl.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let meta = fs::metadata(&path)?;
-                let mtime = meta.modified()?;
-                out.push(TranscriptStat { path, mtime });
-            }
-        }
+        // Root children are depth 1.
+        collect_listing(entries, 1, spec, &mut out)?;
         Ok(out)
     }
 
@@ -621,17 +617,26 @@ impl Host for SshHost {
         &self.id
     }
 
-    fn list_transcripts(&self, root: &Path) -> io::Result<Vec<TranscriptStat>> {
+    fn list_transcripts(&self, root: &Path, spec: &ListingSpec) -> io::Result<Vec<TranscriptStat>> {
         // `if [ -d ROOT ]` folds the missing-root case into "exit 0,
         // empty stdout" so the trait's "missing root is not an error"
         // contract holds without parsing exit codes. `find -printf` is a
         // GNU extension; macOS hosts need `findutils` from Homebrew. We
         // assume Linux remotes for now — a portability item is filed in
         // TODO if a macOS remote ever surfaces.
+        //
+        // The depth bounds and name glob come from the agent's
+        // `ListingSpec`; for Claude's `{2, 2, "*.jsonl"}` this string is
+        // byte-identical to the pre-trait hardcoded `find`.
         let quoted = shell_quote_path(&root.to_string_lossy());
+        let ListingSpec {
+            mindepth,
+            maxdepth,
+            name_glob,
+        } = *spec;
         let cmd = format!(
             "if [ -d {quoted} ]; then \
-                find {quoted} -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
+                find {quoted} -mindepth {mindepth} -maxdepth {maxdepth} -type f -name '{name_glob}' \
                     -printf '%T@ %p\\0' 2>/dev/null; \
              fi"
         );
@@ -916,8 +921,8 @@ impl Host for SshHost {
 /// tilde expansion. POSIX shells expand a *leading* `~` only when it
 /// is unquoted; once we wrap it in single quotes, `'~/foo'` becomes a
 /// literal path with a tilde character. For remote-host paths
-/// (`transcript_root` defaults to `~/.claude/projects`, meaning the
-/// remote user's home), we want the remote shell to do the expansion.
+/// (a `transcript_root` under the remote user's home, e.g. a `~/`-rooted
+/// default), we want the remote shell to do the expansion.
 /// Strategy: leave a leading `~/` (or bare `~`) unquoted; single-quote
 /// the rest. Paths without a leading tilde fall through to the
 /// standard single-quote escape.
@@ -1023,6 +1028,75 @@ fn parse_read_many_output(bytes: &[u8], expected: usize) -> io::Result<Vec<io::R
     Ok(out)
 }
 
+/// Recursive local listing honouring a [`ListingSpec`]: walk `entries`
+/// (already at `depth` below the root — root children are depth 1),
+/// collecting regular files whose depth is in `[mindepth, maxdepth]` and
+/// whose name matches `name_glob`, and recursing into subdirectories only
+/// while `depth < maxdepth` (so the walk never descends past the deepest
+/// interesting level — e.g. Claude's subagent dirs at depth 2 with
+/// `maxdepth == 2` are never entered).
+fn collect_listing(
+    entries: fs::ReadDir,
+    depth: usize,
+    spec: &ListingSpec,
+    out: &mut Vec<TranscriptStat>,
+) -> io::Result<()> {
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if depth < spec.maxdepth {
+                collect_listing(fs::read_dir(&path)?, depth + 1, spec, out)?;
+            }
+        } else if file_type.is_file()
+            && depth >= spec.mindepth
+            && depth <= spec.maxdepth
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && glob_match(spec.name_glob, name)
+        {
+            let mtime = fs::metadata(&path)?.modified()?;
+            out.push(TranscriptStat { path, mtime });
+        }
+    }
+    Ok(())
+}
+
+/// Match `name` against a shell-style wildcard `pattern`. Only `*`
+/// (matches any run, including empty) is supported — the agent listing
+/// globs use nothing else (`"*.jsonl"`, `"rollout-*.jsonl"`). Standard
+/// two-pointer backtracking matcher.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = name.chars().collect();
+    let (mut p, mut t) = (0usize, 0usize);
+    // Position of the last `*` in the pattern and the text index we'll
+    // advance it against on a mismatch.
+    let mut star: Option<usize> = None;
+    let mut star_text = 0usize;
+    while t < text.len() {
+        if p < pat.len() && pat[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == '*' {
+            star = Some(p);
+            star_text = t;
+            p += 1;
+        } else if let Some(sp) = star {
+            // Backtrack: let the last `*` swallow one more text char.
+            p = sp + 1;
+            star_text += 1;
+            t = star_text;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
 /// Parse the NUL-delimited output of `find -printf '%T@ %p\0'` into
 /// [`TranscriptStat`] entries. NUL termination is what lets paths
 /// containing whitespace round-trip correctly.
@@ -1079,6 +1153,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Claude's transcript-tree shape: files exactly two levels below the
+    /// root. Inlined here (rather than pulled from the agent registry) so
+    /// the host tests pin the depth-2 `.jsonl` walk independently of any
+    /// agent wiring.
+    const DEPTH2_JSONL: ListingSpec = ListingSpec {
+        mindepth: 2,
+        maxdepth: 2,
+        name_glob: "*.jsonl",
+    };
+
     fn write_file(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("mkdir parent");
@@ -1097,7 +1181,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let host = LocalHost::new();
         let stats = host
-            .list_transcripts(&tmp.path().join("nope"))
+            .list_transcripts(&tmp.path().join("nope"), &DEPTH2_JSONL)
             .expect("missing root is ok");
         assert!(stats.is_empty());
     }
@@ -1111,7 +1195,7 @@ mod tests {
         write_file(&root.join("proj-b").join("s3.jsonl"), "{}\n");
 
         let host = LocalHost::new();
-        let mut stats = host.list_transcripts(&root).expect("list");
+        let mut stats = host.list_transcripts(&root, &DEPTH2_JSONL).expect("list");
         stats.sort_by(|a, b| a.path.cmp(&b.path));
         let names: Vec<_> = stats
             .iter()
@@ -1130,9 +1214,47 @@ mod tests {
         write_file(&root.join("README.md"), "ignore"); // top-level file: not a project dir
 
         let host = LocalHost::new();
-        let stats = host.list_transcripts(&root).expect("list");
+        let stats = host.list_transcripts(&root, &DEPTH2_JSONL).expect("list");
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].path.file_name().unwrap(), "s1.jsonl");
+    }
+
+    #[test]
+    fn list_transcripts_honours_deeper_spec_and_name_glob() {
+        // The listing walk generalises past Claude's depth-2 shape: a
+        // deeper spec with a prefixed glob (the codex/pi direction) must
+        // reach files at the right depth and match the glob, while files
+        // at the wrong depth or with the wrong name are skipped.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().join("sessions");
+        // Depth-3 match.
+        write_file(
+            &root.join("2026").join("07").join("rollout-a.jsonl"),
+            "{}\n",
+        );
+        // Depth-3, wrong name (glob mismatch).
+        write_file(&root.join("2026").join("07").join("notes.jsonl"), "x");
+        // Depth-2, right name but too shallow for mindepth 3.
+        write_file(&root.join("2026").join("rollout-shallow.jsonl"), "x");
+
+        let spec = ListingSpec {
+            mindepth: 3,
+            maxdepth: 3,
+            name_glob: "rollout-*.jsonl",
+        };
+        let host = LocalHost::new();
+        let stats = host.list_transcripts(&root, &spec).expect("list");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].path.file_name().unwrap(), "rollout-a.jsonl");
+    }
+
+    #[test]
+    fn glob_match_supports_star_wildcard() {
+        assert!(glob_match("*.jsonl", "abc.jsonl"));
+        assert!(glob_match("rollout-*.jsonl", "rollout-2026-07-x.jsonl"));
+        assert!(!glob_match("rollout-*.jsonl", "other.jsonl"));
+        assert!(!glob_match("*.jsonl", "notes.txt"));
+        assert!(glob_match("*", "anything"));
     }
 
     #[test]

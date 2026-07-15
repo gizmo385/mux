@@ -125,10 +125,90 @@ pub fn plan_install(current: &str, binary_path: &Path) -> Result<InstallPlan, In
     let hooks_obj = ensure_object(root_obj, "hooks")?;
     let notification_arr = ensure_array(hooks_obj, "Notification")?;
 
-    // Search the existing entries for ours.
-    let mut action = InstallAction::Added;
-    let mut handled = false;
-    for matcher_entry in notification_arr.iter_mut() {
+    // Claude wires the hook under the single `Notification` event with a
+    // `.*` matcher; codex ([`plan_install_codex`]) reuses the same merge
+    // helper across two matcher-less event arrays.
+    let action = merge_command_into_array(notification_arr, &desired_command, Some(".*"));
+
+    let new_content = serde_json::to_string_pretty(&root).map_err(InstallError::Parse)? + "\n";
+    Ok(InstallPlan {
+        new_content,
+        action,
+    })
+}
+
+/// Codex hooks-file variant of [`plan_install`]. Writes `type:"command"`
+/// handlers for the two lifecycle events agent-mux cares about —
+/// `PermissionRequest` (needs-approval → blocking marker) and `Stop`
+/// (turn complete → non-blocking marker) — each invoking
+/// `<binary> hook --agent codex`.
+///
+/// ## hooks.json schema assumption (BEST-EFFORT)
+///
+/// Codex configures lifecycle hooks in `~/.codex/hooks.json`
+/// (Appendix A §5 of `docs/plans/2026-07-09-multi-agent-cli.md`,
+/// researched 2026-07-09 — no `codex` on the build box to verify against).
+/// The exact top-level key layout is **not independently confirmed**; we
+/// mirror Claude Code's proven shape (Codex's hooks mechanism was modelled
+/// on it): a top-level `"hooks"` object keyed by event name, each value an
+/// array of `{ "hooks": [ { "type": "command", "command": … } ] }`
+/// entries. If upstream turns out to use a different layout, the fix is
+/// localised to this one function plus [`merge_command_into_array`]'s
+/// appended-entry shape — everything else (recognition, idempotency,
+/// merge, dry-run, the I/O wrapper) is schema-agnostic.
+///
+/// # Errors
+///
+/// Same as [`plan_install`]: [`InstallError::Parse`] on malformed JSON,
+/// [`InstallError::NotJsonObject`] on a non-object root,
+/// [`InstallError::SchemaMismatch`] if `hooks` or an event value has an
+/// unexpected shape.
+pub fn plan_install_codex(current: &str, binary_path: &Path) -> Result<InstallPlan, InstallError> {
+    let desired_command = format!("{} hook --agent codex", binary_path.display());
+    let mut root: Value = if current.trim().is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(current).map_err(InstallError::Parse)?
+    };
+    let root_obj = root.as_object_mut().ok_or(InstallError::NotJsonObject)?;
+    let hooks_obj = ensure_object(root_obj, "hooks")?;
+
+    // Aggregate across both event arrays: any stale update wins (carries
+    // its previous command for the notice), else any fresh append, else a
+    // clean no-op when both handlers were already present.
+    let mut action = InstallAction::NoOp;
+    for event in CODEX_HOOK_EVENTS {
+        let arr = ensure_array(hooks_obj, event)?;
+        let this = merge_command_into_array(arr, &desired_command, None);
+        action = combine_actions(action, this);
+    }
+
+    let new_content = serde_json::to_string_pretty(&root).map_err(InstallError::Parse)? + "\n";
+    Ok(InstallPlan {
+        new_content,
+        action,
+    })
+}
+
+/// The codex lifecycle events agent-mux installs command handlers for.
+/// `PermissionRequest` is the needs-approval signal (→ blocking marker);
+/// `Stop` is turn-complete (→ non-blocking marker).
+const CODEX_HOOK_EVENTS: &[&str] = &["PermissionRequest", "Stop"];
+
+/// Merge `desired_command` into one hook-event array (claude's
+/// `Notification` array, or one of codex's event arrays), preserving every
+/// unrelated entry. Returns the action taken for *this* array:
+/// - an existing agent-mux entry with the exact command → [`InstallAction::NoOp`];
+/// - an existing agent-mux entry with a different (stale) path → updated
+///   in place, [`InstallAction::Updated`];
+/// - no agent-mux entry → a fresh one appended ([`InstallAction::Added`]),
+///   with a `matcher` field only when `matcher` is `Some`.
+fn merge_command_into_array(
+    arr: &mut Vec<Value>,
+    desired_command: &str,
+    matcher: Option<&str>,
+) -> InstallAction {
+    for matcher_entry in arr.iter_mut() {
         let Some(entry_obj) = matcher_entry.as_object_mut() else {
             continue;
         };
@@ -146,43 +226,48 @@ pub fn plan_install(current: &str, binary_path: &Path) -> Result<InstallPlan, In
                 continue;
             }
             if command_str == desired_command {
-                action = InstallAction::NoOp;
-            } else {
-                action = InstallAction::Updated {
-                    previous_command: command_str.to_string(),
-                };
-                inner_obj.insert("command".into(), Value::String(desired_command.clone()));
+                return InstallAction::NoOp;
             }
-            handled = true;
-            break;
-        }
-        if handled {
-            break;
+            let previous_command = command_str.to_string();
+            inner_obj.insert("command".into(), Value::String(desired_command.to_string()));
+            return InstallAction::Updated { previous_command };
         }
     }
 
-    if !handled {
-        notification_arr.push(json!({
-            "matcher": ".*",
-            "hooks": [
-                {"type": "command", "command": desired_command}
-            ]
-        }));
-    }
-
-    let new_content = serde_json::to_string_pretty(&root).map_err(InstallError::Parse)? + "\n";
-    Ok(InstallPlan {
-        new_content,
-        action,
-    })
+    let entry = match matcher {
+        Some(m) => json!({
+            "matcher": m,
+            "hooks": [{"type": "command", "command": desired_command}]
+        }),
+        None => json!({
+            "hooks": [{"type": "command", "command": desired_command}]
+        }),
+    };
+    arr.push(entry);
+    InstallAction::Added
 }
 
-/// `hooks.Notification` element-shape predicate. The command field is
-/// a free-form shell string; we identify our own entries by splitting
-/// on whitespace and checking that the first token's basename is
-/// `agent-mux` and the second is `hook`. That's deliberately
-/// conservative — it won't false-match a different hook command that
-/// happens to mention agent-mux in flags.
+/// Combine two per-array [`InstallAction`]s into the overall action for a
+/// multi-array install (codex). Precedence: a stale update > a fresh
+/// append > no-op — the first `Updated` keeps its `previous_command`.
+fn combine_actions(acc: InstallAction, next: InstallAction) -> InstallAction {
+    match (acc, next) {
+        (prev @ InstallAction::Updated { .. }, _) => prev,
+        (_, next @ InstallAction::Updated { .. }) => next,
+        (InstallAction::Added, _) | (_, InstallAction::Added) => InstallAction::Added,
+        (InstallAction::NoOp, InstallAction::NoOp) => InstallAction::NoOp,
+    }
+}
+
+/// Hook-command element-shape predicate. The command field is a
+/// free-form shell string; we identify our own entries by splitting on
+/// whitespace and checking that the first token's basename is
+/// `agent-mux` and the second is `hook`. That recognises every shape we
+/// write — claude's `<abs>/agent-mux hook` *and* codex's
+/// `<abs>/agent-mux hook --agent codex` (the trailing `--agent codex`
+/// doesn't change the first two tokens) — while staying conservative
+/// enough not to false-match a different command that merely mentions
+/// agent-mux in flags.
 #[must_use]
 fn is_agent_mux_hook_command(command: &str) -> bool {
     let mut parts = command.split_whitespace();
@@ -237,6 +322,16 @@ pub fn default_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Default codex hooks-file path (`~/.codex/hooks.json`) — the global
+/// user-scope file, mirroring the claude installer's user-scope choice
+/// (Appendix A §5). `$CODEX_HOME` relocation and the project-level
+/// `<repo>/.codex/hooks.json` are out of scope for the installer (as the
+/// project-scope claude install is).
+#[must_use]
+pub fn default_codex_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
+}
+
 /// CLI-facing wrapper: read the settings file, plan the install,
 /// optionally back up and write, then verify the post-write content
 /// still parses. `out` receives the user-facing summary lines.
@@ -255,20 +350,82 @@ pub fn install_hooks_at<W: Write>(
     dry_run: bool,
     out: &mut W,
 ) -> io::Result<()> {
-    let current = match fs::read_to_string(settings_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    let current = read_current(settings_path)?;
     let plan = plan_install(&current, binary_path).map_err(io::Error::other)?;
+    apply_install_plan(
+        settings_path,
+        binary_path,
+        &current,
+        &plan,
+        "Notification hook",
+        dry_run,
+        out,
+    )
+}
+
+/// Codex variant of [`install_hooks_at`]: merge the two lifecycle-hook
+/// command handlers into `~/.codex/hooks.json`. Shares the whole I/O
+/// wrapper (backup, atomic write, verify, dry-run) with the claude path —
+/// only the plan function and the user-facing hook label differ.
+///
+/// # Errors
+///
+/// Same as [`install_hooks_at`].
+pub fn install_codex_hooks_at<W: Write>(
+    hooks_path: &Path,
+    binary_path: &Path,
+    dry_run: bool,
+    out: &mut W,
+) -> io::Result<()> {
+    let current = read_current(hooks_path)?;
+    let plan = plan_install_codex(&current, binary_path).map_err(io::Error::other)?;
+    apply_install_plan(
+        hooks_path,
+        binary_path,
+        &current,
+        &plan,
+        "lifecycle hooks",
+        dry_run,
+        out,
+    )
+}
+
+/// Read the current hooks/settings file, treating a missing file as empty
+/// (the fresh-install case) and propagating any other I/O error.
+fn read_current(path: &Path) -> io::Result<String> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Shared I/O half of the installer, parameterised over the plan and the
+/// user-facing hook label (`what`). Prints the summary, short-circuits a
+/// no-op, honours `dry_run`, and otherwise backs up + atomically writes +
+/// verifies. Used by both [`install_hooks_at`] (claude) and
+/// [`install_codex_hooks_at`].
+fn apply_install_plan<W: Write>(
+    settings_path: &Path,
+    binary_path: &Path,
+    current: &str,
+    plan: &InstallPlan,
+    what: &str,
+    dry_run: bool,
+    out: &mut W,
+) -> io::Result<()> {
     writeln!(out, "Settings file: {}", settings_path.display())?;
     writeln!(out, "agent-mux binary: {}", binary_path.display())?;
-    writeln!(out, "Action: {}", describe_action(&plan.action))?;
+    writeln!(out, "Action: {}", describe_action(&plan.action, what))?;
     if matches!(plan.action, InstallAction::NoOp) {
         return Ok(());
     }
     if dry_run {
-        writeln!(out, "\n--- dry run: planned settings.json ---")?;
+        writeln!(
+            out,
+            "\n--- dry run: planned {} ---",
+            file_label(settings_path)
+        )?;
         out.write_all(plan.new_content.as_bytes())?;
         return Ok(());
     }
@@ -283,7 +440,7 @@ pub fn install_hooks_at<W: Write>(
     if !current.is_empty() {
         let backup_path = backup_path_for(settings_path);
         if !backup_path.exists() {
-            fs::write(&backup_path, &current)?;
+            fs::write(&backup_path, current)?;
             writeln!(out, "Backup written: {}", backup_path.display())?;
         }
     }
@@ -305,6 +462,15 @@ pub fn install_hooks_at<W: Write>(
     Ok(())
 }
 
+/// The file's basename for user-facing messages (`settings.json` /
+/// `hooks.json`), falling back to the full path when it has no filename.
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// Where to put the one-time backup of the existing settings.json.
 /// Sibling to the file with a `.bak` suffix added; if the user
 /// already has a `.bak` from a previous install, we leave it alone
@@ -316,20 +482,20 @@ fn backup_path_for(settings_path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
-/// One-line user-facing summary of the action [`plan_install`]
-/// chose. Routed through this helper (rather than inlined in
-/// [`install_hooks_at`]) so the tests can spot-check the text
-/// without going through the full CLI wrapper.
+/// One-line user-facing summary of the action a plan function chose.
+/// `what` names the hook kind (`"Notification hook"` for claude,
+/// `"lifecycle hooks"` for codex). Routed through this helper (rather than
+/// inlined in the installer) so the tests can spot-check the text without
+/// going through the full CLI wrapper.
 #[must_use]
-pub fn describe_action(action: &InstallAction) -> String {
+pub fn describe_action(action: &InstallAction, what: &str) -> String {
     match action {
         InstallAction::NoOp => {
-            "no change \u{2014} agent-mux Notification hook already configured at this path"
-                .to_string()
+            format!("no change \u{2014} agent-mux {what} already configured at this path")
         }
-        InstallAction::Added => "added agent-mux Notification hook entry".to_string(),
+        InstallAction::Added => format!("added agent-mux {what} entry"),
         InstallAction::Updated { previous_command } => {
-            format!("updated stale agent-mux Notification hook entry (was: {previous_command})")
+            format!("updated stale agent-mux {what} entry (was: {previous_command})")
         }
     }
 }
@@ -569,9 +735,170 @@ mod tests {
 
     #[test]
     fn describe_action_includes_previous_command_for_updated_variant() {
-        let s = describe_action(&InstallAction::Updated {
-            previous_command: "/old/agent-mux hook".to_string(),
-        });
+        let s = describe_action(
+            &InstallAction::Updated {
+                previous_command: "/old/agent-mux hook".to_string(),
+            },
+            "Notification hook",
+        );
         assert!(s.contains("/old/agent-mux hook"), "got: {s}");
+    }
+
+    // ---- codex installer (WP8) ----
+
+    #[test]
+    fn plan_install_codex_creates_both_event_handlers_when_empty() {
+        let plan = plan_install_codex("", &binary()).unwrap();
+        assert_eq!(plan.action, InstallAction::Added);
+        let value: Value = serde_json::from_str(&plan.new_content).unwrap();
+        for event in ["PermissionRequest", "Stop"] {
+            let cmd = value["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing command for {event}"));
+            assert_eq!(cmd, "/usr/local/bin/agent-mux hook --agent codex");
+        }
+    }
+
+    #[test]
+    fn plan_install_codex_is_noop_when_both_handlers_present() {
+        let input = r#"{
+  "hooks": {
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}]
+  }
+}"#;
+        let plan = plan_install_codex(input, &binary()).unwrap();
+        assert_eq!(plan.action, InstallAction::NoOp);
+    }
+
+    #[test]
+    fn plan_install_codex_updates_stale_path_in_place() {
+        let input = r#"{
+  "hooks": {
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/old/agent-mux hook --agent codex"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "/old/agent-mux hook --agent codex"}]}]
+  }
+}"#;
+        let plan = plan_install_codex(input, &binary()).unwrap();
+        match &plan.action {
+            InstallAction::Updated { previous_command } => {
+                assert_eq!(previous_command, "/old/agent-mux hook --agent codex");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        let value: Value = serde_json::from_str(&plan.new_content).unwrap();
+        for event in ["PermissionRequest", "Stop"] {
+            assert_eq!(
+                value["hooks"][event][0]["hooks"][0]["command"],
+                "/usr/local/bin/agent-mux hook --agent codex",
+                "{event} stale entry replaced in place"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_install_codex_preserves_unrelated_hook_events() {
+        // A user's own SessionStart handler must survive untouched
+        // alongside the two we add.
+        let input = r#"{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "/other/tool"}]}]
+  }
+}"#;
+        let plan = plan_install_codex(input, &binary()).unwrap();
+        assert_eq!(plan.action, InstallAction::Added);
+        let value: Value = serde_json::from_str(&plan.new_content).unwrap();
+        assert_eq!(
+            value["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "/other/tool"
+        );
+        assert!(value["hooks"]["PermissionRequest"].is_array());
+        assert!(value["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn plan_install_codex_appends_alongside_a_foreign_permission_request_handler() {
+        let input = r#"{
+  "hooks": {
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/other/tool"}]}]
+  }
+}"#;
+        let plan = plan_install_codex(input, &binary()).unwrap();
+        assert_eq!(plan.action, InstallAction::Added);
+        let value: Value = serde_json::from_str(&plan.new_content).unwrap();
+        let arr = value["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "foreign handler preserved, ours appended");
+        assert_eq!(arr[0]["hooks"][0]["command"], "/other/tool");
+        assert_eq!(
+            arr[1]["hooks"][0]["command"],
+            "/usr/local/bin/agent-mux hook --agent codex"
+        );
+    }
+
+    #[test]
+    fn is_agent_mux_hook_command_matches_codex_variant() {
+        assert!(is_agent_mux_hook_command(
+            "/abs/agent-mux hook --agent codex"
+        ));
+        assert!(is_agent_mux_hook_command("agent-mux hook --agent codex"));
+    }
+
+    #[test]
+    fn install_codex_hooks_at_creates_file_and_handlers_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = tmp.path().join(".codex").join("hooks.json");
+        let mut out = Vec::new();
+        install_codex_hooks_at(&hooks, &binary(), false, &mut out).unwrap();
+        assert!(hooks.exists(), "hooks.json must be created");
+        let value: Value = serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+        assert_eq!(
+            value["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            "/usr/local/bin/agent-mux hook --agent codex"
+        );
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/usr/local/bin/agent-mux hook --agent codex"
+        );
+    }
+
+    #[test]
+    fn install_codex_hooks_at_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = tmp.path().join("hooks.json");
+        install_codex_hooks_at(&hooks, &binary(), false, &mut Vec::new()).unwrap();
+        let after_first = fs::read_to_string(&hooks).unwrap();
+        let mut out = Vec::new();
+        install_codex_hooks_at(&hooks, &binary(), false, &mut out).unwrap();
+        assert_eq!(
+            fs::read_to_string(&hooks).unwrap(),
+            after_first,
+            "second run is a no-op"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("already configured")
+        );
+    }
+
+    #[test]
+    fn install_codex_hooks_at_dry_run_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = tmp.path().join("hooks.json");
+        fs::write(&hooks, "{}").unwrap();
+        let original = fs::read_to_string(&hooks).unwrap();
+        let mut out = Vec::new();
+        install_codex_hooks_at(&hooks, &binary(), true, &mut out).unwrap();
+        assert_eq!(
+            fs::read_to_string(&hooks).unwrap(),
+            original,
+            "dry_run must not modify the file"
+        );
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(
+            out_str.contains("dry run"),
+            "dry-run announces itself: {out_str}"
+        );
+        assert!(out_str.contains("hook --agent codex"));
     }
 }

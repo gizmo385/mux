@@ -2,13 +2,17 @@
 //!
 //! Two halves, glued by a known directory under the user's cache root:
 //!
-//! 1. **Producer** ([`receive_hook_from_stdin`]): the `agent-mux hook`
-//!    CLI subcommand. Claude Code spawns this as a hook command per
-//!    its `~/.claude/settings.json` config, hands us the event JSON on
-//!    stdin, and we write a marker file into the cache directory via
-//!    atomic `tmp + rename`. Fire-and-forget — the subcommand process
-//!    exits as soon as the rename completes, so Claude Code's hook
-//!    pipeline never blocks on agent-mux's UI thread.
+//! 1. **Producer** (per agent): the `agent-mux hook` CLI subcommand.
+//!    Claude Code spawns [`receive_hook_from_stdin`] as a hook command
+//!    per its `~/.claude/settings.json` config; Codex spawns
+//!    [`receive_codex_hook_from_stdin`] (`agent-mux hook --agent codex`)
+//!    per its `~/.codex/hooks.json` config. Each hands us the event JSON
+//!    on stdin, and we write a marker file into the agent's hook
+//!    directory via atomic `tmp + rename`. Both producers normalise into
+//!    the *same* marker vocabulary so the consumer is agent-neutral.
+//!    Fire-and-forget — the subcommand process exits as soon as the
+//!    rename completes, so the agent's hook pipeline never blocks on
+//!    agent-mux's UI thread.
 //!
 //! 2. **Consumer** ([`spawn_hook_watcher`]): the dashboard process. A
 //!    `notify`-backed watch on the same directory ingests new marker
@@ -196,6 +200,128 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
     let transcript_path = v.as_object()?.get("transcript_path")?.as_str()?;
     let root = Path::new(transcript_path).parent()?.parent()?;
     Some(hook_dir_for_transcripts_root(root))
+}
+
+/// Codex lifecycle-hook producer — the `--agent codex` variant of the
+/// `agent-mux hook` subcommand. Codex fires the command handlers it finds
+/// in `~/.codex/hooks.json` with the event JSON on **stdin** (Appendix A
+/// §5 of `docs/plans/2026-07-09-multi-agent-cli.md`, researched 2026-07-09
+/// against rust-v0.144.1 — no `codex` on the build box, so the payload
+/// shape is best-effort). Documented fields: `session_id`, `cwd`,
+/// `hook_event_name`, `model`. agent-mux installs exactly two handlers:
+///
+/// - `PermissionRequest` — the agent is blocked waiting on an approval →
+///   normalise to a **blocking** marker (the `permission_prompt`
+///   equivalent).
+/// - `Stop` — the turn completed → normalise to a **non-blocking**
+///   turn-complete marker (the `idle_prompt` equivalent).
+///
+/// Codex payloads carry no `transcript_path`, so the caller resolves
+/// `hooks_dir` from the codex transcript root
+/// (`~/.codex/sessions/.agent-mux-hooks/`) the same way config/agents do,
+/// and passes it in. The marker is written using the **existing** claude
+/// marker vocabulary (`session_id` + a synthesised `notification_type` +
+/// an optional `message`), so the consumer ([`parse_marker_content`],
+/// [`crate::watcher`]'s `poll_hooks_once`, and the catalog's
+/// `apply_hook_event` pin) drains it byte-for-byte unchanged — routing is
+/// by `session_id`, which for codex equals the rollout/thread uuid. No
+/// new marker-schema field is needed: normalising into the claude
+/// vocabulary is what keeps the consumer agent-neutral.
+///
+/// Returns `Ok(Some(path))` when a marker was written, `Ok(None)` when
+/// the event isn't attention-relevant (any `hook_event_name` other than
+/// the two above — we never install those handlers, but stay defensive).
+///
+/// # Errors
+///
+/// Propagates I/O errors from stdin read or the marker write. A payload
+/// without a `session_id` returns [`io::ErrorKind::InvalidData`].
+pub fn receive_codex_hook_from_stdin<R: Read, W: Write>(
+    stdin_reader: &mut R,
+    hooks_dir: &Path,
+    now: SystemTime,
+    stderr_log: &mut W,
+) -> io::Result<Option<PathBuf>> {
+    let mut buf = String::new();
+    stdin_reader.read_to_string(&mut buf)?;
+    let session_id = parse_session_id(&buf)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing session_id field"))?;
+    let event_name = parse_hook_event_name(&buf);
+    let label = event_name.as_deref().unwrap_or("<missing>");
+    let Some((notification_type, message)) = codex_marker_for_event(event_name.as_deref()) else {
+        let _ = writeln!(
+            stderr_log,
+            "agent-mux: codex hook hook_event_name={label} session_id={session_id} \u{2192} skipped (not attention-relevant)"
+        );
+        return Ok(None);
+    };
+    let marker = normalized_codex_marker(&session_id, notification_type, message);
+    let _ = writeln!(
+        stderr_log,
+        "agent-mux: codex hook hook_event_name={label} session_id={session_id} \u{2192} writing marker to {}",
+        hooks_dir.display()
+    );
+    let path = persist_marker(hooks_dir, &session_id, now, &marker)?;
+    Ok(Some(path))
+}
+
+/// Map a codex `hook_event_name` to the `(notification_type, message)` the
+/// normalised marker carries — reusing the claude vocabulary so the
+/// consumer's classification ([`is_blocking_prompt`], the input-required
+/// allowlist) needs no codex awareness. `PermissionRequest` → blocking
+/// approval; `Stop` → turn complete. Any other event is dropped (`None`).
+fn codex_marker_for_event(
+    event_name: Option<&str>,
+) -> Option<(&'static str, Option<&'static str>)> {
+    match event_name {
+        Some("PermissionRequest") => Some((
+            "permission_prompt",
+            Some("Codex is waiting for your approval"),
+        )),
+        Some("Stop") => Some(("idle_prompt", None)),
+        _ => None,
+    }
+}
+
+/// Build the normalised marker JSON for a codex event using the existing
+/// claude marker fields. Only what the consumer reads is written:
+/// `session_id`, the synthesised `notification_type`, and (for the
+/// blocking case) a `message` for the toast body.
+fn normalized_codex_marker(
+    session_id: &str,
+    notification_type: &str,
+    message: Option<&str>,
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    obj.insert(
+        "notification_type".to_string(),
+        serde_json::Value::String(notification_type.to_string()),
+    );
+    if let Some(m) = message {
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(m.to_string()),
+        );
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// Pull `hook_event_name` out of a codex hook payload (the codex
+/// equivalent of claude's `notification_type` discriminator). Returns
+/// `None` when absent, non-string, or empty after trimming.
+#[must_use]
+fn parse_hook_event_name(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let raw = v.as_object()?.get("hook_event_name")?.as_str()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Notification types we treat as "user input is required for this
@@ -397,31 +523,40 @@ pub fn parse_marker_content(path: &Path, raw: &str) -> io::Result<HookEvent> {
     })
 }
 
-/// Spawn the background hook-marker watcher. A `notify` watch on
-/// `hook_dir` translates new marker files into [`WatcherEvent::Hook`]
-/// events on the shared channel. Marker files are deleted after a
-/// successful ingest so the directory doesn't grow without bound — a
-/// failed ingest leaves the marker in place so the next startup
-/// retries it via the initial sweep.
+/// Spawn the background hook-marker watcher over **every enabled
+/// agent's** hook directory. A single `notify` watch (mirroring WP2's
+/// one-transcript-watcher-over-all-roots discipline) translates new
+/// marker files under any watched `<root>/.agent-mux-hooks/` into
+/// [`WatcherEvent::Hook`] events on the shared channel. Marker files are
+/// deleted after a successful ingest so the directories don't grow
+/// without bound — a failed ingest leaves the marker in place so the
+/// next startup retries it via the initial sweep.
+///
+/// Each hook dir is a sibling of one enabled agent's transcript root:
+/// the recursive transcript watch already *sees* these dirs, but filters
+/// their `.json` markers out by extension (only `.jsonl` is a
+/// transcript), so this dedicated watcher owns their ingestion — one
+/// producer path (`agent-mux hook [--agent <label>]`) writing markers
+/// into the per-agent dir, one consumer path draining them.
+///
+/// The handler keys the marker's hook dir off the marker's own parent,
+/// so a single `notify` backend serves claude, codex, and any future
+/// agent's dir without per-agent handler state.
 ///
 /// Returns the `notify::RecommendedWatcher` so the caller can hold it
 /// for the dashboard's lifetime; dropping it tears the backend down.
 ///
 /// # Errors
 ///
-/// Surfaces any error from creating the watcher or the initial
-/// directory scan. The directory itself is created if absent.
+/// Surfaces any error from creating the watcher or watching a directory.
+/// Each directory is created if absent.
 pub fn spawn_hook_watcher(
-    hook_dir: &Path,
+    hook_dirs: &[PathBuf],
     event_tx: &Sender<WatcherEvent>,
 ) -> notify::Result<notify::RecommendedWatcher> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
 
-    fs::create_dir_all(hook_dir).map_err(notify::Error::io)?;
-    sweep_existing_markers(hook_dir, event_tx);
-
     let tx_for_handler = event_tx.clone();
-    let dir_for_handler = hook_dir.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         // Watcher errors are best-effort: a notify hiccup
         // shouldn't kill the dashboard. Subsequent events
@@ -432,11 +567,22 @@ pub fn spawn_hook_watcher(
                 return;
             }
             for path in ev.paths {
-                ingest_marker(&dir_for_handler, &path, &tx_for_handler);
+                // The event fired against one of the watched hook dirs;
+                // the marker's own parent *is* that dir, so `ingest_marker`
+                // can use it directly (its parent-equality guard is then
+                // trivially satisfied) and one handler serves every agent.
+                if let Some(parent) = path.parent() {
+                    ingest_marker(parent, &path, &tx_for_handler);
+                }
             }
         }
     })?;
-    watcher.watch(hook_dir, RecursiveMode::NonRecursive)?;
+
+    for hook_dir in hook_dirs {
+        fs::create_dir_all(hook_dir).map_err(notify::Error::io)?;
+        sweep_existing_markers(hook_dir, event_tx);
+        watcher.watch(hook_dir, RecursiveMode::NonRecursive)?;
+    }
     Ok(watcher)
 }
 
@@ -517,6 +663,85 @@ mod tests {
         );
     }
 
+    /// Codex sibling of [`dispatch`]: fire `receive_codex_hook_from_stdin`
+    /// against an in-memory codex payload + stderr buffer.
+    fn dispatch_codex(payload: &str, hooks_dir: &Path) -> (io::Result<Option<PathBuf>>, String) {
+        let mut input = Cursor::new(payload.as_bytes().to_vec());
+        let mut log = Vec::new();
+        let result = receive_codex_hook_from_stdin(
+            &mut input,
+            hooks_dir,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_234_567),
+            &mut log,
+        );
+        (result, String::from_utf8(log).unwrap())
+    }
+
+    #[test]
+    fn codex_permission_request_writes_a_blocking_marker() {
+        // The codex `PermissionRequest` payload normalises into the
+        // existing claude marker vocabulary, so the *unchanged* consumer
+        // parse yields a blocking prompt for the right session.
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"cx-1","cwd":"/w","hook_event_name":"PermissionRequest","model":"gpt-5-codex"}"#;
+        let (result, log) = dispatch_codex(payload, tmp.path());
+        let path = result.expect("write marker").expect("marker written");
+        let ev = parse_marker(&path).expect("consumer drains the codex marker");
+        assert_eq!(ev.session_id.0, "cx-1", "routes by the codex session id");
+        assert!(
+            ev.blocking_prompt,
+            "PermissionRequest is a blocking approval"
+        );
+        assert!(
+            ev.message.is_some(),
+            "blocking codex marker carries a toast body"
+        );
+        assert!(
+            log.contains("PermissionRequest") && log.contains("writing marker"),
+            "stderr log records the event + action: {log}"
+        );
+    }
+
+    #[test]
+    fn codex_stop_writes_a_non_blocking_turn_complete_marker() {
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"cx-2","cwd":"/w","hook_event_name":"Stop"}"#;
+        let (result, _) = dispatch_codex(payload, tmp.path());
+        let path = result.unwrap().expect("marker written");
+        let ev = parse_marker(&path).unwrap();
+        assert_eq!(ev.session_id.0, "cx-2");
+        assert!(
+            !ev.blocking_prompt,
+            "Stop is a turn-complete nudge, not a blocking prompt"
+        );
+    }
+
+    #[test]
+    fn codex_unrecognised_event_is_skipped() {
+        // We only ever install PermissionRequest + Stop handlers, but a
+        // stray event (or a future one) must be dropped, not misfiled.
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"cx-3","hook_event_name":"PreToolUse"}"#;
+        let (result, log) = dispatch_codex(payload, tmp.path());
+        assert!(result.unwrap().is_none());
+        assert!(log.contains("skipped"), "log records the skip: {log}");
+        assert!(
+            fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "no marker file should be created"
+        );
+    }
+
+    #[test]
+    fn codex_hook_rejects_payload_without_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"hook_event_name":"Stop"}"#;
+        let (result, _) = dispatch_codex(payload, tmp.path());
+        assert_eq!(
+            result.expect_err("should reject").kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn receive_writes_marker_for_idle_prompt() {
         let tmp = TempDir::new().unwrap();
@@ -575,7 +800,7 @@ mod tests {
     fn receive_writes_marker_when_notification_type_field_is_missing() {
         // Conservative fallback: an unknown/older payload shape stays
         // loud rather than silently quiet. Matches the
-        // missing-stop_reason fallback in derive_attention_from_content.
+        // missing-stop-reason fallback in the agent parser.
         let tmp = TempDir::new().unwrap();
         let payload = r#"{"session_id":"a","hook_event_name":"Notification"}"#;
         let (result, log) = dispatch(payload, tmp.path());

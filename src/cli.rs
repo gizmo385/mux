@@ -417,11 +417,19 @@ pub fn print_config_reference<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "    transcript_root = \"...\"      default ~/.claude/projects (tilde → remote home)"
+        "    transcript_root = \"...\"      claude root; default ~/.claude/projects (per-agent → [agents])"
     )?;
     writeln!(
         out,
         "    workspace_folders = [...]    optional per-host; tildes → remote home"
+    )?;
+    writeln!(
+        out,
+        "  [agents.<label>]               claude|codex|pi — enabled/binary/transcript_root; ≥2 enabled"
+    )?;
+    writeln!(
+        out,
+        "                                 shows the row agent tag + new-session agent picker"
     )?;
     writeln!(
         out,
@@ -570,7 +578,7 @@ fn write_notify_test_confirmation<W: Write>(
 pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(
         out,
-        "agent-mux — terminal multiplexer for Claude Code sessions"
+        "agent-mux — terminal multiplexer for agent CLI sessions (Claude Code, Codex, Pi)"
     )?;
     writeln!(out)?;
     writeln!(out, "USAGE:")?;
@@ -593,11 +601,15 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "                           (idempotent; --dry-run prints the change without writing)."
+        "                           (--agent codex → ~/.codex/hooks.json; idempotent; --dry-run"
     )?;
     writeln!(
         out,
-        "  agent-mux hook           Internal: invoked by Claude Code's Notification hook."
+        "                           prints the change without writing)."
+    )?;
+    writeln!(
+        out,
+        "  agent-mux hook           Internal: invoked by an agent's hook (--agent codex for Codex)."
     )?;
     writeln!(out, "  agent-mux help           Show this help.")?;
     writeln!(out)?;
@@ -755,6 +767,7 @@ mod tests {
                         ssh: "devbox.internal".to_string(),
                         transcript_root: PathBuf::from("~/.claude/projects"),
                         workspace_folders: None,
+                        agents: std::collections::BTreeMap::new(),
                     },
                 );
                 m

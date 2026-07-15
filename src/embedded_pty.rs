@@ -397,7 +397,7 @@ pub fn encode_key_for_pty(key: &KeyEvent) -> Vec<u8> {
 /// Encode a crossterm [`MouseEvent`] into an SGR-mode (xterm 1006)
 /// mouse report — `\x1b[<{button};{col};{row}M` (press / scroll /
 /// motion) or `…m` (release). SGR is the modern mouse protocol every
-/// recent terminal speaks, and what tmux / `claude` parse on stdin.
+/// recent terminal speaks, and what tmux / the agent parse on stdin.
 ///
 /// `pty_col` and `pty_row` are PTY-relative, 1-based coordinates. The
 /// caller is responsible for the terminal-to-PTY translation (subtract

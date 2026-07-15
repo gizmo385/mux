@@ -36,6 +36,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentKind;
 use crate::session::{Attention, HostId, Session, SessionId};
 
 /// Location of the per-host snapshot directory. Returns `None` only
@@ -86,9 +87,23 @@ fn cache_file(dir: &Path, host: &HostId) -> PathBuf {
     dir.join(format!("{}.json", host.as_str()))
 }
 
+/// Serde default for [`CachedSession::agent`]: the label of the agent a
+/// pre-`agent`-field snapshot implicitly held.
+fn default_agent_label() -> String {
+    AgentKind::Claude.label().to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedSession {
     id: String,
+    /// Which agent CLI backs the session. `#[serde(default)]` →
+    /// [`default_agent_label`] (`"claude"`) so snapshots written before
+    /// this field existed load unchanged as Claude sessions. Round-tripped
+    /// via [`AgentKind::label`] / [`AgentKind::from_label`]; an
+    /// unrecognised label (a hand-edited or future-version cache) maps
+    /// back to Claude rather than failing the load.
+    #[serde(default = "default_agent_label")]
+    agent: String,
     project_dir: PathBuf,
     transcript_path: PathBuf,
     /// Unix epoch seconds. Signed so a clock-skew remote that
@@ -130,6 +145,7 @@ impl CachedSession {
     fn from_session(s: &Session) -> Self {
         Self {
             id: s.id.0.clone(),
+            agent: s.agent.label().to_string(),
             project_dir: s.project_dir.clone(),
             transcript_path: s.transcript_path.clone(),
             last_activity_secs: systemtime_to_epoch_secs(s.last_activity),
@@ -141,9 +157,13 @@ impl CachedSession {
     }
 
     fn into_session(self, host: &HostId) -> Session {
+        // Unrecognised label (hand-edited or future-version cache) degrades
+        // to Claude rather than failing the best-effort load.
+        let agent = AgentKind::from_label(&self.agent).unwrap_or(AgentKind::Claude);
         Session {
             id: SessionId(self.id),
             host: host.clone(),
+            agent,
             project_dir: self.project_dir,
             transcript_path: self.transcript_path,
             last_activity: epoch_secs_to_systemtime(self.last_activity_secs),
@@ -216,6 +236,7 @@ mod tests {
         Session {
             id: SessionId(id.to_string()),
             host: host.clone(),
+            agent: AgentKind::Claude,
             project_dir: PathBuf::from(format!("/proj/{id}")),
             transcript_path: PathBuf::from(format!("/t/{id}.jsonl")),
             last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
@@ -274,6 +295,47 @@ mod tests {
         assert_eq!(r.attention, s.attention);
         assert_eq!(r.title, s.title);
         assert_eq!(r.parent_repo, s.parent_repo);
+        assert_eq!(r.agent, s.agent);
+    }
+
+    #[test]
+    fn round_trip_preserves_non_claude_agent() {
+        // The agent label must survive write+read for a *non-default*
+        // agent — the default-to-claude fallback would mask a broken
+        // round-trip if every fixture were claude.
+        let dir = TempDir::new().unwrap();
+        let host = HostId("h".into());
+        for kind in [AgentKind::Codex, AgentKind::Pi] {
+            let mut s = sample_session("a", &host);
+            s.agent = kind;
+            write_for_host(dir.path(), &host, std::slice::from_ref(&s)).unwrap();
+            let read = read_for_host(dir.path(), &host);
+            assert_eq!(read[0].agent, kind, "agent must round-trip for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn read_legacy_cache_without_agent_field_defaults_to_claude() {
+        // Snapshots written before the `agent` field existed lack it.
+        // `#[serde(default)]` maps the absence to "claude" so an old cache
+        // still loads — pinned so a future serde tweak can't silently
+        // break first-paint for users with stale caches on disk.
+        let dir = TempDir::new().unwrap();
+        let host = HostId("legacy".into());
+        let legacy_json = r#"[
+            {
+                "id": "old",
+                "project_dir": "/proj/old",
+                "transcript_path": "/t/old.jsonl",
+                "last_activity_secs": 1700000000,
+                "title": null,
+                "attention": "idle"
+            }
+        ]"#;
+        fs::write(cache_file(dir.path(), &host), legacy_json).unwrap();
+        let read = read_for_host(dir.path(), &host);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].agent, AgentKind::Claude);
     }
 
     #[test]

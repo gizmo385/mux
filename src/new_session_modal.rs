@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
+use crate::agent::AgentKind;
 use crate::host::LocalHost;
 use crate::repo::Repo;
 use crate::session::HostId;
@@ -37,8 +38,26 @@ pub enum NewSessionModal {
         state: ListState,
         /// `Worktree` runs the standard pick → Filling → create flow.
         /// `NoWorktree` short-circuits to `SubmitNoWorktree` on Enter
-        /// — claude launches in the repo root, no `git worktree add`,
+        /// — the agent launches in the repo root, no `git worktree add`,
         /// no task metadata.
+        mode: ModalMode,
+        /// Enabled agents in registry order; `agents[0]` is the default.
+        /// When `len() >= 2` the picker inserts a [`Self::PickingAgent`]
+        /// step between the repo pick and the terminal action; a single
+        /// enabled agent skips it entirely, so the Claude-only flow is
+        /// unchanged (zero extra keystroke, zero UI difference).
+        agents: Vec<AgentKind>,
+    },
+    /// Agent-selection step, reached from [`Self::PickingRepo`] only when
+    /// ≥2 agents are enabled. The chosen [`AgentKind`] threads into
+    /// `Filling` (worktree flow) or straight into
+    /// [`KeyOutcome::SubmitNoWorktree`] (no-worktree flow). Esc cancels the
+    /// whole modal, matching the `Filling` step's idiom (there is no
+    /// step-back to the repo picker).
+    PickingAgent {
+        repo: Repo,
+        agents: Vec<AgentKind>,
+        state: ListState,
         mode: ModalMode,
     },
     Filling {
@@ -46,6 +65,10 @@ pub enum NewSessionModal {
         task: String,
         branch: String,
         focus: FillFocus,
+        /// Agent chosen in [`Self::PickingAgent`], or the sole enabled
+        /// agent when that step was skipped. Flows into
+        /// [`KeyOutcome::Submit`].
+        agent: AgentKind,
     },
 }
 
@@ -71,17 +94,20 @@ pub enum KeyOutcome {
     /// User pressed Esc. Caller drops the modal.
     Cancel,
     /// User submitted a valid form in the worktree-creating flow.
-    /// Caller runs `git worktree add` + spawns claude in the new
-    /// worktree.
+    /// Caller runs `git worktree add` + spawns the chosen agent in the
+    /// new worktree.
     Submit {
         repo: Repo,
         task: String,
         base_branch: String,
+        /// Which agent CLI to spawn — the picked kind when the agent step
+        /// ran, else the sole enabled agent.
+        agent: AgentKind,
     },
     /// User picked a repo in [`ModalMode::NoWorktree`]. Caller spawns
-    /// claude directly in the repo's root — no worktree, no task
+    /// the chosen agent directly in the repo's root — no worktree, no task
     /// metadata, no base branch.
-    SubmitNoWorktree { repo: Repo },
+    SubmitNoWorktree { repo: Repo, agent: AgentKind },
 }
 
 impl NewSessionModal {
@@ -92,32 +118,38 @@ impl NewSessionModal {
     /// `seed` biases the initial cursor toward the dashboard's
     /// currently-selected session's repo (see [`NewSessionSeed`]); pass
     /// `None` to open at index 0. Opens in [`ModalMode::Worktree`] —
-    /// the standard pick → Filling → create flow.
+    /// the standard pick → Filling → create flow. `agents` is the enabled
+    /// agent list (registry order, `agents[0]` = default); ≥2 entries add
+    /// the [`Self::PickingAgent`] step, one entry skips it.
     #[must_use]
     pub fn new(
         repos: Vec<Repo>,
         ready_hosts: HashSet<HostId>,
         seed: Option<NewSessionSeed>,
+        agents: Vec<AgentKind>,
     ) -> Self {
-        Self::with_mode(repos, ready_hosts, seed, ModalMode::Worktree)
+        Self::with_mode(repos, ready_hosts, seed, agents, ModalMode::Worktree)
     }
 
     /// Open a new modal in [`ModalMode::NoWorktree`] — Enter on a
     /// repo emits [`KeyOutcome::SubmitNoWorktree`] and the modal closes
-    /// without a Filling stage. The picker UI is otherwise identical.
+    /// without a Filling stage (the agent step, when enabled, still runs
+    /// first). The picker UI is otherwise identical.
     #[must_use]
     pub fn new_no_worktree(
         repos: Vec<Repo>,
         ready_hosts: HashSet<HostId>,
         seed: Option<NewSessionSeed>,
+        agents: Vec<AgentKind>,
     ) -> Self {
-        Self::with_mode(repos, ready_hosts, seed, ModalMode::NoWorktree)
+        Self::with_mode(repos, ready_hosts, seed, agents, ModalMode::NoWorktree)
     }
 
     fn with_mode(
         repos: Vec<Repo>,
         ready_hosts: HashSet<HostId>,
         seed: Option<NewSessionSeed>,
+        agents: Vec<AgentKind>,
         mode: ModalMode,
     ) -> Self {
         debug_assert!(!repos.is_empty(), "modal opened with no repos");
@@ -129,6 +161,7 @@ impl NewSessionModal {
             ready_hosts,
             state,
             mode,
+            agents,
         }
     }
 
@@ -144,9 +177,23 @@ impl NewSessionModal {
             ready_hosts,
             state,
             mode,
+            agents,
         } = self
         {
-            let (outcome, next) = handle_picking(repos, ready_hosts, state, *mode, key);
+            let (outcome, next) = handle_picking(repos, ready_hosts, state, *mode, agents, key);
+            if let Some(next) = next {
+                *self = next;
+            }
+            return outcome;
+        }
+        if let Self::PickingAgent {
+            repo,
+            agents,
+            state,
+            mode,
+        } = self
+        {
+            let (outcome, next) = handle_picking_agent(repo, agents, state, *mode, key);
             if let Some(next) = next {
                 *self = next;
             }
@@ -157,9 +204,10 @@ impl NewSessionModal {
             task,
             branch,
             focus,
+            agent,
         } = self
         {
-            return handle_filling(repo, task, branch, focus, key);
+            return handle_filling(repo, task, branch, focus, *agent, key);
         }
         KeyOutcome::Handled
     }
@@ -173,12 +221,20 @@ impl NewSessionModal {
                 ready_hosts,
                 state,
                 mode,
+                ..
             } => draw_picking(frame, area, repos, ready_hosts, state, *mode),
+            Self::PickingAgent {
+                repo,
+                agents,
+                state,
+                mode,
+            } => draw_picking_agent(frame, area, repo, agents, state, *mode),
             Self::Filling {
                 repo,
                 task,
                 branch,
                 focus,
+                ..
             } => draw_filling(frame, area, repo, task, branch, *focus),
         }
     }
@@ -189,6 +245,7 @@ fn handle_picking(
     ready_hosts: &HashSet<HostId>,
     state: &mut ListState,
     mode: ModalMode,
+    agents: &[AgentKind],
     key: KeyEvent,
 ) -> (KeyOutcome, Option<NewSessionModal>) {
     match key.code {
@@ -216,37 +273,99 @@ fn handle_picking(
             if !ready_hosts.contains(&repo.host) {
                 return (KeyOutcome::Handled, None);
             }
-            if mode == ModalMode::NoWorktree {
-                // Skip Filling entirely — there's no worktree to name
-                // and no base branch to resolve. The caller spawns
-                // claude directly in the repo root.
-                return (KeyOutcome::SubmitNoWorktree { repo }, None);
+            // ≥2 enabled agents → interpose the agent-selection step
+            // before the terminal action. A single enabled agent skips
+            // it: the Claude-only flow gains no extra keystroke.
+            if agents.len() >= 2 {
+                let mut agent_state = ListState::default();
+                agent_state.select(Some(0));
+                let next = NewSessionModal::PickingAgent {
+                    repo,
+                    agents: agents.to_vec(),
+                    state: agent_state,
+                    mode,
+                };
+                return (KeyOutcome::Handled, Some(next));
             }
-            // Default-branch resolution is a local-only fast path
-            // today; for remote repos we leave the field blank and
-            // let the user type it.
-            let branch = if repo.host.is_local() {
-                // Synchronous local git call; fast. Remote default-
-                // branch resolution would require an SSH round-trip
-                // mid-keypress which would block the UI; the field
-                // stays empty for remote repos and the user types
-                // their branch. A future pass can pre-resolve remote
-                // branches asynchronously during workspace scan.
-                let host = LocalHost::new();
-                worktree::resolve_default_base_branch(&host, &repo.path).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let next = NewSessionModal::Filling {
-                repo,
-                task: String::new(),
-                branch,
-                focus: FillFocus::Task,
-            };
-            (KeyOutcome::Handled, Some(next))
+            let agent = default_agent(agents);
+            finish_repo_pick(repo, agent, mode)
         }
         _ => (KeyOutcome::Handled, None),
     }
+}
+
+fn handle_picking_agent(
+    repo: &Repo,
+    agents: &[AgentKind],
+    state: &mut ListState,
+    mode: ModalMode,
+    key: KeyEvent,
+) -> (KeyOutcome, Option<NewSessionModal>) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            select_prev(state, agents.len());
+            (KeyOutcome::Handled, None)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            select_next(state, agents.len());
+            (KeyOutcome::Handled, None)
+        }
+        KeyCode::Enter => {
+            let idx = state.selected().unwrap_or(0);
+            let agent = agents
+                .get(idx)
+                .copied()
+                .unwrap_or_else(|| default_agent(agents));
+            finish_repo_pick(repo.clone(), agent, mode)
+        }
+        _ => (KeyOutcome::Handled, None),
+    }
+}
+
+/// Terminal step shared by the repo pick (single-agent fast path) and the
+/// agent pick: no-worktree mode short-circuits to `SubmitNoWorktree`,
+/// worktree mode transitions into `Filling` with the resolved base branch.
+fn finish_repo_pick(
+    repo: Repo,
+    agent: AgentKind,
+    mode: ModalMode,
+) -> (KeyOutcome, Option<NewSessionModal>) {
+    if mode == ModalMode::NoWorktree {
+        // Skip Filling entirely — there's no worktree to name and no base
+        // branch to resolve. The caller spawns the agent in the repo root.
+        return (KeyOutcome::SubmitNoWorktree { repo, agent }, None);
+    }
+    let branch = resolve_default_branch(&repo);
+    let next = NewSessionModal::Filling {
+        repo,
+        task: String::new(),
+        branch,
+        focus: FillFocus::Task,
+        agent,
+    };
+    (KeyOutcome::Handled, Some(next))
+}
+
+/// Default-branch resolution is a local-only fast path today; for remote
+/// repos we leave the field blank and let the user type it.
+fn resolve_default_branch(repo: &Repo) -> String {
+    if repo.host.is_local() {
+        // Synchronous local git call; fast. Remote default-branch
+        // resolution would require an SSH round-trip mid-keypress which
+        // would block the UI; the field stays empty for remote repos and
+        // the user types their branch. A future pass can pre-resolve
+        // remote branches asynchronously during workspace scan.
+        let host = LocalHost::new();
+        worktree::resolve_default_base_branch(&host, &repo.path).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// First enabled agent, or Claude as a defensive fallback for the
+/// degenerate all-disabled config (which has nothing to discover anyway).
+fn default_agent(agents: &[AgentKind]) -> AgentKind {
+    agents.first().copied().unwrap_or(AgentKind::Claude)
 }
 
 fn handle_filling(
@@ -254,6 +373,7 @@ fn handle_filling(
     task: &mut String,
     branch: &mut String,
     focus: &mut FillFocus,
+    agent: AgentKind,
     key: KeyEvent,
 ) -> KeyOutcome {
     match key.code {
@@ -277,6 +397,7 @@ fn handle_filling(
                 repo: repo.clone(),
                 task: task.clone(),
                 base_branch: branch.clone(),
+                agent,
             }
         }
         KeyCode::Backspace => {
@@ -399,6 +520,60 @@ fn draw_picking(
     );
 }
 
+fn draw_picking_agent(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    repo: &Repo,
+    agents: &[AgentKind],
+    state: &mut ListState,
+    mode: ModalMode,
+) {
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let items: Vec<ListItem<'_>> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            // First enabled agent is the preselected default; mark it so
+            // the user knows Enter-through picks it. Bare `label()`
+            // ("claude"/"codex"/"pi") is the same string the row tag uses.
+            let line = if i == 0 {
+                Line::from(vec![
+                    Span::raw(a.label().to_string()),
+                    Span::styled("  (default)", dim),
+                ])
+            } else {
+                Line::from(Span::raw(a.label().to_string()))
+            };
+            ListItem::new(line)
+        })
+        .collect();
+    // Carry the repo name and the mode into the title so the user keeps
+    // context across the two-step pick — matches the `Filling` step's
+    // "new session in <repo>" framing.
+    let title = match mode {
+        ModalMode::Worktree => format!(" new session in {}: pick an agent ", repo.name),
+        ModalMode::NoWorktree => {
+            format!(
+                " new session (no worktree) in {}: pick an agent ",
+                repo.name
+            )
+        }
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▌ ");
+    frame.render_stateful_widget(list, layout[0], state);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑/↓ or j/k: move · ⏎: select · Esc: cancel ",
+            dim,
+        ))),
+        layout[1],
+    );
+}
+
 fn draw_filling(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -467,15 +642,18 @@ impl std::fmt::Debug for KeyOutcome {
                 repo,
                 task,
                 base_branch,
+                agent,
             } => f
                 .debug_struct("Submit")
                 .field("repo", &repo.name)
                 .field("task", task)
                 .field("base_branch", base_branch)
+                .field("agent", &agent.label())
                 .finish(),
-            Self::SubmitNoWorktree { repo } => f
+            Self::SubmitNoWorktree { repo, agent } => f
                 .debug_struct("SubmitNoWorktree")
                 .field("repo", &repo.name)
+                .field("agent", &agent.label())
                 .finish(),
         }
     }
@@ -527,21 +705,33 @@ mod tests {
         s
     }
 
+    /// Single-agent enabled set — the Claude-only default. Passing this
+    /// keeps the pre-WP7 flow (no agent-selection step), so the existing
+    /// picker/filling assertions below are unchanged.
+    fn claude_only() -> Vec<AgentKind> {
+        vec![AgentKind::Claude]
+    }
+
     #[test]
     fn new_starts_in_picker_with_first_selected() {
-        let modal =
-            NewSessionModal::new(vec![local_repo("a"), local_repo("b")], ready_local(), None);
+        let modal = NewSessionModal::new(
+            vec![local_repo("a"), local_repo("b")],
+            ready_local(),
+            None,
+            claude_only(),
+        );
         match modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 assert_eq!(state.selected(), Some(0));
             }
-            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+            _ => panic!("expected PickingRepo"),
         }
     }
 
     #[test]
     fn esc_returns_cancel_from_any_state() {
-        let mut modal = NewSessionModal::new(vec![local_repo("a")], ready_local(), None);
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a")], ready_local(), None, claude_only());
         assert!(matches!(
             modal.handle_key(key(KeyCode::Esc)),
             KeyOutcome::Cancel
@@ -552,6 +742,7 @@ mod tests {
             task: "x".to_string(),
             branch: "main".to_string(),
             focus: FillFocus::Task,
+            agent: AgentKind::Claude,
         };
         assert!(matches!(
             modal.handle_key(key(KeyCode::Esc)),
@@ -565,27 +756,32 @@ mod tests {
             vec![local_repo("a"), local_repo("b"), local_repo("c")],
             ready_local(),
             None,
+            claude_only(),
         );
         modal.handle_key(key(KeyCode::Up));
         match &modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 assert_eq!(state.selected(), Some(2));
             }
-            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+            _ => panic!("expected PickingRepo"),
         }
         modal.handle_key(key(KeyCode::Down));
         match &modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 assert_eq!(state.selected(), Some(0));
             }
-            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+            _ => panic!("expected PickingRepo"),
         }
     }
 
     #[test]
     fn picker_enter_transitions_to_filling_with_selected_repo() {
-        let mut modal =
-            NewSessionModal::new(vec![local_repo("a"), local_repo("b")], ready_local(), None);
+        let mut modal = NewSessionModal::new(
+            vec![local_repo("a"), local_repo("b")],
+            ready_local(),
+            None,
+            claude_only(),
+        );
         modal.handle_key(key(KeyCode::Down));
         let outcome = modal.handle_key(key(KeyCode::Enter));
         assert!(matches!(outcome, KeyOutcome::Handled));
@@ -594,7 +790,7 @@ mod tests {
                 assert_eq!(repo.name, "b");
                 assert_eq!(*focus, FillFocus::Task);
             }
-            NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+            _ => panic!("expected Filling"),
         }
     }
 
@@ -612,6 +808,7 @@ mod tests {
             vec![local_repo("here"), remote_repo("gizmo", "there")],
             ready,
             None,
+            claude_only(),
         );
         // Move to the remote repo.
         modal.handle_key(key(KeyCode::Down));
@@ -630,7 +827,12 @@ mod tests {
         // remote repos pre-fill the same way.
         let mut ready = HashSet::new();
         ready.insert(HostId("gizmo".into()));
-        let mut modal = NewSessionModal::new(vec![remote_repo("gizmo", "alpha")], ready, None);
+        let mut modal = NewSessionModal::new(
+            vec![remote_repo("gizmo", "alpha")],
+            ready,
+            None,
+            claude_only(),
+        );
         let _ = modal.handle_key(key(KeyCode::Enter));
         match &modal {
             NewSessionModal::Filling { repo, branch, .. } => {
@@ -640,7 +842,7 @@ mod tests {
                     "remote repos should not pre-fill branch yet: {branch:?}"
                 );
             }
-            NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+            _ => panic!("expected Filling"),
         }
     }
 
@@ -658,12 +860,12 @@ mod tests {
             host: HostId::local(),
             repo_path: Some(PathBuf::from("/tmp/gamma")),
         };
-        let modal = NewSessionModal::new(repos, ready_local(), Some(seed));
+        let modal = NewSessionModal::new(repos, ready_local(), Some(seed), claude_only());
         match modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 assert_eq!(state.selected(), Some(2));
             }
-            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+            _ => panic!("expected PickingRepo"),
         }
     }
 
@@ -684,13 +886,13 @@ mod tests {
             host: HostId("gizmo".into()),
             repo_path: Some(PathBuf::from("/srv/missing")),
         };
-        let modal = NewSessionModal::new(repos, ready, Some(seed));
+        let modal = NewSessionModal::new(repos, ready, Some(seed), claude_only());
         match modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 // First gizmo repo is at index 1.
                 assert_eq!(state.selected(), Some(1));
             }
-            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+            _ => panic!("expected PickingRepo"),
         }
     }
 
@@ -705,11 +907,13 @@ mod tests {
             vec![local_repo("alpha"), local_repo("beta")],
             ready_local(),
             None,
+            claude_only(),
         );
         modal.handle_key(key(KeyCode::Down));
         match modal.handle_key(key(KeyCode::Enter)) {
-            KeyOutcome::SubmitNoWorktree { repo } => {
+            KeyOutcome::SubmitNoWorktree { repo, agent } => {
                 assert_eq!(repo.name, "beta");
+                assert_eq!(agent, AgentKind::Claude);
             }
             other => panic!("expected SubmitNoWorktree, got {other:?}"),
         }
@@ -727,6 +931,7 @@ mod tests {
             vec![local_repo("here"), remote_repo("gizmo", "there")],
             ready,
             None,
+            claude_only(),
         );
         modal.handle_key(key(KeyCode::Down));
         let outcome = modal.handle_key(key(KeyCode::Enter));
@@ -744,12 +949,12 @@ mod tests {
             host: HostId("unknown".into()),
             repo_path: None,
         };
-        let modal = NewSessionModal::new(repos, ready_local(), Some(seed));
+        let modal = NewSessionModal::new(repos, ready_local(), Some(seed), claude_only());
         match modal {
             NewSessionModal::PickingRepo { state, .. } => {
                 assert_eq!(state.selected(), Some(0));
             }
-            NewSessionModal::Filling { .. } => panic!("expected PickingRepo"),
+            _ => panic!("expected PickingRepo"),
         }
     }
 
@@ -760,6 +965,7 @@ mod tests {
             task: String::new(),
             branch: String::new(),
             focus: FillFocus::Task,
+            agent: AgentKind::Claude,
         };
         for c in "hi".chars() {
             modal.handle_key(key(KeyCode::Char(c)));
@@ -779,7 +985,7 @@ mod tests {
                 assert_eq!(branch, "main");
                 assert_eq!(*focus, FillFocus::Branch);
             }
-            NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+            _ => panic!("expected Filling"),
         }
     }
 
@@ -790,6 +996,7 @@ mod tests {
             task: "abc".to_string(),
             branch: "main".to_string(),
             focus: FillFocus::Task,
+            agent: AgentKind::Claude,
         };
         modal.handle_key(key(KeyCode::Backspace));
         match &modal {
@@ -797,7 +1004,7 @@ mod tests {
                 assert_eq!(task, "ab");
                 assert_eq!(branch, "main");
             }
-            NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+            _ => panic!("expected Filling"),
         }
     }
 
@@ -808,13 +1015,14 @@ mod tests {
             task: String::new(),
             branch: "main".to_string(),
             focus: FillFocus::Branch,
+            agent: AgentKind::Claude,
         };
         let outcome = modal.handle_key(key(KeyCode::Enter));
         assert!(matches!(outcome, KeyOutcome::Handled));
         // Focus snaps back to the offending field.
         match &modal {
             NewSessionModal::Filling { focus, .. } => assert_eq!(*focus, FillFocus::Task),
-            NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+            _ => panic!("expected Filling"),
         }
     }
 
@@ -825,12 +1033,13 @@ mod tests {
             task: "task".to_string(),
             branch: String::new(),
             focus: FillFocus::Task,
+            agent: AgentKind::Claude,
         };
         let outcome = modal.handle_key(key(KeyCode::Enter));
         assert!(matches!(outcome, KeyOutcome::Handled));
         match &modal {
             NewSessionModal::Filling { focus, .. } => assert_eq!(*focus, FillFocus::Branch),
-            NewSessionModal::PickingRepo { .. } => panic!("expected Filling"),
+            _ => panic!("expected Filling"),
         }
     }
 
@@ -841,18 +1050,165 @@ mod tests {
             task: "refactor parser".to_string(),
             branch: "main".to_string(),
             focus: FillFocus::Task,
+            agent: AgentKind::Claude,
         };
         match modal.handle_key(key(KeyCode::Enter)) {
             KeyOutcome::Submit {
                 repo,
                 task,
                 base_branch,
+                agent,
             } => {
                 assert_eq!(repo.name, "agent-mux");
                 assert_eq!(task, "refactor parser");
                 assert_eq!(base_branch, "main");
+                assert_eq!(agent, AgentKind::Claude);
             }
             other => panic!("expected Submit, got {other:?}"),
         }
+    }
+
+    // ------- agent-selection step (WP7) -------
+
+    /// Two-agent enabled set (Claude default, Codex second) — exercises the
+    /// [`NewSessionModal::PickingAgent`] step the ≥2 gate inserts.
+    fn two_agents() -> Vec<AgentKind> {
+        vec![AgentKind::Claude, AgentKind::Codex]
+    }
+
+    #[test]
+    fn single_agent_skips_agent_step_worktree_flow() {
+        // The pixel-identical guarantee for Claude-only: Enter on a ready
+        // repo goes straight to Filling, no PickingAgent interposed.
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a")], ready_local(), None, claude_only());
+        let outcome = modal.handle_key(key(KeyCode::Enter));
+        assert!(matches!(outcome, KeyOutcome::Handled));
+        assert!(
+            matches!(
+                modal,
+                NewSessionModal::Filling {
+                    agent: AgentKind::Claude,
+                    ..
+                }
+            ),
+            "single agent must transition straight to Filling with the sole agent"
+        );
+    }
+
+    #[test]
+    fn single_agent_skips_agent_step_no_worktree_flow() {
+        // No-worktree + single agent → SubmitNoWorktree directly, no step.
+        let mut modal = NewSessionModal::new_no_worktree(
+            vec![local_repo("a")],
+            ready_local(),
+            None,
+            claude_only(),
+        );
+        match modal.handle_key(key(KeyCode::Enter)) {
+            KeyOutcome::SubmitNoWorktree { agent, .. } => assert_eq!(agent, AgentKind::Claude),
+            other => panic!("expected SubmitNoWorktree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_agents_interpose_picking_agent_step_before_filling() {
+        // ≥2 agents: repo Enter lands on the agent picker (default = first
+        // enabled, preselected), not straight into Filling.
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a")], ready_local(), None, two_agents());
+        let outcome = modal.handle_key(key(KeyCode::Enter));
+        assert!(matches!(outcome, KeyOutcome::Handled));
+        match &modal {
+            NewSessionModal::PickingAgent {
+                repo,
+                agents,
+                state,
+                mode,
+            } => {
+                assert_eq!(repo.name, "a");
+                assert_eq!(agents, &vec![AgentKind::Claude, AgentKind::Codex]);
+                assert_eq!(state.selected(), Some(0), "default agent preselected");
+                assert_eq!(*mode, ModalMode::Worktree);
+            }
+            _ => panic!("expected PickingAgent"),
+        }
+    }
+
+    #[test]
+    fn agent_step_threads_chosen_kind_into_filling() {
+        // Pick the *second* agent (codex) and confirm it rides into
+        // Filling, then out through Submit.
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a")], ready_local(), None, two_agents());
+        modal.handle_key(key(KeyCode::Enter)); // repo → agent picker
+        modal.handle_key(key(KeyCode::Down)); // move to codex
+        modal.handle_key(key(KeyCode::Enter)); // pick codex → Filling
+        match &modal {
+            NewSessionModal::Filling { agent, focus, .. } => {
+                assert_eq!(*agent, AgentKind::Codex);
+                assert_eq!(*focus, FillFocus::Task);
+            }
+            _ => panic!("expected Filling carrying codex"),
+        }
+        for c in "task".chars() {
+            modal.handle_key(key(KeyCode::Char(c)));
+        }
+        modal.handle_key(key(KeyCode::Tab));
+        for c in "main".chars() {
+            modal.handle_key(key(KeyCode::Char(c)));
+        }
+        match modal.handle_key(key(KeyCode::Enter)) {
+            KeyOutcome::Submit { agent, .. } => assert_eq!(agent, AgentKind::Codex),
+            other => panic!("expected Submit carrying codex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_step_threads_chosen_kind_into_submit_no_worktree() {
+        // No-worktree + ≥2 agents: repo Enter → agent picker → pick codex →
+        // SubmitNoWorktree carries codex (no Filling stage).
+        let mut modal = NewSessionModal::new_no_worktree(
+            vec![local_repo("a")],
+            ready_local(),
+            None,
+            two_agents(),
+        );
+        modal.handle_key(key(KeyCode::Enter)); // repo → agent picker
+        modal.handle_key(key(KeyCode::Down)); // move to codex
+        match modal.handle_key(key(KeyCode::Enter)) {
+            KeyOutcome::SubmitNoWorktree { repo, agent } => {
+                assert_eq!(repo.name, "a");
+                assert_eq!(agent, AgentKind::Codex);
+            }
+            other => panic!("expected SubmitNoWorktree carrying codex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_step_navigation_wraps() {
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a")], ready_local(), None, two_agents());
+        modal.handle_key(key(KeyCode::Enter)); // → agent picker
+        modal.handle_key(key(KeyCode::Up)); // wrap up from 0 → last
+        match &modal {
+            NewSessionModal::PickingAgent { state, agents, .. } => {
+                assert_eq!(state.selected(), Some(agents.len() - 1));
+            }
+            _ => panic!("expected PickingAgent"),
+        }
+    }
+
+    #[test]
+    fn esc_cancels_from_agent_step() {
+        // Matches the Filling step's idiom: Esc drops the whole modal, it
+        // does not step back to the repo picker.
+        let mut modal =
+            NewSessionModal::new(vec![local_repo("a")], ready_local(), None, two_agents());
+        modal.handle_key(key(KeyCode::Enter)); // → agent picker
+        assert!(matches!(
+            modal.handle_key(key(KeyCode::Esc)),
+            KeyOutcome::Cancel
+        ));
     }
 }

@@ -8,9 +8,10 @@ use std::time::{Duration, SystemTime};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
+use crate::agent::{AgentDerivation, AgentKind, agent};
 use crate::attachment::{LivePaneSnapshot, list_live_panes};
 use crate::host::Host;
-use crate::session::{Attention, EDITED_FILES_CAP, HostId, SessionId};
+use crate::session::{Attention, HostId, SessionId};
 
 /// How much of the transcript's tail to read when deriving attention.
 /// Transcripts are append-only JSONL; reading the last few KB is enough
@@ -26,12 +27,18 @@ pub const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 #[derive(Debug)]
 pub struct AttentionUpdate {
     pub id: SessionId,
+    /// Which agent CLI produced this update. The tail was already parsed
+    /// through this agent's `derive`, so the value is informational for
+    /// the catalog handler (it applies attention by id); carried alongside
+    /// `id` so an event is self-describing and future routing needs no
+    /// second lookup.
+    pub agent: AgentKind,
     pub attention: Attention,
     /// Whether `attention` is `Working` *because* the last transcript
     /// entry is a bare assistant `tool_use` — the signature of an
     /// in-flight tool or a blocked permission prompt. The catalog uses
     /// this to refuse to clear a live hook "blocked" pin on the prompt's
-    /// own entry (see [`AttentionDerivation`] and
+    /// own entry (see [`crate::agent::AgentDerivation`] and
     /// [`crate::catalog::SessionCatalog::apply_heuristic_attention`]).
     /// `false` for every non-`tool_use` derivation.
     pub from_tool_use: bool,
@@ -48,7 +55,7 @@ pub struct AttentionUpdate {
     /// mtime equals discovery's) costs nothing.
     pub mtime: Option<SystemTime>,
     /// Files edited within the scanned tail, most-recent-first (see
-    /// [`AttentionDerivation::edited_files`]). The catalog unions these
+    /// [`crate::agent::AgentDerivation`]). The catalog unions these
     /// into `Session.edited_files` via `merge_edited_files` so the picker
     /// stays current as the conversation runs. Empty when the tail held
     /// no edits or couldn't be read.
@@ -70,6 +77,10 @@ pub enum WatcherEvent {
     Attention(AttentionUpdate),
     NewTranscript {
         host: HostId,
+        /// Which agent CLI owns this transcript, resolved by the (host ×
+        /// agent) root the path was discovered under. The catalog builds
+        /// the session through this agent's parser.
+        agent: AgentKind,
         path: PathBuf,
         mtime: SystemTime,
     },
@@ -100,8 +111,8 @@ pub enum WatcherEvent {
     /// The catalog uses this to decide per-session whether Enter will
     /// be a fast switch (deterministic `agent-mux-<id>` tmux session
     /// exists, or a pane matches the session's `project_dir`) vs an
-    /// auto-resume (no match — fall through to `claude --resume`).
-    /// Empty lists are a valid value (no live panes / no tmux server
+    /// auto-resume (no match — fall through to the agent's resume
+    /// command). Empty lists are a valid value (no live panes / no tmux server
     /// / ssh hiccup) — every session on the host transitions to
     /// `Some(false)` in that case.
     LivePanes {
@@ -116,13 +127,30 @@ pub struct TranscriptWatcher {
     /// the notify backend down. We also call `.watch` on it from
     /// `add_target` in the no-recursive-root fallback path.
     watcher: notify::RecommendedWatcher,
-    targets: Arc<Mutex<HashMap<PathBuf, SessionId>>>,
+    /// Path → (session id, agent). The agent is stored per known target so
+    /// a filesystem event routes to the right parser even in the per-file
+    /// fallback mode where no recursive root is available to match against.
+    targets: Arc<Mutex<HashMap<PathBuf, (SessionId, AgentKind)>>>,
     event_tx: Sender<WatcherEvent>,
     host: Arc<dyn Host>,
-    /// True when a recursive watch on the projects root is active. When
-    /// false, `add_target` falls back to per-file watches so the watcher
-    /// still works in the degenerate no-discovery-root case.
+    /// True when at least one recursive root watch is active. When false,
+    /// `add_target` falls back to per-file watches so the watcher still
+    /// works in the degenerate no-discovery-root case.
     has_recursive_root: bool,
+}
+
+/// Longest-prefix match of `path` against the watched roots, yielding the
+/// owning agent + its root. `None` when no root contains the path (e.g.
+/// per-file fallback mode, where `roots` is empty).
+fn agent_for_path<'a>(
+    roots: &'a [(AgentKind, PathBuf)],
+    path: &Path,
+) -> Option<(AgentKind, &'a Path)> {
+    roots
+        .iter()
+        .filter(|(_, root)| path.starts_with(root))
+        .max_by_key(|(_, root)| root.as_os_str().len())
+        .map(|(k, root)| (*k, root.as_path()))
 }
 
 impl TranscriptWatcher {
@@ -138,13 +166,18 @@ impl TranscriptWatcher {
 
     /// Start watching for transcript events.
     ///
-    /// When `discovery_root` is `Some` and watchable, a single recursive
-    /// watch covers every transcript under it — both attention updates
-    /// for known files and discovery of new ones. When it is `None`, or
-    /// the recursive watch fails (e.g. the dir is on a filesystem that
-    /// can't be recursively watched), the watcher falls back to per-file
-    /// watches for the `initial` set and `NewTranscript` events will not
-    /// fire.
+    /// `roots` is one `(AgentKind, root)` pair per enabled agent. A single
+    /// recursive `notify` watcher covers every root under one process (the
+    /// "one filesystem watcher" discipline); a filesystem event is routed
+    /// to its owning agent by longest-prefix root match, then filtered by
+    /// that agent's [`crate::agent::AgentCli::is_transcript`] predicate.
+    /// The reference agent's (claude) root is created if missing so the
+    /// watch attaches on first run — other agents' roots are watched only
+    /// when present, because the directory's existence *is* the "installed
+    /// here" signal and fabricating it would defeat that. When no root can
+    /// be watched recursively (empty `roots`, or every watch failed), the
+    /// watcher falls back to per-file watches for the `initial` set and
+    /// `NewTranscript` events will not fire.
     ///
     /// Emits an initial `Attention` update for each session in `initial`
     /// synchronously before the watcher thread starts, so the UI never
@@ -161,34 +194,37 @@ impl TranscriptWatcher {
     /// Returns `notify::Error` if the platform watcher cannot be created
     /// or, in the per-file fallback, if any of the initial paths cannot
     /// be watched.
+    // Linear setup: watch each root, prime initial state, then spawn the
+    // one notify thread. The steps read top-to-bottom and share locals;
+    // extracting them would just scatter the setup across helpers.
+    #[allow(clippy::too_many_lines)]
     pub fn start(
         host: Arc<dyn Host>,
-        initial: Vec<(SessionId, PathBuf)>,
-        discovery_root: Option<&Path>,
+        initial: Vec<(SessionId, PathBuf, AgentKind)>,
+        roots: &[(AgentKind, PathBuf)],
     ) -> notify::Result<(Self, Receiver<WatcherEvent>)> {
         let (event_tx, event_rx) = mpsc::channel::<WatcherEvent>();
         let (notify_tx, notify_rx) = mpsc::channel();
 
         let mut watcher = notify::recommended_watcher(notify_tx)?;
 
-        let has_recursive_root = match discovery_root {
-            Some(root) => {
-                // Ensure the dir exists so the watch attaches on first-run
-                // (claude code would create it on its own eventually, but
-                // we'd miss the discovery window).
+        let mut watched_roots: Vec<(AgentKind, PathBuf)> = Vec::new();
+        for (kind, root) in roots {
+            if *kind == AgentKind::Claude {
+                // Byte-identical to the pre-WP2 first-run behaviour: create
+                // the reference agent's root so the watch attaches before
+                // the agent itself gets around to creating it (and we'd
+                // otherwise miss the discovery window).
                 let _ = fs::create_dir_all(root);
-                watcher.watch(root, RecursiveMode::Recursive).is_ok()
             }
-            None => false,
-        };
-        let projects_root = if has_recursive_root {
-            discovery_root.map(Path::to_path_buf)
-        } else {
-            None
-        };
+            if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
+                watched_roots.push((*kind, root.clone()));
+            }
+        }
+        let has_recursive_root = !watched_roots.is_empty();
 
         if !has_recursive_root {
-            for (_, path) in &initial {
+            for (_, path, _) in &initial {
                 watcher.watch(path, RecursiveMode::NonRecursive)?;
             }
         }
@@ -201,11 +237,12 @@ impl TranscriptWatcher {
         // `touch_activity` is still a no-op here because the catalog
         // already holds the discovery-time mtime — passing it through
         // doesn't rewind the cell.
-        for (id, path) in &initial {
+        for (id, path, kind) in &initial {
             let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
-            let detail = derive_attention_detail(host.as_ref(), path);
+            let detail = derive_attention_detail(host.as_ref(), path, *kind, Path::new(""));
             let _ = event_tx.send(WatcherEvent::Attention(AttentionUpdate {
                 id: id.clone(),
+                agent: *kind,
                 attention: detail.attention,
                 from_tool_use: detail.from_tool_use,
                 mtime,
@@ -213,14 +250,14 @@ impl TranscriptWatcher {
             }));
         }
 
-        let targets: Arc<Mutex<HashMap<PathBuf, SessionId>>> = Arc::new(Mutex::new(
-            initial.into_iter().map(|(id, p)| (p, id)).collect(),
+        let targets: Arc<Mutex<HashMap<PathBuf, (SessionId, AgentKind)>>> = Arc::new(Mutex::new(
+            initial.into_iter().map(|(id, p, k)| (p, (id, k))).collect(),
         ));
 
         let targets_for_thread = Arc::clone(&targets);
         let event_tx_for_thread = event_tx.clone();
         let host_for_thread = Arc::clone(&host);
-        let projects_root_for_thread = projects_root;
+        let roots_for_thread = watched_roots;
         thread::spawn(move || {
             for res in notify_rx {
                 let Ok(event) = res else { continue };
@@ -233,39 +270,53 @@ impl TranscriptWatcher {
                     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                         continue;
                     }
-                    // Drop transcripts nested deeper than `<root>/<bucket>/<file>.jsonl`.
-                    // Claude Code writes subagent (sidechain) transcripts at
-                    // `<bucket>/<parent-session-id>/subagents/agent-<id>.jsonl`,
-                    // which the recursive notify watch would otherwise surface
-                    // as standalone dashboard rows that flap on every write.
-                    // The local `Host::list_transcripts` enforces the same
-                    // depth-2 shape via `read_dir`, so both startup discovery
-                    // and live discovery filter identically.
-                    if let Some(root) = projects_root_for_thread.as_deref()
-                        && !is_top_level_transcript(&path, root)
+                    // Route path → owning agent by longest-prefix root
+                    // match, then apply *that agent's* top-level-transcript
+                    // predicate. This drops sidechain/subagent transcripts
+                    // nested deeper than the agent's tree shape (e.g. Claude
+                    // Code's `<bucket>/<parent-id>/subagents/…`), which the
+                    // recursive watch would otherwise surface as flapping
+                    // standalone rows; `Host::list_transcripts` enforces the
+                    // same shape at startup so both filter identically.
+                    let routed = agent_for_path(&roots_for_thread, &path);
+                    if let Some((kind, root)) = routed
+                        && !agent(kind).is_transcript(&path, root)
                     {
                         continue;
                     }
-                    let known_id = targets_for_thread
+                    let known = targets_for_thread
                         .lock()
                         .ok()
                         .and_then(|m| m.get(&path).cloned());
-                    let outgoing = if let Some(id) = known_id {
+                    let outgoing = if let Some((id, kind)) = known {
                         // Stat the file alongside the tail read so the
                         // dashboard's last-activity cell stays live —
                         // dropping the mtime on stat failure (file
                         // vanished, filesystem hiccup) is fine; the
                         // catalog keeps its existing value.
                         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
-                        let detail = derive_attention_detail(host_for_thread.as_ref(), &path);
+                        let detail = derive_attention_detail(
+                            host_for_thread.as_ref(),
+                            &path,
+                            kind,
+                            Path::new(""),
+                        );
                         WatcherEvent::Attention(AttentionUpdate {
                             id,
+                            agent: kind,
                             attention: detail.attention,
                             from_tool_use: detail.from_tool_use,
                             mtime,
                             edited_files: detail.edited_files,
                         })
                     } else {
+                        // A previously-unknown transcript: its agent is the
+                        // routed one. Without a watched root (per-file
+                        // fallback) we can't attribute it, so skip —
+                        // `NewTranscript` never fires in that mode anyway.
+                        let Some((kind, _)) = routed else {
+                            continue;
+                        };
                         // Stat now so the main thread doesn't have to;
                         // the file may have vanished between event and
                         // stat, in which case we drop and let the next
@@ -275,6 +326,7 @@ impl TranscriptWatcher {
                         };
                         WatcherEvent::NewTranscript {
                             host: HostId::local(),
+                            agent: kind,
                             path,
                             mtime,
                         }
@@ -310,17 +362,23 @@ impl TranscriptWatcher {
     /// In the no-recursive-root fallback path, returns `notify::Error` if
     /// the per-file watch cannot be installed. With a recursive root in
     /// place, this never fails.
-    pub fn add_target(&mut self, id: SessionId, path: PathBuf) -> notify::Result<()> {
+    pub fn add_target(
+        &mut self,
+        id: SessionId,
+        path: PathBuf,
+        kind: AgentKind,
+    ) -> notify::Result<()> {
         if !self.has_recursive_root {
             self.watcher.watch(&path, RecursiveMode::NonRecursive)?;
         }
-        let detail = derive_attention_detail(self.host.as_ref(), &path);
+        let detail = derive_attention_detail(self.host.as_ref(), &path, kind, Path::new(""));
         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         if let Ok(mut targets) = self.targets.lock() {
-            targets.insert(path, id.clone());
+            targets.insert(path, (id.clone(), kind));
         }
         let _ = self.event_tx.send(WatcherEvent::Attention(AttentionUpdate {
             id,
+            agent: kind,
             attention: detail.attention,
             from_tool_use: detail.from_tool_use,
             mtime,
@@ -342,9 +400,10 @@ impl TranscriptWatcher {
         host: &HostId,
         id: SessionId,
         path: PathBuf,
+        kind: AgentKind,
     ) -> notify::Result<()> {
         if host.is_local() {
-            self.add_target(id, path)
+            self.add_target(id, path, kind)
         } else {
             Ok(())
         }
@@ -376,7 +435,7 @@ impl TranscriptWatcher {
     pub fn start_polling_host(
         &self,
         host: Arc<dyn Host>,
-        root: PathBuf,
+        roots: Vec<(AgentKind, PathBuf)>,
         initial: Vec<(SessionId, PathBuf, SystemTime)>,
         interval: Duration,
     ) {
@@ -387,7 +446,15 @@ impl TranscriptWatcher {
                 .into_iter()
                 .map(|(id, path, mtime)| (path, (id, mtime)))
                 .collect();
-            let hooks_dir = crate::hook_ingest::hook_dir_for_transcripts_root(&root);
+            // WP8: hook markers live under each enabled agent's
+            // `<root>/.agent-mux-hooks/` (claude + codex today). Poll each
+            // one per tick over the same ControlMaster — an idle N-agent
+            // host is N cheap `list_files` calls, and a marker-free dir is
+            // a single empty listing.
+            let hooks_dirs: Vec<PathBuf> = roots
+                .iter()
+                .map(|(_, r)| crate::hook_ingest::hook_dir_for_transcripts_root(r))
+                .collect();
             loop {
                 thread::sleep(interval);
                 // Heal a dead connection before doing any work this tick.
@@ -419,17 +486,27 @@ impl TranscriptWatcher {
                         continue;
                     }
                 }
-                if !poll_once(host.as_ref(), &host_id, &root, &mut known, &tx) {
-                    return;
+                // One `find` per enabled agent root per tick. An idle
+                // N-agent host therefore costs N cheap finds (mtime-skip
+                // keeps the per-transcript reads down to actual changes);
+                // only *enabled* agents cost anything, and a root whose
+                // directory doesn't exist folds into an empty listing.
+                for (kind, root) in &roots {
+                    if !poll_once(host.as_ref(), &host_id, root, *kind, &mut known, &tx) {
+                        return;
+                    }
                 }
-                // Sibling tick on the same SSH ControlMaster: drain
-                // any new hook markers in `<root>/.agent-mux-hooks/`
-                // and emit them as `WatcherEvent::Hook`. A failure
-                // here doesn't break attention polling — the next
-                // tick retries and a really broken host surfaces via
-                // `list_transcripts` failing anyway.
-                if !poll_hooks_once(host.as_ref(), &hooks_dir, &tx) {
-                    return;
+                // Sibling tick on the same SSH ControlMaster: drain any
+                // new hook markers in each enabled agent's
+                // `<root>/.agent-mux-hooks/` and emit them as
+                // `WatcherEvent::Hook`. A failure here doesn't break
+                // attention polling — the next tick retries and a really
+                // broken host surfaces via `list_transcripts` failing
+                // anyway.
+                for hooks_dir in &hooks_dirs {
+                    if !poll_hooks_once(host.as_ref(), hooks_dir, &tx) {
+                        return;
+                    }
                 }
             }
         });
@@ -557,10 +634,12 @@ fn poll_once(
     host: &dyn Host,
     host_id: &HostId,
     root: &Path,
+    kind: AgentKind,
     known: &mut HashMap<PathBuf, (SessionId, SystemTime)>,
     tx: &Sender<WatcherEvent>,
 ) -> bool {
-    let Ok(stats) = host.list_transcripts(root) else {
+    let cli = agent(kind);
+    let Ok(stats) = host.list_transcripts(root, &cli.listing()) else {
         return true;
     };
     for stat in stats {
@@ -571,10 +650,11 @@ fn poll_once(
             // at one `find` per interval rather than N `tail -c`.
             if stat.mtime > *last_seen {
                 *last_seen = stat.mtime;
-                let detail = derive_attention_detail(host, &stat.path);
+                let detail = derive_attention_detail(host, &stat.path, kind, Path::new(""));
                 if tx
                     .send(WatcherEvent::Attention(AttentionUpdate {
                         id: id.clone(),
+                        agent: kind,
                         attention: detail.attention,
                         from_tool_use: detail.from_tool_use,
                         mtime: Some(stat.mtime),
@@ -587,14 +667,14 @@ fn poll_once(
             }
             continue;
         }
-        let Some(stem) = stat.path.file_stem().and_then(|s| s.to_str()) else {
+        let Some(id) = cli.session_id_from_path(&stat.path) else {
             continue;
         };
-        let id = SessionId(stem.to_string());
         known.insert(stat.path.clone(), (id.clone(), stat.mtime));
         if tx
             .send(WatcherEvent::NewTranscript {
                 host: host_id.clone(),
+                agent: kind,
                 path: stat.path.clone(),
                 mtime: stat.mtime,
             })
@@ -605,10 +685,11 @@ fn poll_once(
         // The dashboard would otherwise see this row sit at `Unknown`
         // until the *next* write — for a session that's been idle for
         // hours that could be a long time. Emit one Attention now.
-        let detail = derive_attention_detail(host, &stat.path);
+        let detail = derive_attention_detail(host, &stat.path, kind, Path::new(""));
         if tx
             .send(WatcherEvent::Attention(AttentionUpdate {
                 id,
+                agent: kind,
                 attention: detail.attention,
                 from_tool_use: detail.from_tool_use,
                 mtime: Some(stat.mtime),
@@ -622,50 +703,6 @@ fn poll_once(
     true
 }
 
-/// True iff `path` sits exactly one bucket below `projects_root` — i.e.
-/// `<projects_root>/<bucket>/<file>.jsonl`. Used by the local notify
-/// thread to drop sidechain transcripts Claude Code writes at
-/// `<bucket>/<parent-session-id>/subagents/agent-<id>.jsonl`; the bulk
-/// discovery path enforces the same shape via `read_dir` two levels deep,
-/// so both startup and live discovery filter identically.
-fn is_top_level_transcript(path: &Path, projects_root: &Path) -> bool {
-    path.parent()
-        .and_then(Path::parent)
-        .is_some_and(|p| p == projects_root)
-}
-
-/// The heuristic's full read of a transcript: the derived [`Attention`]
-/// plus whether the last classified entry was a bare assistant
-/// `tool_use`. The flag lets the catalog tell a permission prompt's
-/// transcript signature (the assistant paused mid-tool to ask → reads as
-/// `Working`) apart from genuine progress past a prompt (a `tool_result`
-/// / user message / turn-end). Without it, the very `tool_use` entry that
-/// triggered a hook's "blocked" pin would clobber that pin back to
-/// "working" the moment its file mtime edged a millisecond past the
-/// hook's timestamp. See [`crate::catalog::SessionCatalog::apply_heuristic_attention`].
-///
-/// Also carries the files edited within the scanned window (see
-/// `edited_files`). Bundling it here means the watcher's single tail read
-/// and discovery's single full-buffer read each yield attention *and* the
-/// edit list without a second `read_tail` — which on a remote host would
-/// be a second SSH round-trip per poll tick. Not `Copy` for that reason
-/// (the `Vec` field); the previous `Copy` was incidental.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttentionDerivation {
-    pub attention: Attention,
-    /// `true` iff the last classified entry was an assistant `tool_use`
-    /// (the transcript shape of an in-flight tool *or* a blocked
-    /// permission prompt — the two are indistinguishable from the
-    /// transcript alone, which is exactly why the hook exists).
-    pub from_tool_use: bool,
-    /// Absolute paths of files edited within the scanned buffer, most
-    /// recently edited first, deduplicated, capped at [`EDITED_FILES_CAP`].
-    /// For the tail-read path this is the *recent* window; for discovery's
-    /// full-buffer read it is the session's complete edit history. The
-    /// catalog unions these into `Session.edited_files`.
-    pub edited_files: Vec<PathBuf>,
-}
-
 /// Larger escalation window for [`derive_attention_detail`] when the
 /// default [`TAIL_BYTES`] tail yields no parseable entry. A single final
 /// assistant message can exceed 32 KiB (a long answer on one JSONL
@@ -676,216 +713,56 @@ pub struct AttentionDerivation {
 const TAIL_BYTES_ESCALATED: u64 = 1024 * 1024;
 
 /// Derive an attention state from the most recent meaningful JSONL entry in
-/// `transcript_path`. Reads only the last `TAIL_BYTES` of the file through
-/// `host`; the (possibly truncated) first line is discarded by virtue of
-/// failing to parse, and the remaining lines are walked to find the latest
-/// conversational entry.
+/// `transcript_path`, parsing through `kind`'s agent. Reads only the last
+/// `TAIL_BYTES` of the file through `host`; the (possibly truncated) first
+/// line is discarded by virtue of failing to parse, and the remaining lines
+/// are walked to find the latest conversational entry.
 #[must_use]
-pub fn derive_attention(host: &dyn Host, transcript_path: &Path) -> Attention {
-    derive_attention_detail(host, transcript_path).attention
+pub fn derive_attention(host: &dyn Host, transcript_path: &Path, kind: AgentKind) -> Attention {
+    derive_attention_detail(host, transcript_path, kind, Path::new("")).attention
 }
 
-/// Like [`derive_attention`] but also reports the `from_tool_use`
-/// discriminator (see [`AttentionDerivation`]). The five watcher
+/// Like [`derive_attention`] but returns the full [`AgentDerivation`]
+/// (attention + `from_tool_use` + edited files). The five watcher
 /// producers use this so the catalog can protect a live hook pin from
 /// the blocked prompt's own `tool_use` signature.
 ///
-/// Escalates to a larger read once when the default tail yields
-/// `Unknown` — a guard against a final message that overran the 32 KiB
-/// window leaving a completed turn looking like "no signal".
+/// This is the host-read orchestration around the agent's pure parse: it
+/// reads the tail through `host`, parses via the agent, and escalates to a
+/// larger read once when the default tail yields `Unknown` — a guard
+/// against a final message that overran the 32 KiB window leaving a
+/// completed turn looking like "no signal". The parsing itself lives
+/// behind [`crate::agent::AgentCli::derive`].
 #[must_use]
-pub fn derive_attention_detail(host: &dyn Host, transcript_path: &Path) -> AttentionDerivation {
+pub fn derive_attention_detail(
+    host: &dyn Host,
+    transcript_path: &Path,
+    kind: AgentKind,
+    cwd: &Path,
+) -> AgentDerivation {
+    // `cwd` is the session's working directory, threaded through for agents
+    // whose edited-file paths can be relative (pi). The watcher's own
+    // callers pass an empty placeholder — a tail read has no header `cwd`
+    // line — and the reference (claude) parser ignores it; discovery, which
+    // *does* know the cwd, hands the real value to `AgentCli::derive`.
+    let cli = agent(kind);
     let Ok(tail) = host.read_tail(transcript_path, TAIL_BYTES) else {
-        return AttentionDerivation {
+        return AgentDerivation {
             attention: Attention::Unknown,
             from_tool_use: false,
             edited_files: Vec::new(),
         };
     };
-    let detail = derive_attention_detail_from_content(&tail);
+    let detail = cli.derive(&tail, cwd);
     if detail.attention == Attention::Unknown
         && let Ok(bigger) = host.read_tail(transcript_path, TAIL_BYTES_ESCALATED)
     {
-        let escalated = derive_attention_detail_from_content(&bigger);
+        let escalated = cli.derive(&bigger, cwd);
         if escalated.attention != Attention::Unknown {
             return escalated;
         }
     }
     detail
-}
-
-/// Same attention-derivation logic as [`derive_attention`], but operates
-/// on transcript content already in memory. Discovery calls this after
-/// its bulk `read_many` so attention falls out of the same buffer it
-/// reads to extract `cwd` / `aiTitle`, with no extra SSH round-trip.
-/// The polling path keeps using the tail-only [`derive_attention`]
-/// because there the whole-file read would be wasteful — only the last
-/// few KB carry signal once the session is well underway.
-#[must_use]
-pub fn derive_attention_from_content(transcript: &str) -> Attention {
-    derive_attention_detail_from_content(transcript).attention
-}
-
-/// [`derive_attention_from_content`] plus the `from_tool_use`
-/// discriminator. Walks every parseable JSONL line, keeping the last
-/// classifiable entry, then maps it to an [`AttentionDerivation`].
-#[must_use]
-pub fn derive_attention_detail_from_content(transcript: &str) -> AttentionDerivation {
-    let mut last: Option<EntryKind> = None;
-    for line in transcript.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(kind) = classify(&value) {
-            last = Some(kind);
-        }
-    }
-    let attention = match last {
-        Some(EntryKind::AssistantAwaiting) => Attention::NeedsInput,
-        Some(EntryKind::AssistantToolUse | EntryKind::UserMessage | EntryKind::ToolResult) => {
-            Attention::Working
-        }
-        None => Attention::Unknown,
-    };
-    AttentionDerivation {
-        attention,
-        from_tool_use: matches!(last, Some(EntryKind::AssistantToolUse)),
-        edited_files: derive_edited_files_from_content(transcript),
-    }
-}
-
-/// Tool names whose `tool_use` blocks represent a file edit. `Read`,
-/// `Bash`, `Grep`, etc. are deliberately excluded — the picker is "files
-/// Claude *changed*", not "files Claude looked at". `MultiEdit` is the
-/// legacy batch-edit tool; `NotebookEdit` targets `.ipynb` cells and
-/// carries the path under `notebook_path` rather than `file_path`.
-const EDIT_TOOL_NAMES: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
-
-/// Extract the files edited in `transcript`, most recently edited first,
-/// deduplicated, capped at [`EDITED_FILES_CAP`]. Walks every parseable
-/// JSONL line for assistant `tool_use` blocks whose tool name is in
-/// [`EDIT_TOOL_NAMES`] and pulls the target path (`input.file_path`, or
-/// `input.notebook_path` for `NotebookEdit`).
-///
-/// Pure — no I/O. Discovery calls it on the full transcript buffer (full
-/// history); the watcher's tail read calls it on the last few KB (recent
-/// window). The catalog reconciles the two via
-/// [`crate::catalog::SessionCatalog::merge_edited_files`].
-#[must_use]
-pub fn derive_edited_files_from_content(transcript: &str) -> Vec<PathBuf> {
-    // Accumulate in chronological (oldest-first) order, then dedup
-    // keeping each path's *most recent* occurrence, then reverse to
-    // most-recent-first. Doing the dedup after the walk (rather than a
-    // HashSet during it) is what lets a re-edited file move to the front.
-    let mut chronological: Vec<PathBuf> = Vec::new();
-    for line in transcript.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        collect_edited_paths(&value, &mut chronological);
-    }
-    let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
-    let mut recent_first: Vec<PathBuf> = Vec::new();
-    for path in chronological.iter().rev() {
-        if seen.insert(path.as_path()) {
-            recent_first.push(path.clone());
-            if recent_first.len() >= EDITED_FILES_CAP {
-                break;
-            }
-        }
-    }
-    recent_first
-}
-
-/// Append the edit-target path(s) from one JSONL entry's `tool_use`
-/// blocks to `acc`, in the order they appear. A single assistant entry
-/// can carry several `tool_use` blocks, so this pushes each match.
-fn collect_edited_paths(value: &serde_json::Value, acc: &mut Vec<PathBuf>) {
-    let Some(content) = value
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return;
-    };
-    for block in content {
-        if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
-            continue;
-        }
-        let name = block.get("name").and_then(serde_json::Value::as_str);
-        if !name.is_some_and(|n| EDIT_TOOL_NAMES.contains(&n)) {
-            continue;
-        }
-        let Some(input) = block.get("input") else {
-            continue;
-        };
-        // `NotebookEdit` uses `notebook_path`; every other edit tool uses
-        // `file_path`. Try `file_path` first (the common case), fall back
-        // to `notebook_path`.
-        let path = input
-            .get("file_path")
-            .or_else(|| input.get("notebook_path"))
-            .and_then(serde_json::Value::as_str);
-        if let Some(p) = path {
-            acc.push(PathBuf::from(p));
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
-    /// Assistant message whose turn has actually ended — `stop_reason`
-    /// is `end_turn`, `stop_sequence`, `max_tokens`, or missing/unknown
-    /// (the conservative fallback so a partial or unfamiliar entry
-    /// keeps the previous "assistant is the last word" behaviour rather
-    /// than silently demoting to Working).
-    AssistantAwaiting,
-    /// Assistant message that paused only to invoke a tool
-    /// (`stop_reason == "tool_use"`). The assistant is not awaiting
-    /// human input; it's waiting on the tool to return.
-    AssistantToolUse,
-    UserMessage,
-    ToolResult,
-}
-
-fn classify(value: &serde_json::Value) -> Option<EntryKind> {
-    let entry_type = value.get("type")?.as_str()?;
-    match entry_type {
-        "assistant" => Some(classify_assistant(value)),
-        "user" => {
-            if value.get("toolUseResult").is_some() {
-                Some(EntryKind::ToolResult)
-            } else {
-                Some(EntryKind::UserMessage)
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Decide whether an assistant entry represents an end-of-turn (the
-/// session is now awaiting user input) or a tool-use pause (the
-/// assistant is still working, the tool just hasn't returned yet).
-///
-/// Drives the dominant notification-noise fix: tool-using turns flicker
-/// the last entry through `type: "assistant"` between every `tool_use`
-/// block and its matching `tool_result`, and the prior heuristic
-/// reported every such flicker as `NeedsInput`. Looking at
-/// `message.stop_reason` collapses those into `Working` and reserves
-/// `NeedsInput` for entries the model itself flagged as turn-ending.
-///
-/// `stop_reason` lives at `message.stop_reason` in the Claude Code JSONL
-/// shape. Missing / non-string / unfamiliar values fall back to
-/// `AssistantAwaiting` so a malformed line stays conservative.
-fn classify_assistant(value: &serde_json::Value) -> EntryKind {
-    let stop_reason = value
-        .get("message")
-        .and_then(|m| m.get("stop_reason"))
-        .and_then(|s| s.as_str());
-    match stop_reason {
-        Some("tool_use") => EntryKind::AssistantToolUse,
-        _ => EntryKind::AssistantAwaiting,
-    }
 }
 
 #[cfg(test)]
@@ -907,55 +784,30 @@ mod tests {
     #[test]
     fn empty_file_is_unknown() {
         let f = tempfile::NamedTempFile::new().unwrap();
-        assert_eq!(derive_attention(&host(), f.path()), Attention::Unknown);
+        assert_eq!(
+            derive_attention(&host(), f.path(), AgentKind::Claude),
+            Attention::Unknown
+        );
     }
 
-    #[test]
-    fn is_top_level_transcript_accepts_depth_two_paths() {
-        let root = Path::new("/r/projects");
-        assert!(is_top_level_transcript(
-            Path::new("/r/projects/-foo/abc.jsonl"),
-            root
-        ));
-    }
-
-    #[test]
-    fn is_top_level_transcript_rejects_nested_subagent_paths() {
-        // The exact shape Claude Code writes for sidechain transcripts:
-        // <bucket>/<parent-session-id>/subagents/agent-<id>.jsonl.
-        // Without this filter the recursive notify watch would surface
-        // every subagent as a flapping standalone session.
-        let root = Path::new("/r/projects");
-        assert!(!is_top_level_transcript(
-            Path::new("/r/projects/-foo/parent-sess/subagents/agent-xyz.jsonl"),
-            root
-        ));
-    }
-
-    #[test]
-    fn is_top_level_transcript_rejects_root_or_above() {
-        let root = Path::new("/r/projects");
-        // Direct child of the root, not inside any bucket — shouldn't happen
-        // in practice but the predicate should still say no.
-        assert!(!is_top_level_transcript(
-            Path::new("/r/projects/loose.jsonl"),
-            root
-        ));
-        // Path entirely outside the root.
-        assert!(!is_top_level_transcript(
-            Path::new("/elsewhere/foo/bar.jsonl"),
-            root
-        ));
-    }
+    // These tests cover the *host-read orchestration* in
+    // `derive_attention` (tail read via the Host, escalation, and routing
+    // the bytes through the agent parser). The agent-specific
+    // classification (stop-reason handling, edited-file extraction) is
+    // pinned in the reference-agent module; the fixtures here stay minimal and
+    // agent-neutral so this module carries no transcript-field coupling.
 
     #[test]
     fn only_housekeeping_entries_is_unknown() {
+        // Entries the parser doesn't classify leave the state Unknown.
         let f = write_jsonl(&[
             r#"{"type":"permission-mode","permissionMode":"default"}"#,
             r#"{"type":"file-history-snapshot"}"#,
-            r#"{"type":"ai-title","title":"x"}"#,
         ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::Unknown);
+        assert_eq!(
+            derive_attention(&host(), f.path(), AgentKind::Claude),
+            Attention::Unknown
+        );
     }
 
     #[test]
@@ -964,7 +816,10 @@ mod tests {
             r#"{"type":"user","message":"hi"}"#,
             r#"{"type":"assistant","message":"hello"}"#,
         ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
+        assert_eq!(
+            derive_attention(&host(), f.path(), AgentKind::Claude),
+            Attention::NeedsInput
+        );
     }
 
     #[test]
@@ -973,7 +828,10 @@ mod tests {
             r#"{"type":"assistant","message":"hello"}"#,
             r#"{"type":"user","message":"do thing"}"#,
         ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
+        assert_eq!(
+            derive_attention(&host(), f.path(), AgentKind::Claude),
+            Attention::Working
+        );
     }
 
     #[test]
@@ -982,7 +840,10 @@ mod tests {
             r#"{"type":"assistant","message":"running tool"}"#,
             r#"{"type":"user","toolUseResult":{"stdout":"ok"}}"#,
         ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
+        assert_eq!(
+            derive_attention(&host(), f.path(), AgentKind::Claude),
+            Attention::Working
+        );
     }
 
     #[test]
@@ -991,239 +852,37 @@ mod tests {
             r#"{"type":"user","message":"hi"}"#,
             r#"{"type":"assistant","message":"hello"}"#,
             r#"{"type":"file-history-snapshot"}"#,
-            r#"{"type":"ai-title","title":"x"}"#,
         ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
+        assert_eq!(
+            derive_attention(&host(), f.path(), AgentKind::Claude),
+            Attention::NeedsInput
+        );
     }
 
     #[test]
     fn nonexistent_file_is_unknown() {
         let path = std::path::PathBuf::from("/nonexistent/path/foo.jsonl");
-        assert_eq!(derive_attention(&host(), &path), Attention::Unknown);
-    }
-
-    #[test]
-    fn assistant_with_tool_use_stop_reason_is_working_not_needs_input() {
-        // The dominant notification-noise case: assistant emits a tool_use
-        // block, the entry's stop_reason is "tool_use", and the next event
-        // will be a tool_result. Previously this flickered through
-        // NeedsInput between every tool_use/tool_result pair.
-        let f = write_jsonl(&[
-            r#"{"type":"user","message":"do thing"}"#,
-            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash"}]}}"#,
-        ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
-    }
-
-    #[test]
-    fn assistant_with_end_turn_stop_reason_is_needs_input() {
-        let f = write_jsonl(&[
-            r#"{"type":"user","message":"hi"}"#,
-            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}"#,
-        ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
-    }
-
-    #[test]
-    fn assistant_without_stop_reason_falls_back_to_needs_input() {
-        // The fallback keeps the pre-fix behaviour for entries that don't
-        // carry a parseable stop_reason — malformed entries, partial
-        // writes, or unfamiliar future shapes — so an unknown line
-        // stays loud rather than silently quiet.
-        let f = write_jsonl(&[
-            r#"{"type":"user","message":"hi"}"#,
-            r#"{"type":"assistant","message":"hello"}"#,
-        ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
-    }
-
-    #[test]
-    fn assistant_with_unknown_stop_reason_falls_back_to_needs_input() {
-        // E.g. `pause_turn`, `refusal`, or a stop_reason added in a future
-        // Claude Code version. Conservative default: surface to the user.
-        let f = write_jsonl(&[
-            r#"{"type":"assistant","message":{"stop_reason":"pause_turn","content":[]}}"#,
-        ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
-    }
-
-    #[test]
-    fn tool_use_followed_by_tool_result_then_end_turn_is_needs_input() {
-        // Full agentic-loop tail: assistant calls a tool, tool result
-        // comes back, assistant ends turn. Only the last entry's
-        // stop_reason should matter for the final attention state.
-        let f = write_jsonl(&[
-            r#"{"type":"user","message":"do thing"}"#,
-            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}"#,
-            r#"{"type":"user","toolUseResult":{"stdout":"ok"}}"#,
-            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
-        ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::NeedsInput);
-    }
-
-    #[test]
-    fn tool_use_assistant_as_last_entry_is_working_not_needs_input() {
-        // Mirrors the "we observed a tool_use entry but the tool_result
-        // hasn't been written yet" window. Pre-fix this was the loudest
-        // false-positive — every tool call notified.
-        let f = write_jsonl(&[
-            r#"{"type":"user","message":"do thing"}"#,
-            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read"}]}}"#,
-        ]);
-        assert_eq!(derive_attention(&host(), f.path()), Attention::Working);
-    }
-
-    #[test]
-    fn detail_flags_from_tool_use_only_for_trailing_tool_use() {
-        // The `from_tool_use` discriminator the catalog leans on to
-        // protect a hook "blocked" pin: true iff the *last* classified
-        // entry is an assistant `tool_use`.
-        let tool_use = derive_attention_detail_from_content(
-            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}"#,
-        );
-        assert_eq!(tool_use.attention, Attention::Working);
-        assert!(tool_use.from_tool_use);
-
-        // A tool_result (user entry) after the tool_use is genuine
-        // progress — Working, but NOT from a tool_use.
-        let tool_result = derive_attention_detail_from_content(
-            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"tool_use\",\"content\":[{\"type\":\"tool_use\"}]}}\n\
-             {\"type\":\"user\",\"toolUseResult\":{\"ok\":true},\"message\":\"r\"}",
-        );
-        assert_eq!(tool_result.attention, Attention::Working);
-        assert!(
-            !tool_result.from_tool_use,
-            "tool_result is progress, not a tool_use"
-        );
-
-        // An end_turn assistant is `done`, never a tool_use.
-        let done = derive_attention_detail_from_content(
-            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"hi"}]}}"#,
-        );
-        assert_eq!(done.attention, Attention::NeedsInput);
-        assert!(!done.from_tool_use);
-    }
-
-    /// Build one assistant JSONL line invoking `tool` on `path`.
-    fn edit_line(tool: &str, path_key: &str, path: &str) -> String {
-        format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{tool}","input":{{"{path_key}":"{path}"}}}}]}}}}"#
-        )
-    }
-
-    #[test]
-    fn edited_files_extracts_edit_and_write_paths_most_recent_first() {
-        let content = [
-            edit_line("Edit", "file_path", "/w/a.rs"),
-            edit_line("Write", "file_path", "/w/b.rs"),
-        ]
-        .join("\n");
-        // Newest edit (b.rs) leads.
         assert_eq!(
-            derive_edited_files_from_content(&content),
-            vec![PathBuf::from("/w/b.rs"), PathBuf::from("/w/a.rs")]
+            derive_attention(&host(), &path, AgentKind::Claude),
+            Attention::Unknown
         );
     }
 
     #[test]
-    fn edited_files_ignores_read_and_bash() {
-        let content = [
-            edit_line("Read", "file_path", "/w/looked.rs"),
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
-            edit_line("Edit", "file_path", "/w/changed.rs"),
-        ]
-        .join("\n");
-        assert_eq!(
-            derive_edited_files_from_content(&content),
-            vec![PathBuf::from("/w/changed.rs")]
-        );
-    }
-
-    #[test]
-    fn edited_files_dedups_and_moves_reedited_to_front() {
-        let content = [
-            edit_line("Edit", "file_path", "/w/a.rs"),
-            edit_line("Edit", "file_path", "/w/b.rs"),
-            edit_line("Edit", "file_path", "/w/a.rs"), // a re-edited last
-        ]
-        .join("\n");
-        // a.rs is most-recent (edited last), b.rs after, each once.
-        assert_eq!(
-            derive_edited_files_from_content(&content),
-            vec![PathBuf::from("/w/a.rs"), PathBuf::from("/w/b.rs")]
-        );
-    }
-
-    #[test]
-    fn edited_files_reads_notebook_path_for_notebook_edit() {
-        let content = edit_line("NotebookEdit", "notebook_path", "/w/nb.ipynb");
-        assert_eq!(
-            derive_edited_files_from_content(&content),
-            vec![PathBuf::from("/w/nb.ipynb")]
-        );
-    }
-
-    #[test]
-    fn edited_files_handles_multiple_tool_use_blocks_in_one_entry() {
-        // A single assistant entry can carry several tool_use blocks.
-        let content = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/w/a.rs"}},{"type":"text","text":"and"},{"type":"tool_use","name":"Write","input":{"file_path":"/w/b.rs"}}]}}"#;
-        // Within one entry, blocks are chronological; b.rs is later so leads.
-        assert_eq!(
-            derive_edited_files_from_content(content),
-            vec![PathBuf::from("/w/b.rs"), PathBuf::from("/w/a.rs")]
-        );
-    }
-
-    #[test]
-    fn edited_files_empty_when_no_edits() {
-        assert!(derive_edited_files_from_content(user_line()).is_empty());
-        assert!(derive_edited_files_from_content("not json").is_empty());
-    }
-
-    #[test]
-    fn edited_files_caps_at_the_limit() {
-        let content: String = (0..(EDITED_FILES_CAP + 50))
-            .map(|i| edit_line("Edit", "file_path", &format!("/w/f{i}.rs")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let files = derive_edited_files_from_content(&content);
-        assert_eq!(files.len(), EDITED_FILES_CAP);
-        // Most-recent-first: the last-written file leads.
-        assert_eq!(
-            files[0],
-            PathBuf::from(format!("/w/f{}.rs", EDITED_FILES_CAP + 49))
-        );
-    }
-
-    #[test]
-    fn derive_attention_detail_carries_edited_files() {
-        // The bundled derivation path the watcher relies on: attention +
-        // edits fall out of one buffer walk.
-        let content = [
-            edit_line("Edit", "file_path", "/w/a.rs"),
-            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[]}}"#.to_string(),
-        ]
-        .join("\n");
-        let detail = derive_attention_detail_from_content(&content);
-        assert_eq!(detail.attention, Attention::NeedsInput);
-        assert_eq!(detail.edited_files, vec![PathBuf::from("/w/a.rs")]);
-    }
-
-    #[test]
-    fn derive_attention_recovers_done_from_oversized_final_message() {
+    fn derive_attention_recovers_state_from_oversized_final_message() {
         // Regression for "completed not detected": a final assistant
         // message larger than TAIL_BYTES leaves only an unterminated
         // continuation in the 32 KiB tail, so the tail-only read derives
-        // `Unknown`. The escalation re-read must recover the real `done`.
+        // `Unknown`. The escalation re-read must recover the real state.
+        // Uses a bare assistant message (no transcript-field coupling —
+        // the classification detail is tested in the reference-agent module).
         let big_text = "x".repeat(40 * 1024); // > TAIL_BYTES (32 KiB) tail window
-        let huge_final = format!(
-            r#"{{"type":"assistant","message":{{"stop_reason":"end_turn","content":[{{"type":"text","text":"{big_text}"}}]}}}}"#,
-        );
+        let huge_final = format!(r#"{{"type":"assistant","message":"{big_text}"}}"#);
         let f = write_jsonl(&[r#"{"type":"user","message":"go"}"#, &huge_final]);
         assert_eq!(
-            derive_attention(&host(), f.path()),
+            derive_attention(&host(), f.path(), AgentKind::Claude),
             Attention::NeedsInput,
-            "oversized final message must still read as done, not unknown"
+            "oversized final message must still classify, not fall to unknown"
         );
     }
 
@@ -1268,7 +927,11 @@ mod tests {
             &self.id
         }
 
-        fn list_transcripts(&self, _root: &Path) -> io::Result<Vec<TranscriptStat>> {
+        fn list_transcripts(
+            &self,
+            _root: &Path,
+            _spec: &crate::agent::ListingSpec,
+        ) -> io::Result<Vec<TranscriptStat>> {
             let mut out: Vec<_> = self
                 .files
                 .lock()
@@ -1383,6 +1046,7 @@ mod tests {
             &host,
             host.id(),
             Path::new("/r"),
+            AgentKind::Claude,
             &mut known,
             &tx
         ));
@@ -1402,7 +1066,14 @@ mod tests {
                 .into_iter()
                 .collect();
         let (tx, rx) = mpsc::channel();
-        poll_once(&host, host.id(), Path::new("/r"), &mut known, &tx);
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut known,
+            &tx,
+        );
 
         let events = drain(&rx);
         assert_eq!(events.len(), 1, "got: {events:?}");
@@ -1429,17 +1100,26 @@ mod tests {
 
         let mut known: HashMap<PathBuf, (SessionId, SystemTime)> = HashMap::new();
         let (tx, rx) = mpsc::channel();
-        poll_once(&host, host.id(), Path::new("/r"), &mut known, &tx);
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut known,
+            &tx,
+        );
 
         let events = drain(&rx);
         assert_eq!(events.len(), 2, "got: {events:?}");
         match &events[0] {
             WatcherEvent::NewTranscript {
                 host: h,
+                agent: a,
                 path: p,
                 mtime: m,
             } => {
                 assert_eq!(h.as_str(), "devbox");
+                assert_eq!(*a, AgentKind::Claude);
                 assert_eq!(p, &path);
                 assert_eq!(*m, ts(50));
             }
@@ -1455,8 +1135,53 @@ mod tests {
         // The new path is now in known-set; a subsequent tick with no
         // mtime change should be silent.
         let (tx2, rx2) = mpsc::channel();
-        poll_once(&host, host.id(), Path::new("/r"), &mut known, &tx2);
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut known,
+            &tx2,
+        );
         assert!(drain(&rx2).is_empty());
+    }
+
+    #[test]
+    fn poll_once_tags_events_with_the_polled_agent() {
+        // WP2 routing: polling a codex root emits events carrying
+        // `AgentKind::Codex`, and the session id is derived through the
+        // codex path-id rule (trailing uuid of the rollout filename) — so
+        // the catalog builds it through the right agent, not claude.
+        let host = MockHost::new("devbox");
+        let path = PathBuf::from(
+            "/r/2026/07/09/rollout-2026-07-09T10-00-00-00000000-1111-2222-3333-444444444444.jsonl",
+        );
+        host.put(&path, user_line(), ts(50));
+
+        let mut known: HashMap<PathBuf, (SessionId, SystemTime)> = HashMap::new();
+        let (tx, rx) = mpsc::channel();
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Codex,
+            &mut known,
+            &tx,
+        );
+
+        let events = drain(&rx);
+        assert_eq!(events.len(), 2, "got: {events:?}");
+        match &events[0] {
+            WatcherEvent::NewTranscript { agent, .. } => assert_eq!(*agent, AgentKind::Codex),
+            other => panic!("expected NewTranscript, got: {other:?}"),
+        }
+        match &events[1] {
+            WatcherEvent::Attention(u) => {
+                assert_eq!(u.agent, AgentKind::Codex);
+                assert_eq!(u.id.0, "00000000-1111-2222-3333-444444444444");
+            }
+            other => panic!("expected Attention, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1468,7 +1193,11 @@ mod tests {
             fn id(&self) -> &HostId {
                 &self.0
             }
-            fn list_transcripts(&self, _: &Path) -> io::Result<Vec<TranscriptStat>> {
+            fn list_transcripts(
+                &self,
+                _: &Path,
+                _: &crate::agent::ListingSpec,
+            ) -> io::Result<Vec<TranscriptStat>> {
                 Err(io::Error::other("ssh: connection refused"))
             }
             fn read_to_string(&self, _: &Path) -> io::Result<String> {
@@ -1514,6 +1243,7 @@ mod tests {
             &host,
             host.id(),
             Path::new("/r"),
+            AgentKind::Claude,
             &mut known,
             &tx
         ));
@@ -1533,7 +1263,14 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         drop(rx);
         assert!(
-            !poll_once(&host, host.id(), Path::new("/r"), &mut known, &tx),
+            !poll_once(
+                &host,
+                host.id(),
+                Path::new("/r"),
+                AgentKind::Claude,
+                &mut known,
+                &tx
+            ),
             "should signal shutdown when no receiver"
         );
     }
@@ -1555,6 +1292,7 @@ mod tests {
             &host,
             host.id(),
             Path::new("/r"),
+            AgentKind::Claude,
             &mut known,
             &tx
         ));

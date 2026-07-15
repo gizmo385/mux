@@ -642,6 +642,7 @@ mod tests {
         Session {
             id: SessionId(id.to_string()),
             host: HostId(host.to_string()),
+            agent: crate::agent::AgentKind::Claude,
             project_dir: PathBuf::from(project),
             transcript_path: PathBuf::from(format!("/t/{id}.jsonl")),
             last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(10_000 - seconds_ago),

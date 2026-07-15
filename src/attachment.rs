@@ -1,17 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::agent::{AgentKind, SpawnPlan, agent};
 use crate::host::{Host, shell_join_quoted, shell_single_quote};
-use crate::session::Session;
+use crate::session::{Session, SessionId};
 
 #[derive(Debug)]
 pub enum AttachError {
     NotFound,
     TmuxCommandFailed(String),
     /// Remote attach hit a code path we haven't filled in yet (e.g. no
-    /// remote pane found and we don't yet auto-spawn `claude --resume`
-    /// inside remote tmux). Surfaced verbatim in the dashboard status
-    /// so the user knows what to do manually.
+    /// remote pane found and we don't yet auto-spawn the agent's resume
+    /// command inside remote tmux). Surfaced verbatim in the dashboard
+    /// status so the user knows what to do manually.
     RemoteUnsupported(String),
 }
 
@@ -86,6 +87,15 @@ pub struct EmbedSpec {
     /// `ToolLaunchRegistry` keys on this field so the dashboard's
     /// "Tools" group can re-attach to the same session.
     pub tmux_session: Option<String>,
+    /// For a `DiscoverAfterSpawn` agent (codex): the adoption *nonce* — the
+    /// uuid naming the provisional `agent-mux-pending-<nonce>` tmux session
+    /// this embed attached to. `None` for every other path (pinned-id
+    /// spawns, attaches, tool/terminal launches). `main.rs` reads it to
+    /// register a pending-spawn entry so the rollout that appears in this
+    /// cwd can adopt the real id and rename the session (plan §2.4). Kept
+    /// distinct from [`tmux_session`](Self::tmux_session) so it never
+    /// touches the tool-launch prune path on PTY exit.
+    pub adopt_pending: Option<String>,
 }
 
 pub trait AttachmentDriver {
@@ -104,7 +114,7 @@ pub trait AttachmentDriver {
     /// Returns `AttachError::NotFound` if no tmux pane matches the session,
     /// `AttachError::TmuxCommandFailed` if tmux returns non-zero, or
     /// `AttachError::RemoteUnsupported` for remote code paths not yet
-    /// implemented (e.g. `claude --resume` against a remote tmux).
+    /// implemented (e.g. the agent resume command against a remote tmux).
     fn attach(
         &self,
         session: &Session,
@@ -124,25 +134,60 @@ pub trait AttachmentDriver {
         host: &dyn Host,
     ) -> Result<AttachOutcome, AttachError>;
 
-    /// Launch a fresh `claude` process in a new tmux window at `cwd`, and
+    /// Launch a fresh agent process in a new tmux window at `cwd`, and
     /// switch focus to it. Used by the new-session flow after the
     /// `WorktreeManager` has created the worktree on `host`.
     ///
-    /// For local hosts, `cwd` is a local path and `claude` runs in a new
+    /// For local hosts, `cwd` is a local path and the agent runs in a new
     /// local tmux window (or a fresh tmux session if outside tmux). For
     /// remote hosts, `cwd` is a path on the *remote* and the command
     /// runs through `Host::ssh_argv` over the existing `ControlMaster`
     /// — same dispatch shape as the M2 attach path.
     ///
-    /// The resulting Claude Code session surfaces in the dashboard
-    /// shortly after via the existing transcript-discovery pipeline —
-    /// this method does not return a `SessionId`.
+    /// The resulting agent session surfaces in the dashboard shortly after
+    /// via the existing transcript-discovery pipeline — this method does
+    /// not return a `SessionId`.
+    ///
+    /// `kind` selects which agent CLI to launch — its
+    /// [`crate::agent::AgentCli::spawn`] plan decides both the launch argv
+    /// and, for a `DiscoverAfterSpawn` agent (codex), the provisional
+    /// `agent-mux-pending-<nonce>` tmux name whose nonce rides back in
+    /// [`EmbedSpec::adopt_pending`]. The new-session flow threads the
+    /// picked kind here (WP7); until then it is `AgentKind::Claude`.
     ///
     /// # Errors
     /// Returns `AttachError::TmuxCommandFailed` if tmux returns non-zero,
     /// or `AttachError::RemoteUnsupported` if `host` is unexpectedly
     /// local-shaped (e.g. an `ssh_argv` impl that returns `None`).
-    fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError>;
+    fn spawn_session(
+        &self,
+        cwd: &Path,
+        host: &dyn Host,
+        kind: AgentKind,
+    ) -> Result<AttachOutcome, AttachError>;
+
+    /// Adopt a `DiscoverAfterSpawn` session (codex): rename its provisional
+    /// `agent-mux-pending-<nonce>` tmux session to the durable
+    /// `agent-mux-<adopted_id>` once the rollout has revealed the real id
+    /// (plan §2.4 step 3). This restores the name→id link that pane
+    /// resolution stage 1, the resume fallback, and the pane-presence
+    /// indicator all key on. Local runs `tmux rename-session`; remote
+    /// routes the same command through `Host::ssh_argv`, like every other
+    /// tmux op. Both drivers behave identically (a rename is neither a
+    /// suspend nor an embed), so this has no per-driver variant.
+    ///
+    /// # Errors
+    /// `AttachError::TmuxCommandFailed` if tmux returns non-zero,
+    /// `AttachError::RemoteUnsupported` if a remote host's `ssh_argv`
+    /// yields `None`.
+    fn adopt_pending_session(
+        &self,
+        host: &dyn Host,
+        nonce: &str,
+        adopted_id: &SessionId,
+    ) -> Result<(), AttachError> {
+        run_adopt_pending_session(host, nonce, adopted_id)
+    }
 
     /// Launch a user-configured tool (lazygit, nvim, …) in the
     /// session's cwd. Same dispatch family as [`spawn_terminal`] —
@@ -214,18 +259,30 @@ impl AttachmentDriver for TmuxDriver {
         }
     }
 
-    fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+    fn spawn_session(
+        &self,
+        cwd: &Path,
+        host: &dyn Host,
+        kind: AgentKind,
+    ) -> Result<AttachOutcome, AttachError> {
+        // The legacy (`--no-embed`) driver never pinned a session id and
+        // never gave a session the `agent-mux-<id>` name, so there is
+        // nothing to adopt here — codex simply launches its bare binary
+        // and later re-attaches via the cwd fallback, exactly like a
+        // session started outside agent-mux. The binary name (bare launch,
+        // no id pin for any agent) comes from the agent.
+        let binary = agent(kind).default_binary();
         if host.id().is_local() {
-            Self::launch_in_new_window(cwd, "claude")
+            Self::launch_in_new_window(cwd, binary)
         } else {
-            // Fresh remote tmux session running claude. No `-A` here
+            // Fresh remote tmux session running the agent. No `-A` here
             // (unlike `resume_remote`): this is the initial spawn so
             // there's no pre-existing session to attach to. tmux
-            // auto-names the session; the user reaches it later via
-            // the dashboard's normal attach path once the new
-            // transcript surfaces in `~/.claude/projects/`.
+            // auto-names the session; the user reaches it later via the
+            // dashboard's normal attach path once the new transcript
+            // surfaces under the agent's transcript root.
             let cwd_str = cwd.to_string_lossy();
-            Self::run_remote_interactive(host, &["tmux", "new-session", "-c", &cwd_str, "claude"])
+            Self::run_remote_interactive(host, &["tmux", "new-session", "-c", &cwd_str, binary])
         }
     }
 }
@@ -242,8 +299,8 @@ impl TmuxDriver {
         }
         // No live pane (either tmux says NotFound, or there's no tmux server
         // at all and list-panes failed). Resume the transcript in a fresh
-        // claude process, in the session's recorded cwd.
-        let cmd = format!("claude --resume {}", session.id.0);
+        // agent process, in the session's recorded cwd.
+        let cmd = agent(session.agent).resume_command(&session.id);
         Self::launch_in_new_window(&session.project_dir, &cmd)
     }
 
@@ -339,11 +396,11 @@ impl TmuxDriver {
     /// *remote* tmux whose `pane_current_path` matches `project_dir`,
     /// then `ssh -t <target> tmux attach -t <pane>`. When no pane
     /// matches, fall through to a remote `tmux new-session -A` running
-    /// `claude --resume <id>` — the analog of the local "resume in a
+    /// the agent's resume command — the analog of the local "resume in a
     /// fresh tmux window" fallback. `-A` makes the fallback
     /// idempotent: a second attach reuses the same remote tmux session
-    /// rather than spawning a parallel `claude --resume` that would
-    /// race the first on the same transcript.
+    /// rather than spawning a parallel resume that would race the first
+    /// on the same transcript.
     ///
     /// Inside-tmux on the local side, both branches live in a new
     /// local tmux window (yes, nested tmux — see README); outside-tmux,
@@ -360,7 +417,7 @@ impl TmuxDriver {
         }
     }
 
-    /// Spawn `claude --resume <id>` inside a deterministically-named
+    /// Spawn the agent's resume command inside a deterministically-named
     /// remote tmux session and attach the client. The session name is
     /// `agent-mux-<conversation-id>`; `-A` attaches to it if it
     /// already exists (so repeated fallbacks converge). Handles all
@@ -465,8 +522,8 @@ pub struct LivePaneSnapshot {
 /// and `pane_current_path`. Returns an empty snapshot on any failure —
 /// no tmux server, ssh hiccup, non-zero exit, parse error. The
 /// dashboard's pane-presence indicator is strictly advisory (the
-/// attach path's `claude --resume` fallback covers stale state), so
-/// failures must not surface as errors.
+/// attach path's resume fallback covers stale state), so failures
+/// must not surface as errors.
 ///
 /// Dispatches by host: local invokes `tmux` directly, remote shells
 /// out via `host.ssh_argv(false, ...)` over the existing
@@ -577,7 +634,7 @@ fn find_pane_remote(
 /// dashboard hosts every "doing stuff" action inside the PTY widget
 /// instead of handing the terminal off. Sidebar stays visible
 /// throughout; pressing Enter on a session row re-attaches to the
-/// underlying claude session (the embed re-installs against a
+/// underlying agent session (the embed re-installs against a
 /// different `SessionId`, dropping the terminal/tool view).
 ///
 /// 2026-05-20 design shift: `spawn_terminal` and `spawn_tool` used to
@@ -631,9 +688,9 @@ impl AttachmentDriver for PtyDriver {
         }
     }
 
-    /// Spawn `claude` into a detached tmux session, then return an
+    /// Spawn the agent into a detached tmux session, then return an
     /// `EmbedPty` that attaches the dashboard's embedded pane to it.
-    /// Split into two tmux calls so the user sees claude paint into the
+    /// Split into two tmux calls so the user sees the agent paint into the
     /// embedded pane immediately rather than getting a fullscreen
     /// handoff (which is what delegating to `TmuxDriver` produced
     /// pre-2026-05-19). tmux assigns the session name via `-P -F
@@ -642,11 +699,16 @@ impl AttachmentDriver for PtyDriver {
     /// the session normally through the transcript watcher; re-attach
     /// via Enter goes through `find_pane_local`, finds this tmux
     /// session by cwd, and embeds against the same target.
-    fn spawn_session(&self, cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+    fn spawn_session(
+        &self,
+        cwd: &Path,
+        host: &dyn Host,
+        kind: AgentKind,
+    ) -> Result<AttachOutcome, AttachError> {
         if host.id().is_local() {
-            Self::spawn_session_local(cwd)
+            Self::spawn_session_local(cwd, kind)
         } else {
-            Self::spawn_session_remote(cwd, host)
+            Self::spawn_session_remote(cwd, host, kind)
         }
     }
 
@@ -674,7 +736,7 @@ impl PtyDriver {
     /// PTY widget — no SSH wrap, no `switch-client` branch. We still
     /// prefer a live-pane attach over a fresh resume when one exists,
     /// so the user's existing tmux work shows up in the widget rather
-    /// than a parallel claude session that doesn't see their open
+    /// than a parallel agent session that doesn't see their open
     /// terminals.
     ///
     /// Infallible by construction — `find_pane_local`'s error path
@@ -721,6 +783,7 @@ impl PtyDriver {
             cwd: None,
             label: format!("terminal · {}", spawn_session_label(&session.project_dir)),
             tmux_session: Some(session_name),
+            adopt_pending: None,
         }))
     }
 
@@ -759,6 +822,7 @@ impl PtyDriver {
             cwd: None,
             label: format!("terminal · {}", spawn_session_label(&session.project_dir)),
             tmux_session: Some(session_name),
+            adopt_pending: None,
         }))
     }
 
@@ -806,6 +870,7 @@ impl PtyDriver {
                 spawn_session_label(&session.project_dir)
             ),
             tmux_session: Some(session_name),
+            adopt_pending: None,
         }))
     }
 
@@ -851,50 +916,57 @@ impl PtyDriver {
                 spawn_session_label(&session.project_dir)
             ),
             tmux_session: Some(session_name),
+            adopt_pending: None,
         }))
     }
 
-    /// Spawn a fresh `claude` into a detached local tmux session and
-    /// build the embedded-attach spec for it. The session is minted with
-    /// a fresh uuid used for *both* its tmux session name
-    /// (`agent-mux-<uuid>`) and `claude --session-id <uuid>`, so Claude's
-    /// transcript lands at `<uuid>.jsonl` and the `SessionId` discovery
-    /// later derives equals the tmux name. Two tmux calls:
-    /// (1) `tmux new-session -d -s agent-mux-<uuid> -c <cwd> claude
-    /// --session-id <uuid>` creates the detached session; (2) the embed
-    /// spec attaches to that exact name. Because the name is
-    /// id-derived, re-attaching from a discovered row later resolves by
-    /// name (stage 1) instead of guessing by cwd — so several sessions
-    /// sharing one directory never collapse onto the same pane.
-    fn spawn_session_local(cwd: &Path) -> Result<AttachOutcome, AttachError> {
+    /// Spawn a fresh agent into a detached local tmux session and build
+    /// the embedded-attach spec for it. The session is minted with a fresh
+    /// uuid used for *both* its tmux session name (`agent-mux-<uuid>`) and
+    /// the agent's id-pin (the [`crate::agent::AgentCli::spawn`] tail), so
+    /// for an id-pinning agent the transcript lands at `<uuid>.jsonl` and
+    /// the `SessionId` discovery later derives equals the tmux name. Two
+    /// tmux calls: (1) `tmux new-session -d -s agent-mux-<uuid> -c <cwd>
+    /// <agent-tail>` creates the detached session; (2) the embed spec
+    /// attaches to that exact name. Because the name is id-derived,
+    /// re-attaching from a discovered row later resolves by name (stage 1)
+    /// instead of guessing by cwd — so several sessions sharing one
+    /// directory never collapse onto the same pane.
+    fn spawn_session_local(cwd: &Path, kind: AgentKind) -> Result<AttachOutcome, AttachError> {
         let cwd_str = cwd.to_string_lossy().into_owned();
         let session_uuid = new_session_uuid()?;
-        let session_name = agent_mux_session_name(&session_uuid);
-        let spawn_argv = tmux_new_claude_session_argv(&session_name, &cwd_str, &session_uuid);
+        let plan = resolve_spawn_plan(kind, cwd, &session_uuid);
+        let spawn_argv = tmux_new_agent_session_argv(&plan.tmux_session, &cwd_str, &plan.tail);
         let (program, rest) = spawn_argv.split_first().expect("non-empty argv");
         // `-d` prints nothing; `run_for_stdout` just checks exit status.
         run_for_stdout(Command::new(program).args(rest))?;
         Ok(AttachOutcome::EmbedPty(EmbedSpec {
-            argv: tmux_attach_argv(&session_name),
+            argv: tmux_attach_argv(&plan.tmux_session),
             cwd: None,
             label: spawn_session_label(cwd),
+            adopt_pending: plan.adopt_pending,
             ..Default::default()
         }))
     }
 
     /// Remote analogue of [`spawn_session_local`]. One ssh round-trip
     /// to create the detached remote tmux session named
-    /// `agent-mux-<uuid>` (with `claude --session-id <uuid>`); the embed
+    /// `agent-mux-<uuid>` (with the agent's id-pin tail); the embed
     /// spec then wraps `tmux attach -t <name>` in `Host::ssh_argv(true,
     /// …)` so the embedded pane drives the remote attach over the same
     /// `ControlMaster`. The name is id-derived rather than tmux-assigned
     /// for the same reason as the local path — re-attach resolves by
     /// name, so same-directory remote sessions stay distinct.
-    fn spawn_session_remote(cwd: &Path, host: &dyn Host) -> Result<AttachOutcome, AttachError> {
+    fn spawn_session_remote(
+        cwd: &Path,
+        host: &dyn Host,
+        kind: AgentKind,
+    ) -> Result<AttachOutcome, AttachError> {
         let cwd_str = cwd.to_string_lossy().into_owned();
         let session_uuid = new_session_uuid()?;
-        let session_name = agent_mux_session_name(&session_uuid);
-        let spawn_remote_cmd = tmux_new_claude_session_argv(&session_name, &cwd_str, &session_uuid);
+        let plan = resolve_spawn_plan(kind, cwd, &session_uuid);
+        let spawn_remote_cmd =
+            tmux_new_agent_session_argv(&plan.tmux_session, &cwd_str, &plan.tail);
         let spawn_refs: Vec<&str> = spawn_remote_cmd.iter().map(String::as_str).collect();
         let spawn_argv = host
             .ssh_argv(false, &spawn_refs)
@@ -902,7 +974,7 @@ impl PtyDriver {
         let (program, rest) = spawn_argv.split_first().expect("non-empty ssh argv");
         // `-d` prints nothing; `run_for_stdout` just checks exit status.
         run_for_stdout(Command::new(program).args(rest))?;
-        let attach_remote_cmd = tmux_attach_argv(&session_name);
+        let attach_remote_cmd = tmux_attach_argv(&plan.tmux_session);
         let attach_refs: Vec<&str> = attach_remote_cmd.iter().map(String::as_str).collect();
         let argv = host
             .ssh_argv(true, &attach_refs)
@@ -911,6 +983,7 @@ impl PtyDriver {
             argv,
             cwd: None,
             label: spawn_session_label(cwd),
+            adopt_pending: plan.adopt_pending,
             ..Default::default()
         }))
     }
@@ -944,8 +1017,8 @@ impl PtyDriver {
 }
 
 /// Human-readable label for the embedded pane title. Prefers the
-/// session's resolved title (from `.agent-mux/task.toml` or
-/// `aiTitle`); falls back to a short id suffix so multiple title-less
+/// session's resolved title (from `.agent-mux/task.toml` or the agent's
+/// title entry); falls back to a short id suffix so multiple title-less
 /// sessions stay distinguishable.
 fn embed_label(session: &Session) -> String {
     if let Some(title) = &session.title {
@@ -969,25 +1042,30 @@ fn tmux_attach_argv(target: &str) -> Vec<String> {
     vec!["tmux".into(), "attach".into(), "-t".into(), target.into()]
 }
 
-/// The tmux command for "create a detached session running `claude` in
-/// `cwd`, pinned to `session_uuid`." Used by
-/// [`PtyDriver::spawn_session_local`] and `_remote` to spawn the
-/// new-session target the embedded pane then attaches to.
+/// The tmux command for "create a detached session running the agent in
+/// `cwd`." Used by [`PtyDriver::spawn_session_local`] and `_remote` to
+/// spawn the new-session target the embedded pane then attaches to.
 ///
 /// `-d` keeps the spawning client detached (the embed becomes the only
-/// attached client). `-s <tmux_session>` gives the session a
-/// deterministic name (`agent-mux-<uuid>`) instead of tmux's auto-name,
-/// and `claude --session-id <uuid>` makes Claude Code write its
-/// transcript as `<uuid>.jsonl` — so the `SessionId` discovery later
-/// derives from the transcript stem equals the tmux session name. That
-/// link is what lets [`resolve_pane_target`]'s stage-1 name match
-/// re-attach to *this* session on every later Enter, rather than the
-/// cwd fallback picking whichever pane sorts first (which collapsed
-/// several same-directory sessions onto one pane). A freshly-minted v4
-/// uuid can't collide with an existing session, so `-s` is safe here.
+/// attached client). `-s <tmux_session>` gives the session a deterministic
+/// name (`agent-mux-<uuid>`) instead of tmux's auto-name. `agent_tail` is
+/// the agent's launch argv (from [`crate::agent::AgentCli::spawn`]) — for
+/// an id-pinning agent that pins the session id to `<uuid>`, making the
+/// transcript stem the same uuid, so the `SessionId` discovery later
+/// derives equals the tmux session name. That link is what lets
+/// [`resolve_pane_target`]'s stage-1
+/// name match re-attach to *this* session on every later Enter, rather
+/// than the cwd fallback picking whichever pane sorts first (which
+/// collapsed several same-directory sessions onto one pane). A
+/// freshly-minted v4 uuid can't collide with an existing session, so `-s`
+/// is safe here.
 #[must_use]
-fn tmux_new_claude_session_argv(tmux_session: &str, cwd: &str, session_uuid: &str) -> Vec<String> {
-    vec![
+fn tmux_new_agent_session_argv(
+    tmux_session: &str,
+    cwd: &str,
+    agent_tail: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
         "tmux".into(),
         "new-session".into(),
         "-d".into(),
@@ -995,27 +1073,126 @@ fn tmux_new_claude_session_argv(tmux_session: &str, cwd: &str, session_uuid: &st
         tmux_session.into(),
         "-c".into(),
         cwd.into(),
-        "claude".into(),
-        "--session-id".into(),
-        session_uuid.into(),
-    ]
+    ];
+    argv.extend_from_slice(agent_tail);
+    argv
 }
 
-/// The deterministic tmux session name for a Claude session id — the
-/// convention [`resolve_pane_target`]'s stage-1 match and
-/// [`tmux_resume_argv`] both key on. Kept as one helper so the
-/// `agent-mux-` prefix lives in a single place.
+/// The resolved shape of a fresh spawn: the tmux session name to create,
+/// the agent's launch argv tail, and (for a `DiscoverAfterSpawn` agent) the
+/// adoption nonce to carry back in [`EmbedSpec::adopt_pending`].
+struct SpawnPlanResolved {
+    tmux_session: String,
+    tail: Vec<String>,
+    adopt_pending: Option<String>,
+}
+
+/// Turn an agent's [`SpawnPlan`] into a concrete tmux session name + launch
+/// tail for a spawn pinned to `session_uuid`.
+///
+/// - `PinnedId` (claude, pi): the session is named `agent-mux-<uuid>` and
+///   the agent's argv pins that same uuid, so the transcript stem — hence
+///   the discovered [`SessionId`] — equals the tmux name (today's identity
+///   contract). No adoption needed.
+/// - `DiscoverAfterSpawn` (codex): the agent can't pin an id, so the
+///   session gets the provisional name `agent-mux-pending-<uuid>` and the
+///   bare-binary tail; the uuid rides back as the adoption nonce so
+///   `main.rs` can correlate the rollout that appears and rename the
+///   session to `agent-mux-<real-id>` (plan §2.4).
+fn resolve_spawn_plan(kind: AgentKind, cwd: &Path, session_uuid: &str) -> SpawnPlanResolved {
+    match agent(kind).spawn(cwd, &SessionId(session_uuid.to_string())) {
+        SpawnPlan::PinnedId { argv } => SpawnPlanResolved {
+            tmux_session: agent_mux_session_name(session_uuid),
+            tail: argv,
+            adopt_pending: None,
+        },
+        SpawnPlan::DiscoverAfterSpawn { argv } => SpawnPlanResolved {
+            tmux_session: agent_mux_pending_session_name(session_uuid),
+            tail: argv,
+            adopt_pending: Some(session_uuid.to_string()),
+        },
+    }
+}
+
+/// The deterministic tmux session name for a session id — the convention
+/// [`resolve_pane_target`]'s stage-1 match and [`tmux_resume_argv`] both
+/// key on. Kept as one helper so the `agent-mux-` prefix lives in a single
+/// place.
 #[must_use]
 fn agent_mux_session_name(session_uuid: &str) -> String {
     format!("agent-mux-{session_uuid}")
+}
+
+/// The provisional tmux session name a `DiscoverAfterSpawn` agent (codex)
+/// launches under before its real id is known — `agent-mux-pending-<nonce>`.
+/// [`adopt_pending_session`](AttachmentDriver::adopt_pending_session)
+/// renames it to `agent-mux-<id>` once the rollout reveals the id. The
+/// `agent-mux-pending-` prefix keeps it inside the `agent-mux-` family that
+/// [`resolve_pane_target`] stage 2 skips, so a still-pending session never
+/// gets handed to a neighbour's cwd fallback; and because the real id is
+/// the rollout uuid (not the nonce), stage 1's `agent-mux-<real-id>` match
+/// can never collide with this name either.
+#[must_use]
+fn agent_mux_pending_session_name(nonce: &str) -> String {
+    format!("agent-mux-pending-{nonce}")
+}
+
+/// Rename the provisional `agent-mux-pending-<nonce>` session to the
+/// durable `agent-mux-<adopted_id>`, dispatching local vs remote the same
+/// way every other tmux op does. Shared by both drivers' identical
+/// [`AttachmentDriver::adopt_pending_session`] default. See
+/// [`tmux_rename_session_argv`] for the argv shape.
+fn run_adopt_pending_session(
+    host: &dyn Host,
+    nonce: &str,
+    adopted_id: &SessionId,
+) -> Result<(), AttachError> {
+    let from = agent_mux_pending_session_name(nonce);
+    let to = agent_mux_session_name(&adopted_id.0);
+    let argv = tmux_rename_session_argv(&from, &to);
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if host.id().is_local() {
+        // Drop the leading "tmux" — `run_tmux` re-prepends it.
+        run_tmux(&argv_refs[1..])
+    } else {
+        let ssh = host
+            .ssh_argv(false, &argv_refs)
+            .ok_or_else(|| AttachError::RemoteUnsupported("host is local".into()))?;
+        let (program, rest) = ssh.split_first().expect("ssh_argv non-empty when remote");
+        let output = Command::new(program)
+            .args(rest)
+            .output()
+            .map_err(|e| AttachError::TmuxCommandFailed(e.to_string()))?;
+        if !output.status.success() {
+            return Err(AttachError::TmuxCommandFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The tmux command that renames session `from` to `to`. One helper so the
+/// `rename-session` verb lives in a single place (mirrors
+/// [`tmux_attach_argv`]); local callers drop the leading `tmux`, remote
+/// callers hand the whole vector to `Host::ssh_argv`.
+#[must_use]
+fn tmux_rename_session_argv(from: &str, to: &str) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "rename-session".into(),
+        "-t".into(),
+        from.into(),
+        to.into(),
+    ]
 }
 
 /// Mint a fresh random v4 UUID (lowercase, hyphenated) for a
 /// newly-spawned session. Read straight from the OS CSPRNG
 /// (`/dev/urandom`, present on both Linux and macOS) so we take no new
 /// crate dependency and spawn no subprocess. The value names the
-/// session's tmux session *and* is handed to `claude --session-id`, so
-/// the two agree on identity before Claude has written a byte of
+/// session's tmux session *and* is handed to the agent's id-pin, so the
+/// two agree on identity before the agent has written a byte of
 /// transcript.
 ///
 /// # Errors
@@ -1121,11 +1298,11 @@ fn tool_label_token(command: &[String]) -> String {
 }
 
 /// The `remote_cmd` for "no live pane — spin up a fresh tmux session
-/// named after the conversation and run `claude --resume <id>` in it."
+/// named after the conversation and run the agent's resume command in it."
 /// The `-A` flag makes the spawn idempotent: a second invocation
 /// attaches to the existing `agent-mux-<id>` session instead of
-/// spawning a parallel `claude --resume` that would race the first on
-/// the same transcript.
+/// spawning a parallel resume that would race the first on the same
+/// transcript.
 ///
 /// Used by `TmuxDriver::resume_remote` (preserves the M2-shipped
 /// remote-resume behaviour exactly) and by `PtyDriver` for both local
@@ -1135,7 +1312,7 @@ fn tool_label_token(command: &[String]) -> String {
 fn tmux_resume_argv(session: &Session) -> Vec<String> {
     let session_name = format!("agent-mux-{}", session.id.0);
     let cwd = session.project_dir.to_string_lossy().into_owned();
-    let claude_cmd = format!("claude --resume {}", session.id.0);
+    let resume_cmd = agent(session.agent).resume_command(&session.id);
     vec![
         "tmux".into(),
         "new-session".into(),
@@ -1144,7 +1321,7 @@ fn tmux_resume_argv(session: &Session) -> Vec<String> {
         session_name,
         "-c".into(),
         cwd,
-        claude_cmd,
+        resume_cmd,
     ]
 }
 
@@ -1212,33 +1389,33 @@ pub fn find_pane_local(
 ///
 /// 1. Pane in a tmux session named `agent-mux-<session.id.0>`. That's
 ///    the deterministic name both `tmux_resume_argv` and the initial
-///    `spawn_session_local`/`_remote` use (the latter pins it via
-///    `claude --session-id <uuid>` so the transcript stem — and hence
-///    the discovered `SessionId` — equals the tmux name). Every
-///    agent-mux-spawned session therefore has an unambiguous pin from
+///    `spawn_session_local`/`_remote` use (the latter pins it via the
+///    agent's id-pin so the transcript stem — and hence the discovered
+///    `SessionId` — equals the tmux name). Every agent-mux-spawned
+///    session therefore has an unambiguous pin from
 ///    `session_id` to tmux session from birth — even when multiple
 ///    sessions share a cwd. This is what keeps same-directory rows from
 ///    collapsing onto one pane via the cwd fallback below.
 ///
 /// 2. First pane whose `pane_current_path` matches `session.project_dir`
 ///    *and* whose tmux session is **not** `agent-mux-`-named. Catches
-///    sessions with no `agent-mux-<id>` tmux session — chiefly those
-///    `claude` was started for *outside* agent-mux (a bare terminal, the
+///    sessions with no `agent-mux-<id>` tmux session — chiefly those the
+///    agent was started for *outside* agent-mux (a bare terminal, the
 ///    user's own tmux), which never got the id-derived name. The
 ///    `agent-mux-` exclusion is load-bearing: such a pane belongs to a
 ///    *specific* id (reachable only via stage 1), so letting the cwd
 ///    fallback return it would collapse an un-named row onto a named
 ///    row's pane whenever they share a cwd — the "selecting session A
 ///    opens session B" bug. A skipped row falls through to `NotFound` →
-///    `claude --resume`, which spawns it into its own `agent-mux-<id>`
-///    session.
+///    the agent's resume command, which spawns it into its own
+///    `agent-mux-<id>` session.
 ///
 /// `excluded_tmux_sessions` carries the tmux *session names* of live
 /// `[[tools]]` launches (lazygit, nvim, a shell). Each such launch runs
 /// in a detached tmux session spawned with `-c <project_dir>`, so its
-/// pane's `pane_current_path` is identical to the parent Claude
+/// pane's `pane_current_path` is identical to the parent agent
 /// session's — without this guard the cwd fallback below could resolve
-/// the Claude attach onto a tool's pane (the user reports "returning to
+/// the agent attach onto a tool's pane (the user reports "returning to
 /// the session keeps opening the tool"). Excluded only from the cwd
 /// fallback: stage 1's `agent-mux-<id>` match can't collide with a
 /// tmux-auto-named tool session, so it needs no filtering.
@@ -1280,8 +1457,9 @@ fn resolve_pane_target(
         // un-named row (externally-started, or spawned before it earned
         // its name) collapses onto a named row's pane whenever they
         // share a cwd. Skipping it lets this row fall through to
-        // `NotFound` → `claude --resume`, which spawns it into its own
-        // `agent-mux-<id>` session instead of hijacking the neighbour's.
+        // `NotFound` → the agent's resume command, which spawns it into
+        // its own `agent-mux-<id>` session instead of hijacking the
+        // neighbour's.
         if session_name.starts_with("agent-mux-") {
             continue;
         }
@@ -1294,10 +1472,10 @@ fn resolve_pane_target(
 
 /// Returns true when at least one process is currently holding
 /// `transcript_path` open. Used as a pre-attach signal to catch the
-/// case where Claude is running outside agent-mux's reach (e.g. the
-/// user started `claude` in a bare terminal with no tmux) so the
+/// case where the agent is running outside agent-mux's reach (e.g. the
+/// user started it in a bare terminal with no tmux) so the
 /// `tmux_resume_argv` fallback can prompt before spawning a parallel
-/// `claude --resume` against the same transcript file.
+/// resume against the same transcript file.
 ///
 /// Implementation: `lsof -t -- <path>` and treat any non-empty line
 /// of stdout as a positive hit. Failure modes (`lsof` missing, exits
@@ -1309,8 +1487,8 @@ fn resolve_pane_target(
 /// `lsof` was chosen over `fuser` because the macOS dogfood box is
 /// the active surface and macOS ships `lsof` but not `fuser`. Linux
 /// and WSL also ship `lsof` in their typical package set; agent-mux's
-/// other userspace assumptions (`tmux`, `ssh`, `git`, `claude`) are
-/// already at that bar.
+/// other userspace assumptions (`tmux`, `ssh`, `git`, the agent binary)
+/// are already at that bar.
 #[must_use]
 pub fn probe_live_writer(transcript_path: &Path) -> bool {
     let Ok(output) = Command::new("lsof")
@@ -1366,6 +1544,7 @@ mod tests {
         Session {
             id: SessionId(id.to_string()),
             host: HostId::local(),
+            agent: AgentKind::Claude,
             project_dir: PathBuf::from(project_dir),
             transcript_path: PathBuf::from("/transcripts/x.jsonl"),
             last_activity: std::time::SystemTime::UNIX_EPOCH,
@@ -1515,18 +1694,18 @@ mod tests {
         // Regression (2026-06-30): a `[[tools]]` launch (lazygit, vim, a
         // shell) runs in a detached tmux session spawned with `-c
         // <project_dir>`, so its pane reports the same cwd as the
-        // externally-started Claude session. Without exclusion the cwd
-        // fallback could resolve the Claude attach onto the tool's pane,
+        // externally-started agent session. Without exclusion the cwd
+        // fallback could resolve the agent attach onto the tool's pane,
         // and the user reports "returning to the session keeps opening
         // the tool." The tool's tmux session name is passed in the
-        // exclusion set and must be skipped; the Claude pane wins.
+        // exclusion set and must be skipped; the agent pane wins.
         let out = "3 /home/u/proj\n\
-             user-claude:0.0 /home/u/proj\n";
+             user-sess:0.0 /home/u/proj\n";
         let s = test_session("ext-id", "/home/u/proj");
         // `3` is the tmux-auto-named tool session that lists first.
         let excluded = ["3".to_string()];
         let got = resolve_pane_target(out, &s, &excluded);
-        assert_eq!(got, Some("user-claude:0.0".to_string()));
+        assert_eq!(got, Some("user-sess:0.0".to_string()));
     }
 
     #[test]
@@ -1555,6 +1734,54 @@ mod tests {
     }
 
     #[test]
+    fn resolve_pane_target_reattaches_adopted_codex_session_by_name() {
+        // After adoption the codex session's tmux session was renamed from
+        // `agent-mux-pending-<nonce>` to `agent-mux-<id>` (id = the rollout
+        // uuid the discovered row carries), so a re-attach resolves via the
+        // stage-1 exact name match — identical to the pinned-id agents.
+        // `resolve_pane_target` is agent-neutral; this pins the payoff of
+        // the adoption rename.
+        let out = "agent-mux-rollout-uuid:0.0 /work/proj\n";
+        let s = Session {
+            agent: AgentKind::Codex,
+            ..test_session("rollout-uuid", "/work/proj")
+        };
+        assert_eq!(
+            resolve_pane_target(out, &s, &[]),
+            Some("agent-mux-rollout-uuid:0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_target_reattaches_pi_session_by_name() {
+        // A pi session pins its id at spawn (PinnedId), so its tmux session
+        // is `agent-mux-<id>` from birth — re-attach resolves via the
+        // stage-1 exact name match, identical to the other pinned-id agents.
+        // `resolve_pane_target` is agent-neutral; this pins the pinned-id
+        // payoff for pi (the analog of the adopted-codex re-attach above).
+        let out = "agent-mux-pinned-uuid:0.0 /work/proj\n";
+        let s = Session {
+            agent: AgentKind::Pi,
+            ..test_session("pinned-uuid", "/work/proj")
+        };
+        assert_eq!(
+            resolve_pane_target(out, &s, &[]),
+            Some("agent-mux-pinned-uuid:0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_target_skips_still_pending_codex_pane_for_other_id() {
+        // A codex spawn still awaiting adoption lives in
+        // `agent-mux-pending-<nonce>`, inside the `agent-mux-` family the
+        // stage-2 cwd fallback skips — so a *different* session sharing the
+        // cwd never collapses onto the pending pane.
+        let out = "agent-mux-pending-nonce:0.0 /work/proj\n";
+        let s = test_session("some-other-id", "/work/proj");
+        assert_eq!(resolve_pane_target(out, &s, &[]), None);
+    }
+
+    #[test]
     fn resolve_pane_target_picks_named_match_even_when_cwd_differs() {
         // If `agent-mux-<id>` exists but its cwd no longer matches
         // project_dir (the user `cd`'d inside the pane), the named
@@ -1567,17 +1794,23 @@ mod tests {
     }
 
     #[test]
-    fn tmux_new_claude_session_argv_names_session_and_pins_session_id() {
-        // The shape is load-bearing: `-d` keeps the spawning client
+    fn tmux_new_agent_session_argv_wraps_agent_tail() {
+        // The wrapper shape is load-bearing: `-d` keeps the spawning client
         // detached (the embed becomes the only attached client), `-s
         // <name>` gives the session its id-derived name, `-c <cwd>` sets
-        // the working directory, and `claude --session-id <uuid>` pins
-        // Claude's transcript stem to the same uuid — the link that lets
-        // re-attach resolve by name instead of by cwd.
-        let got = tmux_new_claude_session_argv(
+        // the working directory, and the agent's launch tail follows
+        // verbatim. The agent-specific tail (e.g. the id-pin flag)
+        // is tested in the reference-agent module; here we pin only that the wrapper
+        // appends whatever tail the agent hands it.
+        let tail = vec![
+            "agentbin".to_string(),
+            "--flag".to_string(),
+            "x".to_string(),
+        ];
+        let got = tmux_new_agent_session_argv(
             "agent-mux-11111111-2222-4333-8444-555555555555",
             "/work/agent-mux-fix-bug",
-            "11111111-2222-4333-8444-555555555555",
+            &tail,
         );
         assert_eq!(
             got,
@@ -1589,9 +1822,9 @@ mod tests {
                 "agent-mux-11111111-2222-4333-8444-555555555555".to_string(),
                 "-c".to_string(),
                 "/work/agent-mux-fix-bug".to_string(),
-                "claude".to_string(),
-                "--session-id".to_string(),
-                "11111111-2222-4333-8444-555555555555".to_string(),
+                "agentbin".to_string(),
+                "--flag".to_string(),
+                "x".to_string(),
             ]
         );
     }
@@ -1649,15 +1882,17 @@ mod tests {
     #[test]
     fn pty_driver_spawn_session_remote_invokes_ssh_with_named_session_id() {
         // The remote spawn must hand `tmux new-session -d -s
-        // agent-mux-<uuid> -c <cwd> claude --session-id <uuid>` to
-        // ssh_argv(false, …) — no tty needed for the detached create.
-        // The ssh process spawned from the fake host's argv fails to
-        // connect, so `spawn_session_remote` errors out before the
-        // second (attach) ssh_argv call; `last_call` is therefore the
-        // create call. The uuid is random, so we assert the fixed shape
-        // plus the name↔session-id linkage rather than an exact string.
+        // agent-mux-<uuid> -c <cwd> <agent-tail…>` to ssh_argv(false, …) —
+        // no tty needed for the detached create. The ssh process spawned
+        // from the fake host's argv fails to connect, so
+        // `spawn_session_remote` errors out before the second (attach)
+        // ssh_argv call; `last_call` is therefore the create call. The
+        // uuid is random, so we assert the wrapper shape plus the
+        // name↔pinned-id linkage rather than an exact string. The
+        // agent-specific tail is pinned in the reference-agent module.
         let host = FakeRemoteHost::new();
-        let _ = PtyDriver::spawn_session_remote(Path::new("/srv/work/proj"), &host);
+        let _ =
+            PtyDriver::spawn_session_remote(Path::new("/srv/work/proj"), &host, AgentKind::Claude);
         let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
         assert!(!tty, "detached create does not need a tty");
         assert_eq!(&remote_cmd[0..4], &["tmux", "new-session", "-d", "-s"]);
@@ -1666,19 +1901,214 @@ mod tests {
             tmux_name.starts_with("agent-mux-"),
             "session name is id-derived, got {tmux_name}"
         );
-        assert_eq!(&remote_cmd[5..8], &["-c", "/srv/work/proj", "claude"]);
-        assert_eq!(&remote_cmd[8], "--session-id");
-        let session_uuid = &remote_cmd[9];
+        assert_eq!(&remote_cmd[5..7], &["-c", "/srv/work/proj"]);
+        // The last arg is the pinned id (the agent tail's trailing token);
+        // it must share the uuid with the tmux session name.
+        let session_uuid = remote_cmd.last().expect("non-empty remote cmd");
         assert_eq!(
             tmux_name,
             &format!("agent-mux-{session_uuid}"),
-            "tmux name and claude --session-id must share the uuid"
+            "tmux name and pinned session id must share the uuid"
+        );
+    }
+
+    #[test]
+    fn pty_driver_spawn_session_remote_codex_uses_pending_name_and_bare_binary() {
+        // Codex is a `DiscoverAfterSpawn` agent: the remote spawn launches
+        // the bare binary (no `--session-id`) under a *provisional*
+        // `agent-mux-pending-<nonce>` name — the real id is adopted from
+        // the rollout later (plan §2.4). The fake host's stub ssh fails to
+        // connect, so `spawn_session_remote` errors after the create call;
+        // `last_call` is therefore that create.
+        let host = FakeRemoteHost::new();
+        let _ =
+            PtyDriver::spawn_session_remote(Path::new("/srv/work/proj"), &host, AgentKind::Codex);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(!tty, "detached create does not need a tty");
+        assert_eq!(&remote_cmd[0..4], &["tmux", "new-session", "-d", "-s"]);
+        assert!(
+            remote_cmd[4].starts_with("agent-mux-pending-"),
+            "codex spawns under a provisional name, got {}",
+            remote_cmd[4]
+        );
+        assert_eq!(&remote_cmd[5..8], &["-c", "/srv/work/proj", "codex"]);
+        assert_eq!(
+            remote_cmd.len(),
+            8,
+            "no --session-id pin for codex; got {remote_cmd:?}"
+        );
+    }
+
+    #[test]
+    fn tmux_rename_session_argv_shape() {
+        // The single point of truth for the adopt rename verb.
+        assert_eq!(
+            tmux_rename_session_argv("agent-mux-pending-nonce", "agent-mux-real-id"),
+            vec![
+                "tmux".to_string(),
+                "rename-session".to_string(),
+                "-t".to_string(),
+                "agent-mux-pending-nonce".to_string(),
+                "agent-mux-real-id".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn adopt_pending_session_remote_routes_rename_through_ssh_argv() {
+        // The adopt rename stays behind the Attachment Driver: for a remote
+        // host it routes `tmux rename-session -t agent-mux-pending-<nonce>
+        // agent-mux-<id>` through `Host::ssh_argv` (tty=false — a rename is
+        // non-interactive), exactly like every other remote tmux op.
+        let host = FakeRemoteHost::new();
+        let _ = TmuxDriver::new().adopt_pending_session(
+            &host,
+            "nonce-123",
+            &SessionId("real-id".into()),
+        );
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(!tty, "a rename needs no tty");
+        assert_eq!(
+            remote_cmd,
+            vec![
+                "tmux",
+                "rename-session",
+                "-t",
+                "agent-mux-pending-nonce-123",
+                "agent-mux-real-id",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_remote_attach_no_pane_resumes_with_codex_resume() {
+        // A codex session with no live remote pane falls through to the
+        // shared `tmux_resume_argv` machinery, parameterised by the agent's
+        // resume command — `codex resume <id>` rather than claude's flag.
+        let host = FakeRemoteHost::new();
+        let session = Session {
+            agent: AgentKind::Codex,
+            ..make_session(HostId("remote".into()), "/work/proj")
+        };
+        let _ = TmuxDriver::resume_remote(&session, &host);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(tty, "resume needs -t for an interactive agent");
+        assert_eq!(
+            remote_cmd,
+            vec![
+                "tmux",
+                "new-session",
+                "-A",
+                "-s",
+                "agent-mux-abc",
+                "-c",
+                "/work/proj",
+                "codex resume abc",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_remote_resume_argv_ssh_quotes_the_multi_word_resume_command() {
+        // The trailing token `codex resume <id>` is multi-word; when
+        // `SshHost::ssh_argv` joins the remote command for the remote shell
+        // it must single-quote that token so the spaces survive
+        // re-tokenization (otherwise the remote sh runs `codex` with stray
+        // args). Pin the quoting via the same `shell_join_quoted` the real
+        // `SshHost::ssh_argv` applies.
+        let session = Session {
+            agent: AgentKind::Codex,
+            ..make_session(HostId("remote".into()), "/work/proj")
+        };
+        let argv = tmux_resume_argv(&session);
+        assert_eq!(argv.last().unwrap(), "codex resume abc");
+        let joined = crate::host::shell_join_quoted(argv.iter().map(String::as_str));
+        assert!(
+            joined.contains("'codex resume abc'"),
+            "resume command must survive as one single-quoted unit; got {joined}"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_plan_pins_pi_uuid_as_session_id_and_tmux_name() {
+        // The local spawn argv shape for pi (a `PinnedId` agent): the minted
+        // uuid is simultaneously the `agent-mux-<uuid>` tmux session name AND
+        // the `--session-id` the agent launches with — today's identity
+        // contract, no adoption. `resolve_spawn_plan` is the shared resolver
+        // both drivers' spawn paths feed the tmux wrapper.
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let plan = resolve_spawn_plan(AgentKind::Pi, Path::new("/work/proj"), uuid);
+        assert_eq!(plan.tmux_session, format!("agent-mux-{uuid}"));
+        assert_eq!(
+            plan.tail,
+            vec![
+                "pi".to_string(),
+                "--session-id".to_string(),
+                uuid.to_string(),
+            ]
+        );
+        assert!(
+            plan.adopt_pending.is_none(),
+            "a pinned-id agent needs no post-spawn adoption"
+        );
+    }
+
+    #[test]
+    fn pi_remote_attach_no_pane_resumes_with_pi_session_id() {
+        // A pi session with no live remote pane falls through to the shared
+        // `tmux_resume_argv` machinery, parameterised by the agent's resume
+        // command — `pi --session-id <id>` (same flag as spawn) rather than
+        // claude's `--resume`. Pins the resume-fallback argv shape end to end.
+        let host = FakeRemoteHost::new();
+        let session = Session {
+            agent: AgentKind::Pi,
+            ..make_session(HostId("remote".into()), "/work/proj")
+        };
+        let _ = TmuxDriver::resume_remote(&session, &host);
+        let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
+        assert!(tty, "resume needs -t for an interactive agent");
+        assert_eq!(
+            remote_cmd,
+            vec![
+                "tmux",
+                "new-session",
+                "-A",
+                "-s",
+                "agent-mux-abc",
+                "-c",
+                "/work/proj",
+                "pi --session-id abc",
+            ]
+        );
+    }
+
+    #[test]
+    fn pi_remote_resume_argv_ssh_quotes_the_multi_word_resume_command() {
+        // The trailing token `pi --session-id <id>` is multi-word; when
+        // `SshHost::ssh_argv` joins the remote command for the remote shell
+        // it must single-quote that token so the flag+id survive
+        // re-tokenization as one unit (otherwise the remote sh runs `pi`
+        // with a stray `--session-id` and a bare id arg). Pin the quoting via
+        // the same `shell_join_quoted` the real `SshHost::ssh_argv` applies.
+        let session = Session {
+            agent: AgentKind::Pi,
+            ..make_session(HostId("remote".into()), "/work/proj")
+        };
+        let argv = tmux_resume_argv(&session);
+        assert_eq!(argv.last().unwrap(), "pi --session-id abc");
+        let joined = crate::host::shell_join_quoted(argv.iter().map(String::as_str));
+        assert!(
+            joined.contains("'pi --session-id abc'"),
+            "resume command must survive as one single-quoted unit; got {joined}"
         );
     }
 
     #[test]
     fn build_new_session_command_for_spawn_session() {
-        let got = build_new_session_command("/work/agent-mux-fix-bug", "claude");
+        // `build_new_session_command` is agent-neutral — it wraps whatever
+        // command string it's handed. Exercise it with a placeholder
+        // binary; the real agent binary is supplied by the caller.
+        let got = build_new_session_command("/work/agent-mux-fix-bug", "agentbin");
         assert_eq!(got.program, "tmux");
         assert_eq!(
             got.args,
@@ -1686,7 +2116,7 @@ mod tests {
                 "new-session".to_string(),
                 "-c".to_string(),
                 "/work/agent-mux-fix-bug".to_string(),
-                "claude".to_string(),
+                "agentbin".to_string(),
             ]
         );
         assert!(got.cwd.is_none());
@@ -1694,14 +2124,14 @@ mod tests {
 
     #[test]
     fn build_new_session_command_for_resume() {
-        let got = build_new_session_command("/work/proj", "claude --resume abc-123");
+        let got = build_new_session_command("/work/proj", "agentbin resume abc-123");
         assert_eq!(
             got.args,
             vec![
                 "new-session".to_string(),
                 "-c".to_string(),
                 "/work/proj".to_string(),
-                "claude --resume abc-123".to_string(),
+                "agentbin resume abc-123".to_string(),
             ]
         );
     }
@@ -1735,7 +2165,11 @@ mod tests {
             static ID: std::sync::OnceLock<HostId> = std::sync::OnceLock::new();
             ID.get_or_init(|| HostId("remote".into()))
         }
-        fn list_transcripts(&self, _: &Path) -> std::io::Result<Vec<crate::host::TranscriptStat>> {
+        fn list_transcripts(
+            &self,
+            _: &Path,
+            _: &crate::agent::ListingSpec,
+        ) -> std::io::Result<Vec<crate::host::TranscriptStat>> {
             Ok(vec![])
         }
         fn read_to_string(&self, _: &Path) -> std::io::Result<String> {
@@ -1816,7 +2250,11 @@ mod tests {
         let session = make_session(HostId("remote".into()), "/work/proj");
         let _ = TmuxDriver::resume_remote(&session, &host);
         let (tty, remote_cmd) = host.last_call().expect("ssh_argv called");
-        assert!(tty, "resume needs -t for interactive claude");
+        assert!(tty, "resume needs -t for an interactive agent");
+        // The trailing token is the agent's resume command (pinned in
+        // the reference-agent module); the wrapper shape around it is what this test
+        // owns.
+        let resume_cmd = agent(session.agent).resume_command(&session.id);
         assert_eq!(
             remote_cmd,
             vec![
@@ -1827,7 +2265,7 @@ mod tests {
                 "agent-mux-abc",
                 "-c",
                 "/work/proj",
-                "claude --resume abc",
+                resume_cmd.as_str(),
             ]
         );
     }
@@ -1837,8 +2275,7 @@ mod tests {
         // Naming the remote tmux session after the conversation id
         // makes repeated fallbacks converge: the second attach with
         // -A attaches to the existing session rather than spawning a
-        // parallel `claude --resume` that would race the first on
-        // the transcript.
+        // parallel resume that would race the first on the transcript.
         let host = FakeRemoteHost::new();
         let session = make_session(HostId("remote".into()), "/work/proj");
         let _ = TmuxDriver::resume_remote(&session, &host);
@@ -2002,6 +2439,7 @@ mod tests {
         Session {
             id: crate::session::SessionId("abc".into()),
             host,
+            agent: AgentKind::Claude,
             project_dir: PathBuf::from(project),
             transcript_path: PathBuf::from("/x/abc.jsonl"),
             last_activity: SystemTime::UNIX_EPOCH,
@@ -2036,13 +2474,15 @@ mod tests {
     }
 
     #[test]
-    fn tmux_resume_argv_produces_named_session_with_dash_a_and_claude_resume() {
+    fn tmux_resume_argv_produces_named_session_with_dash_a_and_agent_resume() {
         // Pins the resume shape used by TmuxDriver::resume_remote *and*
         // PtyDriver for both local and remote: the -A flag plus the
         // deterministic agent-mux-<id> session name is what makes
         // repeated attach attempts converge instead of racing parallel
-        // `claude --resume` invocations on the same transcript.
+        // resume invocations on the same transcript. The trailing token is
+        // the agent's own resume command (pinned in the reference-agent module).
         let session = make_session(HostId("remote".into()), "/work/proj");
+        let resume_cmd = agent(session.agent).resume_command(&session.id);
         assert_eq!(
             tmux_resume_argv(&session),
             vec![
@@ -2053,7 +2493,7 @@ mod tests {
                 "agent-mux-abc".to_string(),
                 "-c".to_string(),
                 "/work/proj".to_string(),
-                "claude --resume abc".to_string(),
+                resume_cmd,
             ]
         );
     }

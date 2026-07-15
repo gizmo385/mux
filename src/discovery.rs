@@ -3,15 +3,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::agent::{AgentCli, AgentKind, agent};
 use crate::host::Host;
-use crate::session::{Attention, HostId, Session, SessionId};
-use crate::watcher::{derive_attention_from_content, derive_edited_files_from_content};
+use crate::session::{Attention, HostId, Session};
 use crate::worktree;
-
-#[must_use]
-pub fn claude_projects_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("projects"))
-}
 
 /// Transcripts older than this are dropped at the `list_transcripts`
 /// boundary, before any per-transcript SSH `cat` / `test -d` round-trip.
@@ -25,7 +20,7 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
 /// whether the box happens to be local or remote.
 pub const DISCOVERY_MAX_AGE: Duration = Duration::from_hours(720);
 
-/// Discover sessions by listing `root` (typically `~/.claude/projects`)
+/// Discover sessions by listing `root` (the agent's transcript root)
 /// through the given `Host`. The same code path serves the local case and
 /// the future SSH case — the only thing that varies is the `Host` impl.
 ///
@@ -37,11 +32,11 @@ pub const DISCOVERY_MAX_AGE: Duration = Duration::from_hours(720);
 /// Returns `io::Error` if `host.list_transcripts` or the per-transcript
 /// reads fail. A missing `root` directory is treated as "no sessions"
 /// (see [`crate::host::Host::list_transcripts`]) and yields an empty `Vec`.
-pub fn discover(host: &dyn Host, root: &Path) -> io::Result<Vec<Session>> {
+pub fn discover(host: &dyn Host, root: &Path, kind: AgentKind) -> io::Result<Vec<Session>> {
     let cutoff = SystemTime::now()
         .checked_sub(DISCOVERY_MAX_AGE)
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    discover_with_cutoff(host, root, cutoff)
+    discover_with_cutoff(host, root, kind, cutoff)
 }
 
 /// Per-transcript intermediate built during phase 1 of bulk discovery.
@@ -63,10 +58,16 @@ struct Partial<'a> {
 pub fn discover_with_cutoff(
     host: &dyn Host,
     root: &Path,
+    kind: AgentKind,
     cutoff: SystemTime,
 ) -> io::Result<Vec<Session>> {
+    // One (host, agent, root) triple: list via this agent's `ListingSpec`
+    // and parse via its `parse_meta` / `derive`. Callers iterate
+    // (host × enabled agents); each root is a distinct `list_transcripts`,
+    // preserving the "one find per root, batched reads" remote discipline.
+    let cli = agent(kind);
     let stats: Vec<_> = host
-        .list_transcripts(root)?
+        .list_transcripts(root, &cli.listing())?
         .into_iter()
         .filter(|s| s.mtime >= cutoff)
         .collect();
@@ -91,9 +92,12 @@ pub fn discover_with_cutoff(
         let Ok(content) = content_result else {
             continue;
         };
-        let meta = parse_transcript_meta(&content);
-        let project_dir = meta.cwd.clone().unwrap_or_else(|| fallback_dir(&stat.path));
-        let attention = derive_attention_from_content(&content);
+        let meta = cli.parse_meta(&content);
+        let project_dir = meta
+            .cwd
+            .clone()
+            .unwrap_or_else(|| cli.fallback_dir(&stat.path));
+        let attention = cli.derive(&content, &project_dir).attention;
         partials.push(Partial {
             stat,
             content,
@@ -172,6 +176,7 @@ pub fn discover_with_cutoff(
             .get(partial.project_dir.as_path())
             .map(String::as_str);
         if let Some(s) = assemble_session(
+            cli,
             host.id(),
             &partial.stat.path,
             partial.stat.mtime,
@@ -198,6 +203,7 @@ pub fn discover_with_cutoff(
 // two call sites (bulk discovery + single-shot build_session) without
 // reducing the actual coupling.
 fn assemble_session(
+    cli: &dyn AgentCli,
     host_id: &HostId,
     transcript_path: &Path,
     mtime: SystemTime,
@@ -207,12 +213,12 @@ fn assemble_session(
     git_pointer_content: Option<&str>,
     attention: Attention,
 ) -> Option<Session> {
-    let id = SessionId(transcript_path.file_stem()?.to_str()?.to_string());
-    let meta = parse_transcript_meta(transcript_content);
+    let id = cli.session_id_from_path(transcript_path)?;
+    let meta = cli.parse_meta(transcript_content);
     let project_dir = meta
         .cwd
         .clone()
-        .unwrap_or_else(|| fallback_dir(transcript_path));
+        .unwrap_or_else(|| cli.fallback_dir(transcript_path));
     if !project_dir_exists {
         return None;
     }
@@ -227,7 +233,7 @@ fn assemble_session(
         .as_ref()
         .map(|m| SystemTime::UNIX_EPOCH + Duration::from_secs(m.created_at));
     // Stillborn-transcript filter. A transcript with no `task.toml`
-    // task name, no `ai-title` entry, and no real first user message
+    // task name, no agent-title entry, and no real first user message
     // is the "/clear-and-walked-away" case: Claude Code creates the
     // file immediately on `/clear` (a `<local-command-caveat>` /
     // `<command-name>/clear</command-name>` envelope pair plus a
@@ -241,14 +247,21 @@ fn assemble_session(
     // session surfaces naturally with a meaningful title. Mirrors
     // the discovery-boundary discipline the subagent path-shape
     // filter follows: filter at ingestion, don't clean up after.
-    if task_title.is_none() && meta.ai_title.is_none() && meta.first_user_message.is_none() {
+    if task_title.is_none() && meta.title.is_none() && meta.first_user_message.is_none() {
         return None;
     }
-    let title = task_title.or(meta.ai_title).or(meta.first_user_message);
+    let title = task_title.or(meta.title).or(meta.first_user_message);
     let parent_repo = git_pointer_content.and_then(worktree::parse_parent_repo);
+    // Full edit history from the whole transcript buffer in hand — the
+    // watcher's tail-derived updates union onto this as the conversation
+    // continues (see `merge_edited_files`). Same buffer walk the attention
+    // derivation does; discovery keeps the two calls separate (attention
+    // in phase 1, edits here) exactly as before the trait.
+    let edited_files = cli.derive(transcript_content, &project_dir).edited_files;
     Some(Session {
         id,
         host: host_id.clone(),
+        agent: cli.kind(),
         project_dir,
         transcript_path: transcript_path.to_path_buf(),
         last_activity: mtime,
@@ -263,10 +276,7 @@ fn assemble_session(
         // transitions re-stamp this in the catalog.
         attention_entered_at: Some(mtime),
         started_at,
-        // Full edit history from the whole transcript buffer in hand —
-        // the watcher's tail-derived updates union onto this as the
-        // conversation continues (see `merge_edited_files`).
-        edited_files: derive_edited_files_from_content(transcript_content),
+        edited_files,
     })
 }
 
@@ -281,7 +291,7 @@ fn assemble_session(
 /// deleted, or the transcript predates having `cwd` metadata and we
 /// fell back to the `<unknown>` literal), or a transcript with no
 /// content-identifying signal yet — no task.toml task name, no
-/// `ai-title`, and no real user message (the post-`/clear`
+/// an agent title, and no real user message (the post-`/clear`
 /// stillborn case; the watcher's next event re-fires `NewTranscript`
 /// once the user actually types). In any of those cases, the user
 /// can't attach to or meaningfully recognise the session, so showing
@@ -292,21 +302,21 @@ fn assemble_session(
 pub fn build_session(
     host: &dyn Host,
     transcript_path: &Path,
+    kind: AgentKind,
     mtime: SystemTime,
 ) -> io::Result<Option<Session>> {
-    if transcript_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .is_none()
-    {
+    // The agent comes from the (host × agent) root the `NewTranscript`
+    // event was routed through, so the right parser builds the session.
+    let cli = agent(kind);
+    if cli.session_id_from_path(transcript_path).is_none() {
         return Ok(None);
     }
     let content = host.read_to_string(transcript_path)?;
-    let meta = parse_transcript_meta(&content);
+    let meta = cli.parse_meta(&content);
     let project_dir = meta
         .cwd
         .clone()
-        .unwrap_or_else(|| fallback_dir(transcript_path));
+        .unwrap_or_else(|| cli.fallback_dir(transcript_path));
     let exists = host.is_dir(&project_dir);
     let (task_toml, git_pointer) = if exists {
         (
@@ -319,6 +329,7 @@ pub fn build_session(
         (None, None)
     };
     Ok(assemble_session(
+        cli,
         host.id(),
         transcript_path,
         mtime,
@@ -328,131 +339,6 @@ pub fn build_session(
         git_pointer.as_deref(),
         Attention::Unknown,
     ))
-}
-
-#[derive(Debug, Default)]
-struct TranscriptMeta {
-    cwd: Option<PathBuf>,
-    ai_title: Option<String>,
-    /// Normalized + truncated text of the first non-empty user-authored
-    /// message in the transcript. Used as a title fallback for sessions
-    /// where `ai-title` hasn't surfaced yet and no `task.toml` exists —
-    /// better than just the directory name when several sessions share
-    /// a cwd.
-    first_user_message: Option<String>,
-}
-
-/// Max display length (in chars, not bytes) for the first-user-message
-/// title fallback. Long enough to be useful on a 100-col terminal next
-/// to the dimmed cwd/host/age trailing spans; short enough that a
-/// rambling first message doesn't dominate the row.
-const FIRST_USER_MSG_MAX_CHARS: usize = 60;
-
-/// Single-pass scan over an already-fetched transcript: take cwd from
-/// the first line that has one, ai-title from the *last* `ai-title`
-/// entry (titles refine as the session grows), and the first non-empty
-/// user message for the title-fallback path. Malformed JSON lines are
-/// skipped. Pure — no I/O — so both the single-shot `build_session`
-/// path and the batched `discover_with_cutoff` path can share it.
-fn parse_transcript_meta(raw: &str) -> TranscriptMeta {
-    let mut meta = TranscriptMeta::default();
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if meta.cwd.is_none()
-            && let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str)
-        {
-            meta.cwd = Some(PathBuf::from(cwd));
-        }
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("ai-title")
-            && let Some(title) = value.get("aiTitle").and_then(serde_json::Value::as_str)
-        {
-            meta.ai_title = Some(title.to_string());
-        }
-        if meta.first_user_message.is_none()
-            && value.get("type").and_then(serde_json::Value::as_str) == Some("user")
-            && value.get("toolUseResult").is_none()
-            && let Some(text) = extract_user_text(&value)
-            && !text.trim().is_empty()
-            && !is_slash_command_envelope(&text)
-        {
-            meta.first_user_message = Some(normalize_for_title(&text));
-        }
-    }
-    meta
-}
-
-/// Pull the human-authored text out of a `{"type":"user", ...}` entry.
-/// Accepts the three shapes seen in practice: `message` as a plain
-/// string, `message.content` as a string, or `message.content` as an
-/// array of `{"type":"text", "text":"..."}` blocks (with non-text
-/// blocks silently skipped). Returns `None` for shapes we don't
-/// recognise rather than guessing.
-fn extract_user_text(entry: &serde_json::Value) -> Option<String> {
-    let message = entry.get("message")?;
-    if let Some(s) = message.as_str() {
-        return Some(s.to_string());
-    }
-    let content = message.get("content")?;
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
-    if let Some(arr) = content.as_array() {
-        let mut buf = String::new();
-        for block in arr {
-            if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                && let Some(text) = block.get("text").and_then(serde_json::Value::as_str)
-            {
-                if !buf.is_empty() {
-                    buf.push(' ');
-                }
-                buf.push_str(text);
-            }
-        }
-        if !buf.is_empty() {
-            return Some(buf);
-        }
-    }
-    None
-}
-
-/// True if `text` is Claude Code's slash-command wrapper (e.g.
-/// `<local-command-caveat>…</local-command-caveat>` or
-/// `<command-name>/clear</command-name>`) rather than human-typed
-/// prose. Same family of "user entry but not human content" as
-/// `toolUseResult`: surfacing it as a session title produces noise
-/// like `<local-command-caveat>The messages below were genera…` for
-/// any session whose first input was a slash command and which
-/// hasn't had `aiTitle` generated yet.
-fn is_slash_command_envelope(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("<local-command-caveat>") || trimmed.starts_with("<command-name>")
-}
-
-/// Collapse all-whitespace runs to a single space, trim, and truncate
-/// to `FIRST_USER_MSG_MAX_CHARS` chars (not bytes) with an ellipsis
-/// suffix when shortened. The list row renders on a single line, so a
-/// multi-line first message has to be flattened before it lands there.
-fn normalize_for_title(raw: &str) -> String {
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut iter = collapsed.chars();
-    let mut taken: String = iter.by_ref().take(FIRST_USER_MSG_MAX_CHARS).collect();
-    if iter.next().is_some() {
-        taken.push('…');
-    }
-    taken
-}
-
-fn fallback_dir(transcript_path: &Path) -> PathBuf {
-    transcript_path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|n| n.to_str())
-        .map_or_else(
-            || PathBuf::from("<unknown>"),
-            |n| PathBuf::from(n.replace('-', "/")),
-        )
 }
 
 #[cfg(test)]
@@ -473,10 +359,11 @@ mod tests {
         (tmp, projects, cwd)
     }
 
-    /// Test-local shorthand: every test in this module discovers against
-    /// the local filesystem, so wrap the explicit-host call.
+    /// Test-local shorthand: every test in this module discovers claude
+    /// sessions against the local filesystem, so wrap the explicit-host
+    /// + explicit-agent call.
     fn discover_local(root: &Path) -> io::Result<Vec<Session>> {
-        discover(&LocalHost::new(), root)
+        discover(&LocalHost::new(), root, AgentKind::Claude)
     }
 
     /// Force a file's mtime to a specific instant. Used by the recency-
@@ -628,6 +515,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_discovery_lists_via_codex_listing_spec() {
+        // WP2 routing: discovering with `AgentKind::Codex` must list the
+        // codex tree (depth-4 `rollout-*.jsonl`) through the codex agent,
+        // not the claude depth-2 shape. The stub parser yields no cwd, so
+        // no Session survives assembly — but the *listing* must run through
+        // the right spec, which we prove directly against the host.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".codex").join("sessions");
+        let day = root.join("2026").join("07").join("09");
+        create_dir_all(&day).unwrap();
+        let rollout =
+            day.join("rollout-2026-07-09T10-00-00-00000000-1111-2222-3333-444444444444.jsonl");
+        fs::write(&rollout, "{\"type\":\"session_meta\"}\n").unwrap();
+        // A claude-shaped depth-2 file that the codex spec must NOT pick up.
+        let shallow = root.join("bucket");
+        create_dir_all(&shallow).unwrap();
+        fs::write(shallow.join("x.jsonl"), "{}\n").unwrap();
+
+        let host = LocalHost::new();
+        let listed = host
+            .list_transcripts(&root, &agent(AgentKind::Codex).listing())
+            .unwrap();
+        let paths: Vec<_> = listed.iter().map(|s| s.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![rollout],
+            "codex spec lists only depth-4 rollouts"
+        );
+
+        // discover() through the codex agent runs cleanly (stub parser →
+        // no assembled session yet; the read path lands in WP3).
+        let sessions = discover(&host, &root, AgentKind::Codex).unwrap();
+        assert!(
+            sessions.is_empty(),
+            "stub codex parser assembles nothing: {sessions:?}"
+        );
+    }
+
+    #[test]
     fn discovers_edited_files_from_transcript() {
         // End-to-end: an Edit/Write tool_use in the transcript surfaces
         // on Session.edited_files, most-recent-first, so the picker has a
@@ -728,7 +654,7 @@ mod tests {
     #[test]
     fn stillborn_transcript_with_no_signal_is_filtered() {
         // A transcript with a cwd entry but no real user message, no
-        // ai-title, and no task.toml is the post-`/clear`-and-walked-
+        // agent title, and no task.toml is the post-`/clear`-and-walked-
         // away case. The session has nothing the user could recognise
         // it by; surfacing it produces a row titled only by its
         // session-id hash. Filter at the discovery boundary so the
@@ -827,7 +753,13 @@ mod tests {
         )
         .unwrap();
 
-        let session = build_session(&LocalHost::new(), &path, SystemTime::now()).unwrap();
+        let session = build_session(
+            &LocalHost::new(),
+            &path,
+            AgentKind::Claude,
+            SystemTime::now(),
+        )
+        .unwrap();
         assert!(session.is_none(), "got: {session:?}");
     }
 
@@ -944,7 +876,8 @@ mod tests {
         let sessions = discover_local(&projects).unwrap();
         let title = sessions[0].title.as_deref().unwrap();
         assert!(title.ends_with('…'), "got: {title}");
-        assert_eq!(title.chars().count(), FIRST_USER_MSG_MAX_CHARS + 1);
+        // 60-char cap (see the reference agent's first-user-message cap) + the ellipsis.
+        assert_eq!(title.chars().count(), 61);
     }
 
     #[test]
@@ -1123,7 +1056,8 @@ mod tests {
 
         let cutoff = now - Duration::from_hours(720);
         let sessions =
-            discover_with_cutoff(&LocalHost::new(), &projects, cutoff).expect("discover");
+            discover_with_cutoff(&LocalHost::new(), &projects, AgentKind::Claude, cutoff)
+                .expect("discover");
         assert!(
             sessions.is_empty(),
             "cold transcript should be filtered: {sessions:?}"
@@ -1154,7 +1088,8 @@ mod tests {
 
         let cutoff = now - Duration::from_hours(720);
         let sessions =
-            discover_with_cutoff(&LocalHost::new(), &projects, cutoff).expect("discover");
+            discover_with_cutoff(&LocalHost::new(), &projects, AgentKind::Claude, cutoff)
+                .expect("discover");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id.0, "warm");
     }

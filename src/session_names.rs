@@ -2,7 +2,7 @@
 //!
 //! Persistent per-`(host, session_id)` rename store. The dashboard's
 //! `r` keybind opens an inline edit over the selected row; the
-//! resulting name overrides the transcript's `aiTitle` (and the
+//! resulting name overrides the transcript's agent title (and the
 //! branch/commit fallback) when present, so a session whose
 //! auto-derived title is unreadable for triage at a glance can be
 //! renamed to something the user remembers.

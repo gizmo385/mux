@@ -43,7 +43,7 @@ pub enum KeyOutcome {
 impl DeleteWorktreeModal {
     /// Construct a modal from the selected session. Returns `None` if
     /// the session has no `parent_repo` — sessions started outside a
-    /// worktree (a plain checkout, or an arbitrary `claude` invocation
+    /// worktree (a plain checkout, or an arbitrary agent invocation
     /// against any directory) aren't deletable through this path, and
     /// the caller surfaces a status message instead.
     #[must_use]
@@ -195,6 +195,7 @@ mod tests {
         Session {
             id: SessionId("abc123".into()),
             host: HostId::local(),
+            agent: crate::agent::AgentKind::Claude,
             project_dir: PathBuf::from("/work/.agent-mux-worktrees/proj-feature"),
             transcript_path: PathBuf::from("/transcripts/abc.jsonl"),
             last_activity: SystemTime::UNIX_EPOCH,

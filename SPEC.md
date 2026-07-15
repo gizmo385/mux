@@ -12,7 +12,8 @@ The target user is a single developer who already lives in the terminal, already
 
 ## Glossary
 
-- **Session** — one ongoing Claude Code conversation. Each session has an id, a project (working directory), a host, an optional task description, and an on-disk transcript.
+- **Session** — one ongoing agent conversation. Each session has an id, an agent CLI, a project (working directory), a host, an optional task description, and an on-disk transcript.
+- **Agent CLI** — the terminal coding agent a session runs (`claude`, `codex`, `pi`). Each agent defines its own transcript location and format, spawn/resume commands, and attention signals; the `AgentCli` trait (see `ARCHITECTURE.md`) hides the differences from the rest of the system. Claude Code is the reference agent and the only one enabled without configuration.
 - **Project** — the working directory Claude Code runs in for a session. For sessions agent-mux created (M1+) this is usually a worktree of a known Repo — except for the `N` no-worktree flow (post-M5), where agent-mux spawns directly in the repo root. For sessions started externally, it can be any directory.
 - **Repo** — a git repository discovered by scanning workspace folders. The unit of organisation for agent-mux-created sessions: every such session lives in a worktree of exactly one Repo. Sessions whose `project_dir` does not match any known Repo are still rendered, just without a repo label.
 - **Workspace folder** — a directory the user has designated as containing one or more git repos. agent-mux scans these to populate the Repo Registry. Configured in `~/.config/agent-mux/config.toml` (`workspace_folders = [...]`).
@@ -20,7 +21,7 @@ The target user is a single developer who already lives in the terminal, already
 - **Task** — the human-readable description of what a session is for ("refactor the parser"). Optional, persisted alongside the worktree for sessions agent-mux created.
 - **Host** — where a session physically runs. Either `local` or a user-configured SSH target (an entry in `~/.ssh/config` or an explicit `user@host`).
 - **Dashboard** — the agent-mux TUI: the list of all known sessions and their states.
-- **Transcript** — the JSONL file Claude Code writes for each conversation (under `~/.claude/projects/<hash>/<conversation-id>.jsonl`). Source of truth for what a session is doing.
+- **Transcript** — the JSONL file the agent CLI writes for each conversation (Claude Code: `~/.claude/projects/<hash>/<conversation-id>.jsonl`; Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`; Pi: `~/.pi/agent/sessions/--<encoded-cwd>--/<ts>_<id>.jsonl`). Source of truth for what a session is doing.
 - **Attention state** — a session's current status, derived from its transcript: `needs-input`, `working`, or `idle`.
 - **Attachment** — the mechanism by which the user interacts with a session. For M0–M5 this was a foreground `tmux` window (the user's whole terminal took the session's place); post-M5 the default is an embedded PTY pane inside the dashboard, hosting the same `tmux attach` invocation but as a child process rather than a screen handoff. The `AttachmentDriver` trait abstracts both modes so callers don't know the difference; users select via `--no-embed`.
 
@@ -38,6 +39,7 @@ What agent-mux does, in user-observable terms.
 - **Open a file Claude edited.** The user can jump straight into a file the session's Claude has changed, in their own editor, without hunting for it. A `[[tools]]` binding whose command references `{file}` (e.g. `vim {file}`) is *file-scoped*: pressing its key surfaces the list of files that session edited (derived from the transcript — every `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, most-recent-first) and opens the picked one via the same tool-launch path a plain tool uses. Works for local and remote sessions alike (the editor opens against the path on the session's host).
 - **Remote sessions (M2).** Sessions on configured SSH hosts appear in the same dashboard. Attaching opens an `ssh -t target tmux attach …` inside the embedded pane (or as a foreground subprocess with `--no-embed`) — same dispatch as local. Attention state for remote sessions is detected the same way as local: by watching the remote transcript file over the existing SSH connection. Post-M5: `n` against a remote-host repo creates the worktree on the remote and spawns `claude` there, surfacing the new session in the dashboard via the normal discovery pipeline.
 - **Attention notifications.** When a session moves from `working` or `idle` into `needs-input`, the dashboard updates and (eventually) the user receives an OS-level notification.
+- **Multiple agent CLIs (post-M5 arc, in progress).** Sessions from other qualifying agent CLIs (Codex, Pi) appear in the same dashboard once enabled via `[agents.<name>]` config: discovered from each agent's transcript tree, attention-tracked through each agent's transcript semantics, attachable and spawnable through the same flows. With no `[agents]` config, behaviour is identical to Claude-Code-only. Per-agent capability gaps (e.g. Codex approval prompts being invisible to its transcript) are documented in the README rather than papered over.
 
 What agent-mux does not do.
 
@@ -80,13 +82,15 @@ Scope: TOML config schema for themes and keybindings; reload-on-edit; documented
 - **Remote session creation.** `n` against a remote-host repo creates the worktree on the remote (via the `Host` trait's `run` + `write_file` primitives) and spawns `claude` over SSH. Surfaces in the dashboard through normal discovery.
 - **Shape B — embedded-PTY dashboard.** The M3 inline-preview experiment surfaced enough signal — "see other sessions while interacting with one" — to justify the Shape B transition the `AttachmentDriver` trait was designed to allow. The default attach now hosts a pseudoterminal inside the dashboard's TUI rather than handing off the whole terminal; tmux still runs as before, just inside our pane. `--no-embed` opts back into the legacy flow.
 
+- **Multi-agent CLI support (decided 2026-07-09, in progress).** The `AgentCli` trait extraction plus Codex and Pi as the first non-Claude agents, executed per `docs/plans/2026-07-09-multi-agent-cli.md`.
+
 Still on the table: diff view (what an agent has changed against the base branch), merge / discard workflow for completed sessions, Claude Code hooks integration for richer attention signals, embedded-PTY polish (F5+ key codes, leader-chord config knob, mouse-on-sidebar). Order will follow what dogfooding surfaces.
 
 ## Out of scope
 
 - **Replacing tmux.** agent-mux runs on top of tmux. Post-M5's embedded-PTY mode hosts the terminal that tmux runs in, but tmux still owns panes-within-tmux, scrollback, copy mode, and session persistence across agent-mux restarts. A no-tmux Shape B (PTY hosting `claude` directly) is *possible* given the embedded infrastructure but would lose persistence and remote ergonomics; not in scope for the foreseeable plan.
 - **Replacing Claude Code.** agent-mux does not implement a chat UI. The user always interacts with the real Claude Code through tmux — the embedded pane just hosts the terminal tmux + Claude Code run in. agent-mux *spawns* Claude Code sessions (M1 locally, post-M5 remotely) but does not configure or update Claude Code itself.
-- **Other agents.** Cursor, Aider, generic-LLM CLIs — none of these are in scope. Claude Code only.
+- **Agent CLIs that don't qualify.** Multi-agent support (decided 2026-07-09, see `docs/plans/2026-07-09-multi-agent-cli.md`) is bounded by a criterion, not a name list: an agent CLI qualifies only if it (a) persists transcripts to local disk in a tail-parseable format and (b) can resume a session by id from its CLI. Claude Code is the reference agent; OpenAI Codex and Pi are the first additional targets. Agents that don't meet the criterion — IDE-embedded agents, agents with no on-disk transcript, agents resumable only through an interactive picker — are out of scope by construction. Rendering any agent's conversation in agent-mux's own UI remains out of scope regardless.
 - **Windows-native.** Targets Linux and macOS terminals. WSL is the only supported Windows path.
 - **Collaboration features.** Single user, single dashboard instance. No shared state across users or machines (other than the user logging in to their own remote hosts).
 - **Persistent state beyond what tmux and Claude Code already persist.** agent-mux's own state (dashboard view, focus, recent activity cache) is allowed to be ephemeral.

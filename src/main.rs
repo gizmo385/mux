@@ -1583,14 +1583,29 @@ impl App {
             self.status = Some("select a session first".to_string());
             return;
         };
-        if session.edited_files.is_empty() {
-            let who = session.title.as_deref().unwrap_or(session.id.0.as_str());
-            self.status = Some(format!("no files edited yet in {who}"));
+        let cwd = session.project_dir.clone();
+        // Merge the two sources: transcript edits first (they carry
+        // recency + agent-intent order), then git working-tree changes not
+        // already listed — the files changed *programmatically*, which the
+        // edit log misses. Both sides are absolute, so dedup is exact-path
+        // (mirrors `merge_edited_files`); cap the union at `EDITED_FILES_CAP`.
+        let mut merged: Vec<PathBuf> = session.edited_files.clone();
+        for path in &session.git_changed_files {
+            if !merged.contains(path) {
+                merged.push(path.clone());
+            }
+        }
+        let who = session
+            .title
+            .as_deref()
+            .unwrap_or(session.id.0.as_str())
+            .to_string();
+        merged.truncate(agent_mux::session::EDITED_FILES_CAP);
+        if merged.is_empty() {
+            self.status = Some(format!("no files changed yet in {who}"));
             return;
         }
-        let cwd = session.project_dir.clone();
-        let entries: Vec<EditedFileEntry> = session
-            .edited_files
+        let entries: Vec<EditedFileEntry> = merged
             .iter()
             .map(|path| {
                 // Show a path relative to the session cwd when it lives
@@ -2151,6 +2166,12 @@ impl App {
                             // context in the formatter.
                             None,
                         );
+                        // A turn-end (transition *into* NeedsInput) is
+                        // both the moment programmatic file changes have
+                        // landed and the moment the user reaches for the
+                        // `{file}` tool — refresh the git-changed set in
+                        // the background so the picker has it ready.
+                        self.maybe_refresh_git_on_needs_input(&update.id, prev, update.attention);
                     }
                 }
                 WatcherEvent::Hook {
@@ -2186,6 +2207,11 @@ impl App {
                             Some(received_at),
                             message.as_deref(),
                         );
+                        // A hook (permission prompt / turn-end nudge)
+                        // that moves the session into NeedsInput is the
+                        // same "agent stopped, user may act" boundary the
+                        // heuristic arm refreshes on.
+                        self.maybe_refresh_git_on_needs_input(&id, prev, Attention::NeedsInput);
                     }
                 }
                 WatcherEvent::NewTranscript {
@@ -2227,6 +2253,18 @@ impl App {
                         .collect();
                     self.catalog
                         .apply_live_panes(&host, &cwd_set, &live_session_ids);
+                }
+                WatcherEvent::GitStatus {
+                    host: _,
+                    id,
+                    changed,
+                } => {
+                    // A background `git status` refresh completed. Store the
+                    // fresh snapshot (the `host` tag is self-describing but
+                    // unused here — the catalog routes by id). Replaces,
+                    // doesn't union: it's the whole current working-tree
+                    // state, so a no-longer-changed file drops out.
+                    self.catalog.set_git_changed_files(&id, changed);
                 }
             }
         }
@@ -2293,6 +2331,45 @@ impl App {
         );
     }
 
+    /// Refresh the session's git-changed-files set iff this is a transition
+    /// *into* `NeedsInput` (a turn-end / a fresh block). That's the gate the
+    /// git-status source runs on — cheap (a few times per conversation, not
+    /// per poll tick) and aligned with when the user reaches for the
+    /// `{file}` tool. A no-op for every other transition.
+    fn maybe_refresh_git_on_needs_input(&self, id: &SessionId, prev: Attention, new: Attention) {
+        if new == Attention::NeedsInput && prev != Attention::NeedsInput {
+            self.refresh_git_changed_files(id);
+        }
+    }
+
+    /// Kick off a background `git status` for `id` on its host and deliver
+    /// the result back through the watcher's event channel as
+    /// [`WatcherEvent::GitStatus`]. The git call is blocking I/O (a
+    /// subprocess locally, an SSH round-trip remotely), so it runs on a
+    /// detached thread — never the main loop — honouring "session switching
+    /// never blocks on I/O." Silently no-ops when the session or its host is
+    /// gone (offline host, deleted session).
+    fn refresh_git_changed_files(&self, id: &SessionId) {
+        let Some(session) = self.catalog.sessions().iter().find(|s| s.id == *id) else {
+            return;
+        };
+        let host_id = session.host.clone();
+        let cwd = session.project_dir.clone();
+        let Some(host) = self.hosts.get(&host_id).cloned() else {
+            return;
+        };
+        let id = id.clone();
+        let tx = self.watcher.event_sender();
+        std::thread::spawn(move || {
+            let changed = agent_mux::git_status::changed_files(host.as_ref(), &cwd);
+            let _ = tx.send(WatcherEvent::GitStatus {
+                host: host_id,
+                id,
+                changed,
+            });
+        });
+    }
+
     /// React to a watcher-emitted "previously-unknown transcript appeared"
     /// event. The file may be only partially written on the first event,
     /// in which case `build_session` returns `Ok(None)` (no usable cwd
@@ -2313,6 +2390,7 @@ impl App {
             return;
         };
         let id = session.id.clone();
+        let attention = session.attention;
         let transcript_path = session.transcript_path.clone();
         if !self.catalog.add(session) {
             return;
@@ -2320,6 +2398,15 @@ impl App {
         if self.list_state.selected().is_none() {
             let rows = self.current_rows();
             self.list_state.select(first_session_index(&rows));
+        }
+        // A session that surfaces *already* stopped (NeedsInput) — a
+        // pre-existing conversation discovered after launch, e.g. a remote
+        // host connecting late — won't fire a NeedsInput *transition*, so
+        // seed its git-changed set once here. Sessions born Working refresh
+        // on their eventual turn-end; the startup discovery set is left to
+        // the same transition path (no first-frame git-status stampede).
+        if attention == Attention::NeedsInput {
+            self.refresh_git_changed_files(&id);
         }
         if let Err(e) = self
             .watcher
@@ -5191,6 +5278,7 @@ mod tests {
             attention_entered_at: None,
             started_at: None,
             edited_files: Vec::new(),
+            git_changed_files: Vec::new(),
         }
     }
 
@@ -6269,6 +6357,7 @@ mod tests {
             attention_entered_at: None,
             started_at: None,
             edited_files: Vec::new(),
+            git_changed_files: Vec::new(),
         }
     }
 

@@ -106,7 +106,7 @@ key = "g"
 command = ["lazygit"]   # opens lazygit in the selected worktree
 ```
 
-**Open a file the agent edited.** If a tool's `command` references `{file}`, it becomes *file-scoped*: pressing its key opens a picker listing the files that session's agent has edited (most-recently-edited first), and the file you pick is substituted for `{file}` when the tool launches. Fuzzy-filter by typing, `⏎` to open, `Esc` to cancel. The list is read from the conversation transcript.
+**Open a file the agent changed.** If a tool's `command` references `{file}`, it becomes *file-scoped*: pressing its key opens a picker listing the files that session changed (most-recently-edited first), and the file you pick is substituted for `{file}` when the tool launches. Fuzzy-filter by typing, `⏎` to open, `Esc` to cancel. The list comes from two sources, merged: files the agent edited through its edit tools (read from the conversation transcript) **and** files `git status` reports as changed in the session's working tree — so files changed *programmatically* (a script the agent ran, codegen, a formatter) show up too, not just logged edits. The `git status` read runs in the background when a session finishes a turn, so opening the picker never blocks; it's skipped for non-git working directories (which just show the transcript list).
 
 ```toml
 [[tools]]
@@ -179,7 +179,7 @@ Pi has no built-in permission gates, so it needs no hook for parity; a lower-lat
 Per-agent capability limits at this release. They are documented here rather than papered over in the UI:
 
 - **Codex `.jsonl.zst` cold rollouts are skipped.** A background worker zstd-compresses cold Codex rollouts; discovery skips `.jsonl.zst` siblings. They're weeks old — far outside the 30-day hot set — and an append re-materialises a plain `.jsonl`, so this only hides long-dormant sessions.
-- **Codex shell-command edits are uncaptured.** The edited-files picker sees Codex edits made through `apply_patch` (`patch_apply_end` / `FileChange`), not files a Codex turn changed via a raw shell command.
+- **Codex shell-command edits are uncaptured *by the transcript source*.** The transcript half of the file picker sees Codex edits made through `apply_patch` (`patch_apply_end` / `FileChange`), not files a Codex turn changed via a raw shell command. The `git status` half now covers most of that gap — a shell-command change in a git working tree shows up there regardless of which tool made it — so this caveat only bites for a non-git directory.
 - **Codex blocked-on-approval requires the hook.** Without `install-hooks --agent codex`, a Codex session waiting on an approval reads as *working* (the approval prompt is never persisted to the rollout). The hook is the only signal for it.
 - **Pi permission gates are invisible to the tail.** Pi has no built-in gates; any an extension adds are not written to the transcript, so they don't surface as *blocked*.
 - **Codex/Pi are not yet verified live end-to-end.** As of 2026-07-10 the Codex and Pi paths are tested against synthetic fixtures authored from format research (Codex rust-v0.144.1 and Pi v0.80.6, researched 2026-07-09); they have not been run against real `codex`/`pi` binaries. Treat Codex/Pi support as current-release best-effort.

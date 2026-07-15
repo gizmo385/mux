@@ -184,6 +184,7 @@ impl CachedSession {
             // Derived from the transcript, not cached; discovery fills it
             // once it reads the file. Same rationale as `has_live_pane`.
             edited_files: Vec::new(),
+            git_changed_files: Vec::new(),
         }
     }
 }
@@ -249,6 +250,7 @@ mod tests {
             attention_entered_at: None,
             started_at: None,
             edited_files: Vec::new(),
+            git_changed_files: Vec::new(),
         }
     }
 

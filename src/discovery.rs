@@ -277,6 +277,11 @@ fn assemble_session(
         attention_entered_at: Some(mtime),
         started_at,
         edited_files,
+        // Left empty at discovery — the git-status source is background +
+        // transition-gated (see `App::refresh_git_changed_files`), not part
+        // of the startup transcript read, so the startup set doesn't trigger
+        // a git-status stampede. Populates on the session's first turn-end.
+        git_changed_files: Vec::new(),
     })
 }
 

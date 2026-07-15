@@ -162,4 +162,23 @@ pub struct Session {
     /// serialized into the disk cache. A cache-seeded row starts empty and
     /// fills in once discovery reads the transcript.
     pub edited_files: Vec<PathBuf>,
+    /// Absolute paths of files that `git status` reports as changed in
+    /// `project_dir`'s working tree — the *disk-state* complement to
+    /// `edited_files`. Where `edited_files` is transcript-derived (only
+    /// files the agent touched via `Edit`/`Write`/`MultiEdit`/`NotebookEdit`),
+    /// this catches files changed *programmatically* — a script the agent
+    /// ran through `Bash`, codegen, a formatter — which never enter the
+    /// edit log. Modified + untracked (respecting `.gitignore`); deletions
+    /// excluded (can't open a file that's gone). The `{file}`-tool picker
+    /// merges this with `edited_files` (deduped, transcript entries first).
+    ///
+    /// Populated by a background `git status` (via [`crate::git_status`])
+    /// on the session's host, gated on attention transitions *into*
+    /// `NeedsInput` (a turn-end — the moment the user reaches for the file
+    /// tool) so it never runs on the switch/keystroke hot path. Empty until
+    /// the first such refresh; non-git cwds stay empty.
+    ///
+    /// Derived + ephemeral like `edited_files`: not serialized into the
+    /// disk cache.
+    pub git_changed_files: Vec<PathBuf>,
 }

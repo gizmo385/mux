@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod edited_files_modal;
 pub mod embedded_pty;
 pub mod favorites;
+pub mod git_status;
 pub mod hook_ingest;
 pub mod hook_install;
 pub mod host;

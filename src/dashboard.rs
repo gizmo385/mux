@@ -655,6 +655,7 @@ mod tests {
             attention_entered_at: None,
             started_at: None,
             edited_files: Vec::new(),
+            git_changed_files: Vec::new(),
         }
     }
 

@@ -240,6 +240,28 @@ impl SessionCatalog {
         false
     }
 
+    /// Replace a session's `git_changed_files` with a fresh `git status`
+    /// snapshot from the background refresh (see [`crate::git_status`] and
+    /// [`crate::watcher::WatcherEvent::GitStatus`]). Unlike
+    /// [`SessionCatalog::merge_edited_files`], this *replaces* rather than
+    /// unions — `git status` reports the whole current working-tree state,
+    /// so a file that's no longer changed (the user committed or reverted
+    /// it) must drop out. An empty `changed` (clean tree / non-git cwd)
+    /// therefore clears the list. Returns `true` if the stored list
+    /// changed.
+    pub fn set_git_changed_files(&mut self, id: &SessionId, changed: Vec<PathBuf>) -> bool {
+        for session in &mut self.sessions {
+            if session.id == *id {
+                if session.git_changed_files == changed {
+                    return false;
+                }
+                session.git_changed_files = changed;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Apply a fresh pane-presence snapshot from the pane poller for
     /// one host. Two-stage match per session, mirroring the attach
     /// path's `resolve_pane_target` so the indicator agrees with what
@@ -350,6 +372,7 @@ mod tests {
             attention_entered_at: None,
             started_at: None,
             edited_files: Vec::new(),
+            git_changed_files: Vec::new(),
         }
     }
 
@@ -935,5 +958,42 @@ mod tests {
     fn merge_edited_files_unknown_id_is_false() {
         let mut c = SessionCatalog::new();
         assert!(!c.merge_edited_files(&SessionId("missing".into()), vec![pb("/w/a.rs")]));
+    }
+
+    #[test]
+    fn set_git_changed_files_replaces_rather_than_unions() {
+        // Unlike merge_edited_files, git status is a full snapshot: a file
+        // that's no longer changed (committed/reverted) must drop out.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        assert!(c.set_git_changed_files(&id, vec![pb("/proj/a.rs"), pb("/proj/b.rs")]));
+        assert!(c.set_git_changed_files(&id, vec![pb("/proj/b.rs")]));
+        assert_eq!(c.sessions()[0].git_changed_files, vec![pb("/proj/b.rs")]);
+    }
+
+    #[test]
+    fn set_git_changed_files_empty_clears_the_list() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        c.set_git_changed_files(&id, vec![pb("/proj/a.rs")]);
+        assert!(c.set_git_changed_files(&id, Vec::new()));
+        assert!(c.sessions()[0].git_changed_files.is_empty());
+    }
+
+    #[test]
+    fn set_git_changed_files_returns_false_when_unchanged() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        assert!(c.set_git_changed_files(&id, vec![pb("/proj/a.rs")]));
+        assert!(!c.set_git_changed_files(&id, vec![pb("/proj/a.rs")]));
+    }
+
+    #[test]
+    fn set_git_changed_files_unknown_id_is_false() {
+        let mut c = SessionCatalog::new();
+        assert!(!c.set_git_changed_files(&SessionId("missing".into()), vec![pb("/w/a.rs")]));
     }
 }

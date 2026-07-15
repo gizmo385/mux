@@ -120,6 +120,23 @@ pub enum WatcherEvent {
         cwds: Vec<PathBuf>,
         session_names: Vec<String>,
     },
+    /// A background `git status` refresh (see [`crate::git_status`])
+    /// finished for `id` on `host`. `changed` is the absolute path of
+    /// every working-tree change (modified + untracked, deletions
+    /// excluded), which the catalog stores as `Session.git_changed_files`
+    /// so the `{file}`-tool picker can merge it with the transcript-derived
+    /// edit list. Unlike the transcript sources this is not emitted by the
+    /// watcher's own threads — the main loop kicks the refresh off (gated
+    /// on attention transitions into `NeedsInput`) and feeds the result
+    /// back through the shared event channel via [`Self::event_sender`], so
+    /// the git I/O stays off the switch/keystroke hot path. `changed` is a
+    /// full snapshot (it *replaces* the stored list, not unions), including
+    /// empty for a clean tree or a non-git cwd.
+    GitStatus {
+        host: HostId,
+        id: SessionId,
+        changed: Vec<PathBuf>,
+    },
 }
 
 pub struct TranscriptWatcher {

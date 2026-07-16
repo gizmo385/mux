@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/gizmo385/mux/compare/v0.1.7...v0.1.8) - 2026-07-16
+
+### Added
+
+- *(tools)* {file} picker also lists git-status changes, not just logged edits
+- *(ui)* quickswitcher empty-query order — recency beats the done/working tier
+- *(agents)* multi-agent CLI support — Codex & Pi
+
+### Fixed
+
+- *(agents)* match codex task_* turn-lifecycle events (0.142.5)
+- *(flake)* link agent-mux with lld on Darwin to dodge cctools ld crash
+
+### Other
+
+- multi-agent CLI plan + spec scope
+
 ## [0.1.7](https://github.com/gizmo385/mux/compare/v0.1.6...v0.1.7) - 2026-07-08
 
 ### Added

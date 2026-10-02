@@ -605,7 +605,11 @@ pub fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "                           prints the change without writing)."
+        "                           prints the change without writing; --host <name> installs on that"
+    )?;
+    writeln!(
+        out,
+        "                           configured SSH host, using the agent-mux on its PATH)."
     )?;
     writeln!(
         out,

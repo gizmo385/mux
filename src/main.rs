@@ -216,9 +216,18 @@ fn main() -> io::Result<()> {
             // everything else in the file. `--dry-run` prints the planned
             // content without writing. Default target is Claude Code's
             // `~/.claude/settings.json`; `--agent codex` targets
-            // `~/.codex/hooks.json` with the PermissionRequest + Stop
-            // handlers.
+            // `~/.codex/hooks.json` with the PermissionRequest handler.
+            // `--host <name>` installs on that configured SSH host instead
+            // (over its transport, pointing at the *remote* agent-mux).
             let dry_run = argv.iter().any(|s| s == "--dry-run");
+            if let Some(name) = arg_value(&argv, "--host") {
+                return install_hooks_on_named_host(
+                    name,
+                    arg_agent_is_codex(&argv),
+                    dry_run,
+                    &mut stdout,
+                );
+            }
             let binary = std::env::current_exe()?;
             if arg_agent_is_codex(&argv) {
                 let hooks =
@@ -274,10 +283,47 @@ fn run_codex_hook(stderr: &mut impl Write) -> io::Result<()> {
 /// missing (or any other) `--agent` value falls through to the claude
 /// path, so zero-config behaviour is unchanged.
 fn arg_agent_is_codex(argv: &[String]) -> bool {
+    arg_value(argv, "--agent").is_some_and(|a| a == "codex")
+}
+
+/// The value following `flag` in `argv` (`--flag value`), if any.
+fn arg_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
     argv.iter()
-        .position(|s| s == "--agent")
+        .position(|s| s == flag)
         .and_then(|i| argv.get(i + 1))
-        .is_some_and(|a| a == "codex")
+        .map(String::as_str)
+}
+
+/// `install-hooks --host <name>`: connect to the configured `[hosts.<name>]`
+/// over its own `ControlMaster` and run the remote installer. The hook must
+/// run on the machine the agent runs on, so the handler points at that
+/// machine's `agent-mux`; the installer errors clearly when it's missing.
+fn install_hooks_on_named_host(
+    name: &str,
+    codex: bool,
+    dry_run: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    use agent_mux::hook_install::{HookTarget, install_hooks_on_host};
+    let config = Config::load().map_err(io::Error::other)?;
+    let host_config = config.hosts.get(name).ok_or_else(|| {
+        let known: Vec<&str> = config.hosts.keys().map(String::as_str).collect();
+        io::Error::other(format!(
+            "no [hosts.{name}] in config (configured hosts: {})",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ))
+    })?;
+    let host = SshHost::connect(HostId(name.to_string()), host_config.ssh.clone())?;
+    let target = if codex {
+        HookTarget::Codex
+    } else {
+        HookTarget::Claude
+    };
+    install_hooks_on_host(&host, target, dry_run, out)
 }
 
 fn run_tui(embedded: bool) -> io::Result<()> {
@@ -773,6 +819,12 @@ enum RemoteDiscoveryResult {
     Failed {
         host_id: HostId,
         error: String,
+    },
+    /// A one-shot footer hint about this host's setup — today, a codex
+    /// hook installed there that Codex won't run (untrusted/disabled).
+    /// Computed on the discovery thread so the UI never does the SSH read.
+    Hint {
+        message: String,
     },
 }
 
@@ -1445,6 +1497,13 @@ impl App {
                 RemoteDiscoveryResult::Failed { host_id, error } => {
                     self.pending_hosts = self.pending_hosts.saturating_sub(1);
                     self.connect_errors.push((host_id, error));
+                }
+                RemoteDiscoveryResult::Hint { message } => {
+                    // Footer status is one slot; a setup hint never
+                    // clobbers something the user is already looking at.
+                    if self.status.is_none() {
+                        self.status = Some(message);
+                    }
                 }
             }
         }
@@ -3573,7 +3632,29 @@ fn connect_and_discover(
         // on every start. Best-effort for the same reason as above.
         let _ = cache::write_rejects_for_host(&dir, &host_id, &rejected);
     }
-    let _ = tx.send(RemoteDiscoveryResult::Ready { host_id, sessions });
+    let _ = tx.send(RemoteDiscoveryResult::Ready {
+        host_id: host_id.clone(),
+        sessions,
+    });
+    // After discovery so the rows paint first: if codex is enabled for
+    // this host, check whether Codex will actually run the agent-mux
+    // hook there. Best-effort — any probe/read failure stays silent.
+    if roots.iter().any(|(kind, _)| *kind == AgentKind::Codex)
+        && let Some(message) = agent_mux::hook_install::remote_codex_hook_trust(host.as_ref())
+            .and_then(|trust| remote_codex_hook_hint(&host_id, &trust))
+    {
+        let _ = tx.send(RemoteDiscoveryResult::Hint { message });
+    }
+}
+
+/// Footer wording for a remote host's codex hook trust state — the local
+/// hint's text, prefixed with the host so the user knows where to go
+/// trust it.
+fn remote_codex_hook_hint(
+    host_id: &HostId,
+    trust: &agent_mux::hook_install::CodexHookTrust,
+) -> Option<String> {
+    codex_hook_hint_text(trust).map(|text| format!("{host_id}: {text}"))
 }
 
 /// Outcome of a sidebar-focus key dispatch. Lets `run` keep its event
@@ -3978,8 +4059,8 @@ fn init_hook_watcher(
 /// Without it a blocked Codex session silently reads as working. Like any
 /// footer status it clears on the next keypress. A missing hook stays
 /// quiet — installing it is opt-in and the README covers it. Local host
-/// only: a remote's trust state would need an SSH read, which startup
-/// deliberately doesn't block on.
+/// only: remote hosts get the same hint from their discovery thread
+/// ([`remote_codex_hook_hint`]), since startup doesn't block on SSH.
 fn codex_hook_startup_hint(config: &Config) -> Option<String> {
     use agent_mux::hook_install::{codex_hook_trust_at, default_codex_hooks_path};
     if !config.enabled_agents().contains(&AgentKind::Codex) {
@@ -6509,6 +6590,23 @@ mod tests {
         assert!(codex_hook_hint_text(&CodexHookTrust::Disabled).is_some());
         assert_eq!(codex_hook_hint_text(&CodexHookTrust::NotInstalled), None);
         assert_eq!(codex_hook_hint_text(&CodexHookTrust::Trusted), None);
+    }
+
+    #[test]
+    fn remote_codex_hook_hint_names_the_host() {
+        use agent_mux::hook_install::CodexHookTrust;
+        let host = HostId("devbox".into());
+        let hint = remote_codex_hook_hint(&host, &CodexHookTrust::Untrusted).unwrap();
+        assert!(hint.starts_with("devbox: "), "{hint}");
+        assert!(hint.contains("Hooks need review"), "{hint}");
+        assert_eq!(
+            remote_codex_hook_hint(&host, &CodexHookTrust::Trusted),
+            None
+        );
+        assert_eq!(
+            remote_codex_hook_hint(&host, &CodexHookTrust::NotInstalled),
+            None
+        );
     }
 
     // ---- resolve_notification_title ----

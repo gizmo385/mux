@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use crate::host::Host;
+
 /// What [`plan_install`] decided to do for the given settings file.
 /// Mirrored to the user via [`describe_action`] so they see what
 /// changed (or didn't) on stdout.
@@ -574,14 +576,259 @@ pub fn install_codex_hooks_at<W: Write>(
         read_current(hooks_path)?
     };
     let config_toml = read_current(&hooks_path.with_file_name("config.toml"))?;
-    let trust = codex_hook_trust(hooks_path, &hooks_json, &config_toml);
-    // A trusted, unchanged handler needs no commentary.
-    let unchanged_and_trusted =
-        trust == CodexHookTrust::Trusted && plan.action == InstallAction::NoOp;
+    report_codex_trust(out, hooks_path, &hooks_json, &config_toml, &plan.action)
+}
+
+/// Print where the agent-mux codex handler stands with Codex's hook trust
+/// after an install (or dry run). Shared by the local and `--host`
+/// installers so both say exactly the same thing. A trusted, unchanged
+/// handler needs no commentary.
+fn report_codex_trust<W: Write>(
+    out: &mut W,
+    hooks_path: &Path,
+    hooks_json: &str,
+    config_toml: &str,
+    action: &InstallAction,
+) -> io::Result<()> {
+    let trust = codex_hook_trust(hooks_path, hooks_json, config_toml);
+    let unchanged_and_trusted = trust == CodexHookTrust::Trusted && *action == InstallAction::NoOp;
     if let Some(msg) = describe_codex_trust(&trust).filter(|_| !unchanged_and_trusted) {
         writeln!(out, "\n{msg}")?;
     }
     Ok(())
+}
+
+// ---- remote (`--host`) install ----------------------------------------
+//
+// The remote installer reuses the pure planners above; only the I/O moves
+// onto the host's transport. Every remote step is one small `sh -c` script
+// run through `Host::run` (ssh mechanics stay inside `Host`), with paths
+// passed as positional arguments so nothing is spliced into the script
+// text. The scripts are named constants so tests can recognise them.
+
+/// Prints, one per line: `$HOME`, the codex home (`$CODEX_HOME`, else
+/// `$HOME/.codex`), and the remote `agent-mux` path (empty if not on PATH).
+/// Resolved remotely because the hook paths — and Codex's trust key, which
+/// embeds the hooks file's absolute path — are the *remote* machine's.
+pub const REMOTE_PROBE_SCRIPT: &str =
+    r#"printf '%s\n' "$HOME" "${CODEX_HOME:-$HOME/.codex}"; command -v agent-mux || printf '\n'"#;
+/// `cat "$1"` when it is a regular file, nothing otherwise (a missing
+/// hooks/settings/config file is the fresh-install case, not an error).
+pub const REMOTE_READ_OPTIONAL_SCRIPT: &str = r#"if [ -f "$1" ]; then cat "$1"; fi"#;
+/// `mkdir -p "$1"`.
+pub const REMOTE_MKDIR_SCRIPT: &str = r#"mkdir -p "$1""#;
+/// One-time backup: copy `$2` to `$1` unless `$1` already exists; prints
+/// `written` when it copied.
+pub const REMOTE_BACKUP_SCRIPT: &str = r#"if [ ! -e "$1" ]; then cp "$2" "$1" && echo written; fi"#;
+/// Atomic replace: `mv -f "$1" "$2"`.
+pub const REMOTE_RENAME_SCRIPT: &str = r#"mv -f "$1" "$2""#;
+
+/// Which agent's hook the installer targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookTarget {
+    /// Claude Code's `Notification` hook in `~/.claude/settings.json`.
+    Claude,
+    /// Codex's `PermissionRequest` hook in `$CODEX_HOME/hooks.json`.
+    Codex,
+}
+
+/// The remote paths the installer needs, from one [`REMOTE_PROBE_SCRIPT`]
+/// round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHookEnv {
+    pub home: PathBuf,
+    pub codex_home: PathBuf,
+    /// The remote `agent-mux` binary, if it's on the remote `PATH`.
+    pub agent_mux: Option<PathBuf>,
+}
+
+impl RemoteHookEnv {
+    /// The file the installer edits for `target` on this machine.
+    #[must_use]
+    pub fn settings_path(&self, target: HookTarget) -> PathBuf {
+        match target {
+            HookTarget::Claude => self.home.join(".claude").join("settings.json"),
+            HookTarget::Codex => self.codex_hooks_path(),
+        }
+    }
+
+    /// `$CODEX_HOME/hooks.json` on this machine.
+    #[must_use]
+    pub fn codex_hooks_path(&self) -> PathBuf {
+        self.codex_home.join("hooks.json")
+    }
+}
+
+/// Parse [`REMOTE_PROBE_SCRIPT`]'s stdout.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] when `$HOME` or the codex home is
+/// missing or not absolute.
+pub fn parse_remote_probe(stdout: &str) -> io::Result<RemoteHookEnv> {
+    fn absolute(s: Option<&str>, what: &str) -> io::Result<PathBuf> {
+        match s {
+            Some(v) if v.starts_with('/') => Ok(PathBuf::from(v)),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("remote probe: {what} is not an absolute path: {other:?}"),
+            )),
+        }
+    }
+    let mut lines = stdout.lines().map(str::trim);
+    let home = absolute(lines.next(), "$HOME")?;
+    let codex_home = absolute(lines.next(), "codex home")?;
+    let agent_mux = lines.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    Ok(RemoteHookEnv {
+        home,
+        codex_home,
+        agent_mux,
+    })
+}
+
+/// Run one of the remote scripts above with positional `args`, failing on
+/// a non-zero exit (with the remote stderr in the message).
+fn run_remote_script(host: &dyn Host, script: &str, args: &[&str]) -> io::Result<String> {
+    let mut sh_argv: Vec<&str> = vec!["-c", script, "sh"];
+    sh_argv.extend_from_slice(args);
+    let output = host.run(None, "sh", &sh_argv)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "remote command on {} failed: {}",
+            host.id(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8(output.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Resolve the remote home / codex home / agent-mux path.
+///
+/// # Errors
+/// Transport failures, a failing probe, or unparseable output.
+pub fn probe_remote_hook_env(host: &dyn Host) -> io::Result<RemoteHookEnv> {
+    parse_remote_probe(&run_remote_script(host, REMOTE_PROBE_SCRIPT, &[])?)
+}
+
+/// Read a remote file, treating "missing" as empty.
+fn read_remote_optional(host: &dyn Host, path: &Path) -> io::Result<String> {
+    run_remote_script(
+        host,
+        REMOTE_READ_OPTIONAL_SCRIPT,
+        &[&path.to_string_lossy()],
+    )
+}
+
+/// `agent-mux install-hooks [--agent codex] --host <name>`: install the
+/// agent's hook on a remote machine over `host`'s transport. Same planner,
+/// same summary lines and same trust report as the local installer; the
+/// handler points at the **remote** `agent-mux` (it runs there), and every
+/// path is the remote machine's. The write is atomic (`tmp` + `mv`) with
+/// the same one-time `.bak`, and is re-read and parsed afterwards.
+///
+/// # Errors
+/// - the remote has no `agent-mux` on its `PATH` (install it there first);
+/// - transport / remote-command failures;
+/// - planner errors (malformed existing file), as `io::Error::other`.
+pub fn install_hooks_on_host<W: Write>(
+    host: &dyn Host,
+    target: HookTarget,
+    dry_run: bool,
+    out: &mut W,
+) -> io::Result<()> {
+    let env = probe_remote_hook_env(host)?;
+    let binary = env.agent_mux.clone().ok_or_else(|| {
+        io::Error::other(format!(
+            "agent-mux is not on the PATH of host {} — install it there first \
+             (the hook runs on the machine the agent runs on)",
+            host.id()
+        ))
+    })?;
+    let path = env.settings_path(target);
+    let current = read_remote_optional(host, &path)?;
+    let (plan, what) = match target {
+        HookTarget::Claude => (
+            plan_install(&current, &binary).map_err(io::Error::other)?,
+            "Notification hook",
+        ),
+        HookTarget::Codex => (
+            plan_install_codex(&current, &binary).map_err(io::Error::other)?,
+            "lifecycle hooks",
+        ),
+    };
+    writeln!(out, "Host: {}", host.id())?;
+    writeln!(out, "Settings file: {}", path.display())?;
+    writeln!(out, "agent-mux binary: {}", binary.display())?;
+    writeln!(out, "Action: {}", describe_action(&plan.action, what))?;
+    let changed = !matches!(plan.action, InstallAction::NoOp);
+    if changed && dry_run {
+        writeln!(out, "\n--- dry run: planned {} ---", file_label(&path))?;
+        out.write_all(plan.new_content.as_bytes())?;
+    } else if changed {
+        write_remote_atomically(host, &path, &current, &plan.new_content, out)?;
+        writeln!(
+            out,
+            "\nSettings updated. Restart agent-mux if it's already running."
+        )?;
+    }
+    if target == HookTarget::Codex {
+        let hooks_json = if dry_run || !changed {
+            plan.new_content.clone()
+        } else {
+            read_remote_optional(host, &path)?
+        };
+        let config_toml = read_remote_optional(host, &env.codex_home.join("config.toml"))?;
+        report_codex_trust(out, &path, &hooks_json, &config_toml, &plan.action)?;
+    }
+    Ok(())
+}
+
+/// mkdir the parent, take the one-time backup, write `tmp`, `mv` into
+/// place, then re-read and parse — the remote twin of the local
+/// `apply_install_plan` write path.
+fn write_remote_atomically<W: Write>(
+    host: &dyn Host,
+    path: &Path,
+    current: &str,
+    new_content: &str,
+    out: &mut W,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        run_remote_script(host, REMOTE_MKDIR_SCRIPT, &[&parent.to_string_lossy()])?;
+    }
+    if !current.is_empty() {
+        let backup = backup_path_for(path);
+        let copied = run_remote_script(
+            host,
+            REMOTE_BACKUP_SCRIPT,
+            &[&backup.to_string_lossy(), &path.to_string_lossy()],
+        )?;
+        if copied.contains("written") {
+            writeln!(out, "Backup written: {}", backup.display())?;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    host.write_file(&tmp, new_content)?;
+    run_remote_script(
+        host,
+        REMOTE_RENAME_SCRIPT,
+        &[&tmp.to_string_lossy(), &path.to_string_lossy()],
+    )?;
+    let written = read_remote_optional(host, path)?;
+    serde_json::from_str::<Value>(&written)
+        .map_err(|e| io::Error::other(format!("post-write verification failed: {e}")))?;
+    Ok(())
+}
+
+/// Best-effort remote trust classification of the agent-mux codex hook,
+/// for the per-host discovery thread's footer hint. `None` on any probe or
+/// read failure — a hint is never worth an error.
+#[must_use]
+pub fn remote_codex_hook_trust(host: &dyn Host) -> Option<CodexHookTrust> {
+    let env = probe_remote_hook_env(host).ok()?;
+    let hooks_path = env.codex_hooks_path();
+    let hooks_json = read_remote_optional(host, &hooks_path).ok()?;
+    let config_toml = read_remote_optional(host, &env.codex_home.join("config.toml")).ok()?;
+    Some(codex_hook_trust(&hooks_path, &hooks_json, &config_toml))
 }
 
 /// Read the current hooks/settings file, treating a missing file as empty
@@ -1213,5 +1460,253 @@ trusted_hash = "sha256:abc"
             "dry-run announces itself: {out_str}"
         );
         assert!(out_str.contains("hook --agent codex"));
+    }
+
+    // ---- remote (`--host`) install ----
+
+    /// A stand-in remote machine: `run` executes the real `sh` scripts
+    /// with `HOME` / `PATH` (and optionally `CODEX_HOME`) pointed into a
+    /// temp dir, so the tests exercise the exact remote shell the installer
+    /// ships, minus ssh. `write_file` is a plain local write.
+    struct ShellHost {
+        id: crate::session::HostId,
+        home: PathBuf,
+        path_dir: PathBuf,
+        codex_home: Option<PathBuf>,
+    }
+
+    impl ShellHost {
+        /// A host whose PATH has a fake `agent-mux` when `with_binary`.
+        fn new(tmp: &TempDir, with_binary: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let home = tmp.path().join("home");
+            let path_dir = tmp.path().join("bin");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&path_dir).unwrap();
+            if with_binary {
+                let bin = path_dir.join("agent-mux");
+                fs::write(&bin, "#!/bin/sh\n").unwrap();
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self {
+                id: crate::session::HostId("devbox".into()),
+                home,
+                path_dir,
+                codex_home: None,
+            }
+        }
+
+        fn remote_binary(&self) -> String {
+            self.path_dir.join("agent-mux").display().to_string()
+        }
+    }
+
+    impl Host for ShellHost {
+        fn id(&self) -> &crate::session::HostId {
+            &self.id
+        }
+        fn list_transcripts(
+            &self,
+            _: &Path,
+            _: &crate::agent::ListingSpec,
+        ) -> io::Result<Vec<crate::host::TranscriptStat>> {
+            unimplemented!("not used by the installer")
+        }
+        fn read_to_string(&self, _: &Path) -> io::Result<String> {
+            unimplemented!("installer reads through run()")
+        }
+        fn read_tail(&self, _: &Path, _: u64) -> io::Result<String> {
+            unimplemented!()
+        }
+        fn is_dir(&self, _: &Path) -> bool {
+            unimplemented!()
+        }
+        fn read_many(&self, _: &[&Path]) -> io::Result<Vec<io::Result<String>>> {
+            unimplemented!()
+        }
+        fn is_dir_many(&self, _: &[&Path]) -> io::Result<Vec<bool>> {
+            unimplemented!()
+        }
+        fn run(
+            &self,
+            _cwd: Option<&Path>,
+            program: &str,
+            args: &[&str],
+        ) -> io::Result<std::process::Output> {
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(args)
+                .env("HOME", &self.home)
+                .env("PATH", format!("{}:/usr/bin:/bin", self.path_dir.display()))
+                .env_remove("CODEX_HOME");
+            if let Some(c) = &self.codex_home {
+                cmd.env("CODEX_HOME", c);
+            }
+            cmd.output()
+        }
+        fn write_file(&self, path: &Path, content: &str) -> io::Result<()> {
+            fs::write(path, content)
+        }
+        fn list_files(&self, _: &Path) -> io::Result<Vec<PathBuf>> {
+            unimplemented!()
+        }
+        fn remove(&self, _: &Path) -> io::Result<()> {
+            unimplemented!()
+        }
+        fn ssh_argv(&self, _: bool, _: &[&str]) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    #[test]
+    fn parse_remote_probe_reads_home_codex_home_and_binary() {
+        let env = parse_remote_probe("/home/u\n/home/u/.codex\n/usr/bin/agent-mux\n").unwrap();
+        assert_eq!(env.home, PathBuf::from("/home/u"));
+        assert_eq!(
+            env.codex_hooks_path(),
+            PathBuf::from("/home/u/.codex/hooks.json")
+        );
+        assert_eq!(env.agent_mux, Some(PathBuf::from("/usr/bin/agent-mux")));
+        assert_eq!(
+            parse_remote_probe("/home/u\n/home/u/.codex\n\n")
+                .unwrap()
+                .agent_mux,
+            None,
+            "an empty third line means agent-mux isn't on the remote PATH"
+        );
+        assert!(parse_remote_probe("relative\n/x\n").is_err());
+        assert!(parse_remote_probe("").is_err());
+    }
+
+    #[test]
+    fn remote_codex_install_writes_remote_hooks_file_pointing_at_remote_binary() {
+        let tmp = TempDir::new().unwrap();
+        let host = ShellHost::new(&tmp, true);
+        let mut out = Vec::new();
+        install_hooks_on_host(&host, HookTarget::Codex, false, &mut out).unwrap();
+        let hooks = host.home.join(".codex/hooks.json");
+        let value: Value = serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+        assert_eq!(
+            value["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            format!("{} hook --agent codex", host.remote_binary())
+        );
+        assert!(
+            !host.home.join(".codex/hooks.json.tmp").exists(),
+            "tmp renamed into place"
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Host: devbox"), "{out}");
+        assert!(out.contains("added agent-mux"), "{out}");
+        assert!(
+            out.contains("NOT run this hook until you trust it"),
+            "same trust report as the local installer: {out}"
+        );
+    }
+
+    #[test]
+    fn remote_codex_install_honours_remote_codex_home() {
+        let tmp = TempDir::new().unwrap();
+        let mut host = ShellHost::new(&tmp, true);
+        let codex_home = tmp.path().join("relocated-codex");
+        host.codex_home = Some(codex_home.clone());
+        install_hooks_on_host(&host, HookTarget::Codex, false, &mut Vec::new()).unwrap();
+        assert!(codex_home.join("hooks.json").exists());
+        assert!(!host.home.join(".codex/hooks.json").exists());
+    }
+
+    #[test]
+    fn remote_install_errors_when_agent_mux_is_not_on_the_remote_path() {
+        let tmp = TempDir::new().unwrap();
+        let host = ShellHost::new(&tmp, false);
+        let err =
+            install_hooks_on_host(&host, HookTarget::Codex, false, &mut Vec::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not on the PATH of host devbox"),
+            "clear install-it-there-first error: {msg}"
+        );
+        assert!(!host.home.join(".codex/hooks.json").exists());
+    }
+
+    #[test]
+    fn remote_install_dry_run_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        let host = ShellHost::new(&tmp, true);
+        let mut out = Vec::new();
+        install_hooks_on_host(&host, HookTarget::Codex, true, &mut out).unwrap();
+        assert!(!host.home.join(".codex").exists(), "nothing created");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("dry run"), "{out}");
+        assert!(out.contains("hook --agent codex"), "{out}");
+    }
+
+    #[test]
+    fn remote_install_backs_up_once_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let host = ShellHost::new(&tmp, true);
+        let hooks = host.home.join(".codex/hooks.json");
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        // A legacy install pointing at an old path → updated in place.
+        fs::write(
+            &hooks,
+            r#"{"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"/old/agent-mux hook --agent codex"}]}]}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        install_hooks_on_host(&host, HookTarget::Codex, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Backup written"), "{out}");
+        assert!(host.home.join(".codex/hooks.json.bak").exists());
+        let after_first = fs::read_to_string(&hooks).unwrap();
+        let mut out = Vec::new();
+        install_hooks_on_host(&host, HookTarget::Codex, false, &mut out).unwrap();
+        assert_eq!(fs::read_to_string(&hooks).unwrap(), after_first);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("already configured")
+        );
+    }
+
+    #[test]
+    fn remote_claude_install_targets_remote_settings_json() {
+        let tmp = TempDir::new().unwrap();
+        let host = ShellHost::new(&tmp, true);
+        install_hooks_on_host(&host, HookTarget::Claude, false, &mut Vec::new()).unwrap();
+        let settings = host.home.join(".claude/settings.json");
+        let value: Value = serde_json::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
+        assert_eq!(
+            value["hooks"]["Notification"][0]["hooks"][0]["command"],
+            format!("{} hook", host.remote_binary())
+        );
+    }
+
+    #[test]
+    fn remote_codex_hook_trust_classifies_from_remote_files() {
+        let tmp = TempDir::new().unwrap();
+        let host = ShellHost::new(&tmp, true);
+        // Nothing installed yet.
+        assert_eq!(
+            remote_codex_hook_trust(&host),
+            Some(CodexHookTrust::NotInstalled)
+        );
+        install_hooks_on_host(&host, HookTarget::Codex, false, &mut Vec::new()).unwrap();
+        assert_eq!(
+            remote_codex_hook_trust(&host),
+            Some(CodexHookTrust::Untrusted)
+        );
+        // Trust recorded under the *remote* absolute hooks path.
+        let hooks = host.home.join(".codex/hooks.json");
+        fs::write(
+            host.home.join(".codex/config.toml"),
+            format!(
+                "[hooks.state.\"{}:permission_request:0:0\"]\ntrusted_hash = \"sha256:x\"\n",
+                hooks.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_codex_hook_trust(&host),
+            Some(CodexHookTrust::Trusted)
+        );
     }
 }

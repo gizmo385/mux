@@ -176,7 +176,13 @@ Codex's "blocked on approval" state is never written to its transcript, so witho
 agent-mux install-hooks --agent codex
 ```
 
-**Codex gates hooks on trust.** Codex runs a hook only after you approve it in Codex itself. The next time you start `codex` on that machine, it shows **"Hooks need review"**: choose *Trust all and continue* (or *Review hooks* to approve just the agent-mux one). Until you do, Codex silently skips the hook. Trust is tied to the exact command and its position in `hooks.json`, so re-running the installer after moving the `agent-mux` binary asks you to review it again. The installer reports where the hook stands (from the `[hooks.state]` table in `~/.codex/config.toml`), and while it's untrusted the dashboard shows a reminder in the footer at startup, and agent-mux never writes that trust itself; trusting the hook is your decision, made in Codex.
+For a remote host, run it from your local machine with `--host <name>` (a `[hosts.<name>]` entry). It edits the remote's `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) over the same SSH connection the dashboard uses. The handler points at the `agent-mux` on the *remote's* `PATH`, because the hook runs on the machine Codex runs on, so install agent-mux there first; the installer stops with an error if it can't find it. `--host` works for the Claude hook too (`agent-mux install-hooks --host <name>`).
+
+```bash
+agent-mux install-hooks --agent codex --host devbox
+```
+
+**Codex gates hooks on trust.** Codex runs a hook only after you approve it in Codex itself. The next time you start `codex` on that machine, it shows **"Hooks need review"**: choose *Trust all and continue* (or *Review hooks* to approve just the agent-mux one). Until you do, Codex silently skips the hook. Trust is tied to the exact command and its position in `hooks.json`, so re-running the installer after moving the `agent-mux` binary asks you to review it again. The installer reports where the hook stands (from the `[hooks.state]` table in `~/.codex/config.toml`), and while it's untrusted the dashboard shows a reminder in the footer at startup (for a remote host, once that host's discovery finishes, prefixed with the host name), and agent-mux never writes that trust itself; trusting the hook is your decision, made in Codex.
 
 Codex's turn-complete state needs no hook — it comes from the rollout's `task_complete` event. Earlier agent-mux versions also installed a `Stop` handler; re-running the installer removes it.
 

@@ -188,6 +188,10 @@ Codex's turn-complete state needs no hook — it comes from the rollout's `task_
 
 Pi has no built-in permission gates, so it needs no hook for parity; a lower-latency extension is a possible future add.
 
+### Live smoke test (for contributors)
+
+`scripts/codex-e2e/smoke.sh [local|remote|all]` runs real `codex` in tmux against a localhost mock of the model API, so it costs nothing and needs no login. It drives an approval turn and a patch turn, and checks the dashboard rows and the notifications, which are captured instead of shown. `remote` repeats the run against a fake SSH host on the same machine. It needs `codex`, `tmux`, `python3` and `git`, plus GNU `find` for `remote`, and takes about 40 seconds. It isn't part of `cargo test`.
+
 ### Documented gaps
 
 Per-agent capability limits at this release. They are documented here rather than papered over in the UI:

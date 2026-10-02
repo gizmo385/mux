@@ -234,7 +234,7 @@ Ordered so that every step is shippable and Claude-only stays unchanged. A "pure
 
 **Test strategy:**
 - A conformance suite, golden `SourceEvent` sequences per harness, run against each built-in harness's real fixtures (Codex now has real interactive rollouts under `tests/fixtures/codex/`).
-- The zero-cost **mock-model E2E rig** proven on 2026-10-02 (real `codex` in tmux against a localhost Responses-API stub, with an `osascript` shim capturing notifications) graduates into `scripts/` as a repeatable smoke test.
+- The zero-cost **mock-model E2E rig** proven on 2026-10-02 (real `codex` in tmux against a localhost Responses-API stub, with an `osascript` shim capturing notifications) graduated into `scripts/codex-e2e/smoke.sh` (2026-10-02; local and loopback-SSH remote). The per-harness smoke scenarios hang off it.
 
 ## 6. Risks
 

@@ -202,6 +202,35 @@ impl SessionCatalog {
         None
     }
 
+    /// Release a *blocking* hook pin because the prompt behind it is
+    /// known to be gone — the falling edge of a pane-title signal (codex's
+    /// `[ ! ] Action Required` title clearing once the user answers). The
+    /// agent is back at work, so attention returns to `Working` and the
+    /// blocking flag clears; the next transcript update re-derives from
+    /// there. Returns the previous attention iff a blocking pin was
+    /// released, so the caller can feed the notifier the transition out of
+    /// `NeedsInput` (which re-arms its episodic flag for the turn-end
+    /// toast).
+    ///
+    /// A no-op when there is no blocking pin: the heuristic has already
+    /// moved past the prompt (a denied approval that aborted the turn, or
+    /// a turn that finished before this edge was seen), and overwriting
+    /// that state with `Working` would be wrong.
+    pub fn release_blocking_pin(&mut self, id: &SessionId, at: SystemTime) -> Option<Attention> {
+        let session = self.sessions.iter_mut().find(|s| s.id == *id)?;
+        if session.hook_pinned.is_none() || !session.blocking_prompt {
+            return None;
+        }
+        let previous = session.attention;
+        session.hook_pinned = None;
+        session.blocking_prompt = false;
+        session.attention = Attention::Working;
+        if previous != Attention::Working {
+            session.attention_entered_at = Some(at);
+        }
+        Some(previous)
+    }
+
     /// Hold a hook event whose session isn't in the catalog yet — the
     /// [`Self::apply_hook_event`] `None` case. The marker file is already
     /// consumed by then, so dropping the event would lose the "blocked"
@@ -890,6 +919,49 @@ mod tests {
             false,
         );
         assert_eq!(c.sessions()[0].attention_entered_at, Some(at(50)));
+    }
+
+    #[test]
+    fn release_blocking_pin_returns_to_working_and_unpins() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        c.apply_hook_event(&id, true, at(10));
+        assert_eq!(
+            c.release_blocking_pin(&id, at(20)),
+            Some(Attention::NeedsInput)
+        );
+        let s = &c.sessions()[0];
+        assert_eq!(s.attention, Attention::Working);
+        assert!(!s.blocking_prompt);
+        assert_eq!(s.hook_pinned, None);
+        assert_eq!(s.attention_entered_at, Some(at(20)));
+        // Unpinned: an open-turn `tool_use`-style Working update now
+        // applies, and the turn end transitions into NeedsInput.
+        assert_eq!(
+            c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(30)), false),
+            Some(Attention::Working)
+        );
+    }
+
+    #[test]
+    fn release_blocking_pin_is_a_noop_once_the_heuristic_moved_on() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        c.apply_hook_event(&id, true, at(10));
+        // The turn ended (or was aborted) past the pin before the title
+        // edge arrived: the heuristic released it already.
+        c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(15)), false);
+        assert_eq!(c.release_blocking_pin(&id, at(20)), None);
+        assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
+        // A non-blocking pin (a turn-end nudge) isn't a prompt to clear.
+        c.apply_hook_event(&id, false, at(25));
+        assert_eq!(c.release_blocking_pin(&id, at(30)), None);
+        assert!(
+            c.release_blocking_pin(&SessionId("ghost".into()), at(30))
+                .is_none()
+        );
     }
 
     #[test]

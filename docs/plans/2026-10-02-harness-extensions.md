@@ -270,6 +270,12 @@ The best signals come from what **each agent already exposes in structured form*
   - the HTTP/adapter source for the work harness
 - **The work harness** stays an adapter-backed source (§4.5). Its API's task states map onto `SessionState` the same way A2A's `working` / `input-required` / `completed` would.
 
+## 8. Open questions
+
+- Does the work harness's API **push** events (webhooks, SSE) or only support polling? This decides whether `HttpSource` needs a long-lived connection.
+- What does "attach" mean for a remote task: a log stream, an interactive shell in the task's sandbox, or a web URL? This decides which `AttachPlan` variants the work adapter needs first.
+- Should `Done`/`Failed` sessions age out of the sidebar, as idle sessions effectively do today?
+
 ## 9. Adapter-protocol spike (2026-10-02)
 
 A fake task-execution HTTP API was put behind a ~150-line stdlib-Python adapter, which agent-mux supervised as a child process. That drove real rows end to end (tests, plus a live TUI run):
@@ -295,9 +301,3 @@ The agent-mux side was about 470 lines plus about 100 of glue, with **no spine r
 **State vocabulary.** The spike confirms §7's ACP-aligned `SessionState`, with one addition: ACP's `cancelled` stop reason and A2A's `canceled` fold into `AwaitingInput { stop_reason: Cancelled }` for conversational harnesses, and into `Failed { reason }` for task-shaped ones. No separate variant.
 
 **Estimate.** About 2–3 weeks of focused work for a shippable adapter harness on the refactored spine (H1 1–2 d, H2 3–4 d, H3 2–3 d, H4 2–3 d, H5 1–2 d, H7 2–3 d). A spike-shaped adapter behind a flag would take 3–4 days, but isn't recommended beyond a private trial.
-
-## 8. Open questions
-
-- Does the work harness's API **push** events (webhooks, SSE) or only support polling? This decides whether `HttpSource` needs a long-lived connection.
-- What does "attach" mean for a remote task: a log stream, an interactive shell in the task's sandbox, or a web URL? This decides which `AttachPlan` variants the work adapter needs first.
-- Should `Done`/`Failed` sessions age out of the sidebar, as idle sessions effectively do today?

@@ -4137,7 +4137,8 @@ fn init_hook_watcher(
 /// One-shot startup footer hint when Codex is enabled and its agent-mux
 /// `PermissionRequest` hook is installed but Codex won't run it (never
 /// trusted at Codex's "Hooks need review" prompt, or disabled there).
-/// Without it a blocked Codex session silently reads as working. Like any
+/// Since the pane-title signal that only matters for codex outside tmux,
+/// where a blocked session would silently read as working. Like any
 /// footer status it clears on the next keypress. A missing hook stays
 /// quiet — installing it is opt-in and the README covers it. Local host
 /// only: remote hosts get the same hint from their discovery thread
@@ -4156,10 +4157,10 @@ fn codex_hook_hint_text(trust: &agent_mux::hook_install::CodexHookTrust) -> Opti
     use agent_mux::hook_install::CodexHookTrust;
     match trust {
         CodexHookTrust::Untrusted => Some(
-            "codex approvals won't show as blocked: trust the agent-mux hook at codex's \"Hooks need review\" prompt",
+            "codex hook untrusted: approvals outside tmux won't show as blocked (trust it at codex's \"Hooks need review\" prompt)",
         ),
         CodexHookTrust::Disabled => Some(
-            "codex approvals won't show as blocked: the agent-mux hook is disabled in codex's hooks review",
+            "codex hook disabled in codex's hooks review: approvals outside tmux won't show as blocked",
         ),
         CodexHookTrust::NotInstalled | CodexHookTrust::Trusted => None,
     }

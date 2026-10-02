@@ -357,12 +357,14 @@ pub fn describe_codex_trust(trust: &CodexHookTrust) -> Option<&'static str> {
         CodexHookTrust::Untrusted => Some(
             "Codex will NOT run this hook until you trust it. Start `codex` once on this \
              machine and choose \"Trust all and continue\" (or \"Review hooks\") at the \
-             \"Hooks need review\" prompt. Until then a Codex session waiting on an \
-             approval reads as working in agent-mux.",
+             \"Hooks need review\" prompt. Codex sessions in tmux don't need it (agent-mux \
+             reads their \"Action Required\" pane title); until it's trusted, an approval \
+             in a Codex session outside tmux reads as working in agent-mux.",
         ),
         CodexHookTrust::Disabled => Some(
             "The agent-mux hook is disabled in Codex's hooks review; re-enable it there \
-             or Codex approvals won't surface in agent-mux.",
+             or approvals in Codex sessions outside tmux won't surface in agent-mux \
+             (sessions in tmux are covered by their pane title).",
         ),
         CodexHookTrust::Trusted => Some(
             "Codex has a trust record for this hook. If you just changed it, Codex will \

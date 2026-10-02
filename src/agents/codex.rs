@@ -29,7 +29,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::agent::{AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta};
+use crate::agent::{
+    AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta,
+    bounded_last_message,
+};
 use crate::session::{Attention, EDITED_FILES_CAP, SessionId};
 
 /// Length of a canonical UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
@@ -314,6 +317,10 @@ enum TurnState {
 /// the same `continue`, exactly like the Claude parser.
 fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
     let mut last_turn: Option<TurnState> = None;
+    // `last_agent_message` of the latest turn-complete event, reset by any
+    // later turn event (a fresh `task_started`, or an abort, which carries
+    // no final message) — so it is `Some` only on a completed-turn tail.
+    let mut last_message: Option<String> = None;
     let mut chronological: Vec<PathBuf> = Vec::new();
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -334,9 +341,22 @@ fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
             // are matched so attention survives the rename in either
             // direction, which is exactly the ~daily schema churn this parser
             // is built to absorb.
-            "turn_started" | "task_started" => last_turn = Some(TurnState::Working),
-            "turn_complete" | "turn_aborted" | "task_complete" | "task_aborted" => {
+            "turn_started" | "task_started" => {
+                last_turn = Some(TurnState::Working);
+                last_message = None;
+            }
+            // A completed turn carries the final answer as
+            // `last_agent_message` (persisted by 0.142.5, verified against
+            // the rust-v0.142.5 source 2026-10-02) — the turn-end toast body.
+            "turn_complete" | "task_complete" => {
                 last_turn = Some(TurnState::NeedsInput);
+                last_message = event_field(event, "last_agent_message")
+                    .and_then(Value::as_str)
+                    .and_then(bounded_last_message);
+            }
+            "turn_aborted" | "task_aborted" => {
+                last_turn = Some(TurnState::NeedsInput);
+                last_message = None;
             }
             // Legacy mode: `patch_apply_end` carries a `changes` map keyed
             // by edited path.
@@ -370,6 +390,7 @@ fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
         // the prompt, so it stays `false` and releases the pin.
         from_tool_use: matches!(last_turn, Some(TurnState::Working)),
         edited_files: dedup_most_recent_first(&chronological),
+        last_message,
     }
 }
 
@@ -851,6 +872,64 @@ mod tests {
         let d = derive(&content);
         assert_eq!(d.attention, Attention::NeedsInput);
         assert!(!d.from_tool_use);
+    }
+
+    // ---- derive: last_message (turn-end toast body) ----
+
+    /// A real interactive-TUI `task_complete` line from codex 0.142.5
+    /// (captured 2026-10-02 against a mock provider) — the final answer
+    /// rides `last_agent_message`.
+    const REAL_TASK_COMPLETE_WITH_MESSAGE: &str = r#"{"timestamp":"2026-10-02T07:17:13.611Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"01a0fb78-9f20-7d91-8b18-0f9c2693956d","last_agent_message":"mock reply","completed_at":1790925433,"duration_ms":51705,"time_to_first_token_ms":6043}}"#;
+    /// A real interactive `turn_aborted` line (0.142.5 never renamed this
+    /// one to `task_aborted`).
+    const REAL_TURN_ABORTED: &str = r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"01a0fb7a-8090-7952-a567-aae1697c0e7b","reason":"interrupted","completed_at":1790925519,"duration_ms":15282}}"#;
+
+    #[test]
+    fn derive_task_complete_carries_last_agent_message() {
+        let d = derive(&format!(
+            "{REAL_TASK_STARTED}\n{REAL_TASK_COMPLETE_WITH_MESSAGE}\n"
+        ));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(d.last_message.as_deref(), Some("mock reply"));
+    }
+
+    #[test]
+    fn derive_null_last_agent_message_is_none() {
+        let d = derive(&format!("{REAL_TASK_STARTED}\n{REAL_TASK_COMPLETE}\n"));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(d.last_message, None);
+    }
+
+    #[test]
+    fn derive_aborted_turn_has_no_last_message() {
+        // A completed turn followed by an aborted one: the toast must not
+        // replay the *earlier* turn's answer.
+        let d = derive(&format!(
+            "{REAL_TASK_COMPLETE_WITH_MESSAGE}\n{REAL_TASK_STARTED}\n{REAL_TURN_ABORTED}\n"
+        ));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(d.last_message, None);
+    }
+
+    #[test]
+    fn derive_open_turn_has_no_last_message() {
+        let d = derive(&format!(
+            "{REAL_TASK_COMPLETE_WITH_MESSAGE}\n{REAL_TASK_STARTED}\n"
+        ));
+        assert_eq!(d.attention, Attention::Working);
+        assert_eq!(d.last_message, None);
+    }
+
+    #[test]
+    fn derive_last_message_is_trimmed_and_bounded() {
+        let long = "y".repeat(crate::agent::LAST_MESSAGE_CAP + 500);
+        let line = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"task_complete","last_agent_message":"  {long}  "}}}}"#
+        );
+        let d = derive(&format!("{line}\n"));
+        let msg = d.last_message.expect("message carried");
+        assert_eq!(msg.chars().count(), crate::agent::LAST_MESSAGE_CAP);
+        assert!(msg.starts_with('y'));
     }
 
     #[test]

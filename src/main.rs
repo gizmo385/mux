@@ -2211,10 +2211,13 @@ impl App {
                             prev,
                             update.attention,
                             update.mtime,
-                            // Heuristic transitions carry no prompt
-                            // text; the body falls back to project
-                            // context in the formatter.
-                            None,
+                            // The agent's final assistant message (set
+                            // only on a NeedsInput derivation) is the
+                            // toast body — the transcript twin of the
+                            // hook path's `message`. `None` (mid-turn, or
+                            // a final entry with no text) falls back to
+                            // project context in the formatter.
+                            update.last_message.as_deref(),
                         );
                         // A turn-end (transition *into* NeedsInput) is
                         // both the moment programmatic file changes have
@@ -2341,8 +2344,10 @@ impl App {
     /// treat as live" — used by call sites without a source clock
     /// (e.g. the heuristic path whose `mtime` is often unavailable).
     ///
-    /// `message` is the Claude Code hook's prompt text on the hook path
-    /// (surfaced as the toast body), `None` on the heuristic path.
+    /// `message` is the toast body: the hook's prompt text on the hook
+    /// path, the agent's transcript-derived final assistant message on
+    /// the heuristic path (`None` when there is none — the formatter then
+    /// falls back to project context).
     /// `blocking` is read from the session's own `blocking_prompt` flag
     /// — the catalog set it just before this call (`apply_hook_event`
     /// on the hook path, `apply_heuristic_attention` clears it on the

@@ -194,10 +194,11 @@ const BODY_MESSAGE_CLIP: usize = 140;
 ///   ended, or an idle nudge). No `agent-mux:` prefix — `notify-rust`
 ///   already sets the app name, so the prefix only wasted the line the
 ///   user scans first.
-/// - **Body** prefers the hook `message` — the actual prompt text,
+/// - **Body** prefers `message` — the hook's prompt text, or the agent's
+///   final assistant message on a turn end (hook or transcript-derived),
 ///   which is the single most useful datum — and falls back to the
-///   project's basename when there's no hook (the heuristic path). The
-///   host is appended only when remote; `local` is noise.
+///   project's basename when there's none. The host is appended only
+///   when remote; `local` is noise.
 #[must_use]
 fn format_notification(
     name: &str,
@@ -831,12 +832,14 @@ pub struct Transition<'a> {
     /// site. Drives both the title wording ("needs your input" vs
     /// "finished") and the Linux urgency hint (`Critical` when true).
     pub blocking: bool,
-    /// The Claude Code `Notification` hook's `message` field when this
-    /// transition was driven by a hook event (e.g. "Claude needs your
-    /// permission to use Bash", or an elicitation question) — the most
-    /// informative body text available. `None` on the heuristic path
-    /// (a transcript-derived transition has no prompt text), in which
-    /// case the body falls back to the project context.
+    /// The most informative body text available for this transition: on
+    /// the hook path, the hook event's `message` (e.g. "Claude needs your
+    /// permission to use Bash", an elicitation question, or a codex
+    /// `Stop`'s final assistant message); on the heuristic path, the
+    /// agent's final assistant message read from the transcript tail
+    /// ([`crate::agent::AgentDerivation::last_message`]). `None` when
+    /// neither is available (mid-turn derivations, a final entry with no
+    /// text), in which case the body falls back to the project context.
     pub message: Option<&'a str>,
     /// True when the user is *actively engaged* with this specific
     /// session at transition time — the embedded PTY pane currently

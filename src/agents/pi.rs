@@ -34,7 +34,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::agent::{AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta};
+use crate::agent::{
+    AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta,
+    bounded_last_message,
+};
 use crate::session::{Attention, EDITED_FILES_CAP, SessionId};
 
 /// Max display length (in chars) for the first-user-message title fallback.
@@ -347,6 +350,10 @@ fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
     // Raw path strings, oldest-first — resolved to absolute paths *after*
     // the walk, once the base cwd (passed, or header fallback) is known.
     let mut raw_paths: Vec<String> = Vec::new();
+    // Text of the latest classified message when it is an awaiting
+    // assistant turn; reset by any later classified message, so it is
+    // `Some` only when the derivation lands on NeedsInput.
+    let mut last_message: Option<String> = None;
 
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -362,6 +369,10 @@ fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
             }
             Some("message") => {
                 if let Some(tail) = classify_message(&value) {
+                    last_message = match tail {
+                        PiTail::AssistantAwaiting => assistant_text(&value),
+                        _ => None,
+                    };
                     last = Some(tail);
                 }
                 collect_edited_paths(&value, &mut raw_paths);
@@ -397,7 +408,30 @@ fn derive_from_content(content: &str, cwd: &Path) -> AgentDerivation {
         attention,
         from_tool_use,
         edited_files: dedup_most_recent_first(&chronological),
+        last_message,
     }
+}
+
+/// Concatenate the `text` content blocks of an assistant `message` entry
+/// (`thinking` / `toolCall` blocks skipped), bounded via
+/// [`bounded_last_message`]. `None` when the message carries no text.
+fn assistant_text(value: &Value) -> Option<String> {
+    let content = value.get("message")?.get("content")?;
+    if let Some(s) = content.as_str() {
+        return bounded_last_message(s);
+    }
+    let mut buf = String::new();
+    for block in content.as_array()? {
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(text) = block.get("text").and_then(Value::as_str)
+        {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(text);
+        }
+    }
+    bounded_last_message(&buf)
 }
 
 /// Classify a `message` entry by `message.role`. Assistant messages split on
@@ -828,6 +862,37 @@ mod tests {
         let d = derive(&assistant("stop"));
         assert_eq!(d.attention, Attention::NeedsInput);
         assert!(!d.from_tool_use);
+    }
+
+    // ---- derive: last_message (turn-end toast body) ----
+
+    #[test]
+    fn derive_stop_carries_text_content_blocks() {
+        // Real v3 shape: thinking + text + toolCall blocks; only the text
+        // reaches the toast body.
+        let line = r#"{"type":"message","id":"a9","parentId":"u1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"All done."},{"type":"toolCall","id":"t1","name":"read","arguments":{"path":"a.rs"}}],"provider":"anthropic","model":"m","stopReason":"stop"}}"#;
+        let d = derive(&format!("{}\n{line}\n", user_msg()));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(d.last_message.as_deref(), Some("All done."));
+    }
+
+    #[test]
+    fn derive_stop_with_string_content_carries_it() {
+        assert_eq!(
+            derive(&assistant("stop")).last_message.as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn derive_tool_use_has_no_last_message() {
+        let d = derive(&format!(
+            "{}\n{}\n",
+            assistant("stop"),
+            assistant("toolUse")
+        ));
+        assert_eq!(d.attention, Attention::Working);
+        assert_eq!(d.last_message, None);
     }
 
     #[test]

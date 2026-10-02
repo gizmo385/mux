@@ -60,6 +60,13 @@ pub struct AttentionUpdate {
     /// stays current as the conversation runs. Empty when the tail held
     /// no edits or couldn't be read.
     pub edited_files: Vec<PathBuf>,
+    /// The agent's final assistant message when `attention` is
+    /// `NeedsInput` (see [`crate::agent::AgentDerivation::last_message`]).
+    /// The main loop hands it to the notifier as the toast body on the
+    /// heuristic path — the transcript-derived twin of the hook path's
+    /// `message`. `None` mid-turn, on an unreadable tail, or when the
+    /// final entry carried no text.
+    pub last_message: Option<String>,
 }
 
 /// Events emitted by the watcher. `Attention` flows from filesystem events
@@ -285,6 +292,7 @@ impl TranscriptWatcher {
                 from_tool_use: detail.from_tool_use,
                 mtime,
                 edited_files: detail.edited_files,
+                last_message: detail.last_message,
             }));
         }
 
@@ -346,6 +354,7 @@ impl TranscriptWatcher {
                             from_tool_use: detail.from_tool_use,
                             mtime,
                             edited_files: detail.edited_files,
+                            last_message: detail.last_message,
                         })
                     } else {
                         // A previously-unknown transcript: its agent is the
@@ -421,6 +430,7 @@ impl TranscriptWatcher {
             from_tool_use: detail.from_tool_use,
             mtime,
             edited_files: detail.edited_files,
+            last_message: detail.last_message,
         }));
         Ok(())
     }
@@ -749,6 +759,7 @@ fn poll_once(
                         from_tool_use: detail.from_tool_use,
                         mtime: Some(stat.mtime),
                         edited_files: detail.edited_files,
+                        last_message: detail.last_message,
                     }))
                     .is_err()
                 {
@@ -809,6 +820,7 @@ fn poll_once(
                 from_tool_use: detail.from_tool_use,
                 mtime: Some(stat.mtime),
                 edited_files: detail.edited_files,
+                last_message: detail.last_message,
             }))
             .is_err()
         {
@@ -866,6 +878,7 @@ pub fn derive_attention_detail(
             attention: Attention::Unknown,
             from_tool_use: false,
             edited_files: Vec::new(),
+            last_message: None,
         };
     };
     let detail = cli.derive(&tail, cwd);
@@ -911,6 +924,32 @@ mod tests {
     // classification (stop-reason handling, edited-file extraction) is
     // pinned in the reference-agent module; the fixtures here stay minimal and
     // agent-neutral so this module carries no transcript-field coupling.
+
+    #[test]
+    fn detail_carries_last_message_through_the_host_read() {
+        // The tail read hands the agent's final message through to the
+        // `AttentionUpdate` the producers build from this detail.
+        let f = write_jsonl(&[
+            r#"{"type":"user","message":"hi"}"#,
+            r#"{"type":"assistant","message":"hello there"}"#,
+        ]);
+        let d = derive_attention_detail(&host(), f.path(), AgentKind::Claude, Path::new(""));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(d.last_message.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn escalated_read_still_yields_last_message() {
+        // A final message larger than the default tail window is only
+        // whole in the escalated read; the toast body must survive it.
+        let big = "z".repeat(40 * 1024);
+        let line = format!(r#"{{"type":"assistant","message":"{big}"}}"#);
+        let f = write_jsonl(&[r#"{"type":"user","message":"hi"}"#, &line]);
+        let d = derive_attention_detail(&host(), f.path(), AgentKind::Claude, Path::new(""));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        let msg = d.last_message.expect("escalated read carries the message");
+        assert_eq!(msg.chars().count(), crate::agent::LAST_MESSAGE_CAP);
+    }
 
     #[test]
     fn only_housekeeping_entries_is_unknown() {

@@ -115,6 +115,31 @@ pub struct AgentDerivation {
     /// most-recent-first, deduplicated, capped at
     /// [`crate::session::EDITED_FILES_CAP`].
     pub edited_files: Vec<PathBuf>,
+    /// The agent's final assistant message text, set only when `attention`
+    /// is [`Attention::NeedsInput`] (a turn just ended) and the scanned
+    /// buffer carries it. Rides the watcher's `Attention` event so the
+    /// heuristic path's turn-end toast gets the same body text the hook
+    /// path's `message` gives it. Trimmed, never empty, and bounded by
+    /// [`LAST_MESSAGE_CAP`] (the notifier clips further for display).
+    pub last_message: Option<String>,
+}
+
+/// Upper bound (in chars) on [`AgentDerivation::last_message`]. A final
+/// answer can be many KB; only the first line or so ever reaches a toast,
+/// so there is no point carrying the whole thing through the channel.
+pub const LAST_MESSAGE_CAP: usize = 2048;
+
+/// Normalise a candidate final-message string for
+/// [`AgentDerivation::last_message`]: trim, drop if empty, clip to
+/// [`LAST_MESSAGE_CAP`] chars. Shared by every agent's parser so the bound
+/// and emptiness rules can't drift between agents.
+#[must_use]
+pub fn bounded_last_message(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(LAST_MESSAGE_CAP).collect())
 }
 
 /// How a new session is created. Two strategies exist in the wild.

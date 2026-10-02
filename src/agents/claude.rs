@@ -6,7 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::{AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta};
+use crate::agent::{
+    AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta,
+    bounded_last_message,
+};
 use crate::session::{Attention, EDITED_FILES_CAP, SessionId};
 
 /// Unit-struct [`AgentCli`] for Claude Code. Registered as a `&'static` in
@@ -217,11 +220,19 @@ fn normalize_for_title(raw: &str) -> String {
 /// within the buffer (same walk, one pass over the lines).
 fn derive_from_content(transcript: &str) -> AgentDerivation {
     let mut last: Option<EntryKind> = None;
+    // The final message text, captured only from an `AssistantAwaiting`
+    // entry and reset by any later classified entry — so it is `Some`
+    // only when the derivation lands on NeedsInput.
+    let mut last_message: Option<String> = None;
     for line in transcript.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if let Some(kind) = classify(&value) {
+            last_message = match kind {
+                EntryKind::AssistantAwaiting => assistant_text(&value),
+                _ => None,
+            };
             last = Some(kind);
         }
     }
@@ -236,7 +247,34 @@ fn derive_from_content(transcript: &str) -> AgentDerivation {
         attention,
         from_tool_use: matches!(last, Some(EntryKind::AssistantToolUse)),
         edited_files: edited_files_from_content(transcript),
+        last_message,
     }
+}
+
+/// Concatenate the `text` blocks of an assistant entry's `message.content`
+/// (thinking / `tool_use` blocks skipped), bounded via
+/// [`bounded_last_message`]. `None` when the entry carries no text.
+fn assistant_text(entry: &serde_json::Value) -> Option<String> {
+    let message = entry.get("message")?;
+    if let Some(s) = message.as_str() {
+        return bounded_last_message(s);
+    }
+    let content = message.get("content")?;
+    if let Some(s) = content.as_str() {
+        return bounded_last_message(s);
+    }
+    let mut buf = String::new();
+    for block in content.as_array()? {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+            && let Some(text) = block.get("text").and_then(serde_json::Value::as_str)
+        {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(text);
+        }
+    }
+    bounded_last_message(&buf)
 }
 
 /// Tool names whose `tool_use` blocks represent a file edit. `Read`,
@@ -493,6 +531,47 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":\"hello\"}\n",
         ));
         assert_eq!(d.attention, Attention::NeedsInput);
+    }
+
+    // ---- derive: last_message (turn-end toast body) ----
+
+    #[test]
+    fn derive_end_turn_carries_final_text_blocks() {
+        // Real shape: thinking + text blocks on an end_turn entry; only
+        // the text reaches the toast body.
+        let d = derive(concat!(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix it\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[",
+            "{\"type\":\"thinking\",\"thinking\":\"hmm\"},",
+            "{\"type\":\"text\",\"text\":\"  Fixed the parser.\"},",
+            "{\"type\":\"text\",\"text\":\"Tests pass.  \"}]}}\n",
+        ));
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(
+            d.last_message.as_deref(),
+            Some("Fixed the parser.\nTests pass.")
+        );
+    }
+
+    #[test]
+    fn derive_tool_use_tail_has_no_last_message() {
+        // The text-bearing entry is superseded by a later tool_use one.
+        let d = derive(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"earlier\"}]}}\n",
+            "{\"type\":\"user\",\"message\":\"go on\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"tool_use\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n",
+        ));
+        assert_eq!(d.attention, Attention::Working);
+        assert_eq!(d.last_message, None);
+    }
+
+    #[test]
+    fn derive_needs_input_without_text_has_no_last_message() {
+        let d = derive(
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\",\"content\":[]}}",
+        );
+        assert_eq!(d.attention, Attention::NeedsInput);
+        assert_eq!(d.last_message, None);
     }
 
     #[test]

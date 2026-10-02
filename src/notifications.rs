@@ -685,10 +685,7 @@ impl Notifier {
             return;
         }
         if let Some(last) = entry.last_fired
-            && now
-                .duration_since(last)
-                .ok()
-                .is_some_and(|d| d < DEBOUNCE_WINDOW)
+            && now.duration_since(last).is_ok_and(|d| d < DEBOUNCE_WINDOW)
         {
             return;
         }
@@ -738,10 +735,7 @@ impl Notifier {
                 continue;
             }
             if let Some(last) = entry.last_fired
-                && now
-                    .duration_since(last)
-                    .ok()
-                    .is_some_and(|d| d < DEBOUNCE_WINDOW)
+                && now.duration_since(last).is_ok_and(|d| d < DEBOUNCE_WINDOW)
             {
                 continue;
             }

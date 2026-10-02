@@ -59,7 +59,9 @@ use agent_mux::session::{Attention, HostId, Session, SessionId};
 use agent_mux::session_builder::SessionBuilders;
 use agent_mux::session_names::{SessionNameStore, default_store_path};
 use agent_mux::tool_launches::{ToolLaunch, ToolLaunchRegistry};
-use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent};
+use agent_mux::watcher::{
+    LOCAL_POLL_INTERVAL, REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent,
+};
 use agent_mux::worktree::WorktreeManager;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -898,6 +900,11 @@ impl App {
         // Local pane-presence polling; remotes get theirs in
         // `drain_remote_discoveries` once each `SshHost` is connected.
         watcher.start_pane_polling_host(Arc::clone(&local_host), REMOTE_POLL_INTERVAL);
+        // mtime-poll backstop for local transcripts: catches writes the
+        // platform watcher misses (macOS FSEvents + a writer that holds the
+        // file open, i.e. codex) and attaches agent roots created after
+        // startup. `notify` stays the fast path.
+        watcher.start_local_backstop(LOCAL_POLL_INTERVAL);
 
         let notifier = build_notifier(&config.notifications);
         let theme = Theme::from_config(&config.theme).map_err(io::Error::other)?;

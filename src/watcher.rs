@@ -24,6 +24,27 @@ const TAIL_BYTES: u64 = 32 * 1024;
 /// Becomes configurable in M5.
 pub const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Interval of the *local* mtime-poll backstop (see
+/// [`TranscriptWatcher::start_local_backstop`]). Same cadence as the remote
+/// poller: `notify` stays the fast path, so this only bounds how stale a
+/// session can get when the platform watcher misses a write.
+pub const LOCAL_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Path → the mtime a producer last acted on (derived attention for, or
+/// announced). Shared between the local `notify` thread and the local
+/// backstop poller so a write one of them already handled isn't
+/// re-derived by the other; each remote poller owns its own.
+type LastSeen = Arc<Mutex<HashMap<PathBuf, SystemTime>>>;
+
+/// Per-host record of transcripts the dashboard has *accepted* into its
+/// catalog (it called [`TranscriptWatcher::track_new_transcript`], or the
+/// session was in the poller's discovery seed) → their session id. A
+/// poller announces a path as `NewTranscript` only while it is absent
+/// here, and re-announces it on every later write until it appears — so a
+/// transcript first seen stillborn (discovery drops it) surfaces once it
+/// has content, instead of being silently treated as known forever.
+type Registered = Arc<Mutex<HashMap<HostId, HashMap<PathBuf, SessionId>>>>;
+
 #[derive(Debug)]
 pub struct AttentionUpdate {
     pub id: SessionId,
@@ -170,8 +191,10 @@ pub enum WatcherEvent {
 pub struct TranscriptWatcher {
     /// Kept alive for the lifetime of the dashboard; dropping it tears
     /// the notify backend down. We also call `.watch` on it from
-    /// `add_target` in the no-recursive-root fallback path.
-    watcher: notify::RecommendedWatcher,
+    /// `add_target` in the no-recursive-root fallback path, and from the
+    /// local backstop thread to attach roots that appear after startup —
+    /// hence the shared lock.
+    watcher: Arc<Mutex<notify::RecommendedWatcher>>,
     /// Path → (session id, agent). The agent is stored per known target so
     /// a filesystem event routes to the right parser even in the per-file
     /// fallback mode where no recursive root is available to match against.
@@ -182,6 +205,15 @@ pub struct TranscriptWatcher {
     /// `add_target` falls back to per-file watches so the watcher still
     /// works in the degenerate no-discovery-root case.
     has_recursive_root: bool,
+    /// Every enabled agent's local root, watched or not — the backstop
+    /// poller lists all of them.
+    local_roots: Vec<(AgentKind, PathBuf)>,
+    /// Local roots whose recursive watch couldn't attach at startup
+    /// (directory absent — the agent hadn't run here yet). The backstop
+    /// thread retries them each tick.
+    unwatched_roots: Vec<(AgentKind, PathBuf)>,
+    local_last_seen: LastSeen,
+    registered: Registered,
 }
 
 /// Longest-prefix match of `path` against the watched roots, yielding the
@@ -219,10 +251,12 @@ impl TranscriptWatcher {
     /// The reference agent's (claude) root is created if missing so the
     /// watch attaches on first run — other agents' roots are watched only
     /// when present, because the directory's existence *is* the "installed
-    /// here" signal and fabricating it would defeat that. When no root can
-    /// be watched recursively (empty `roots`, or every watch failed), the
-    /// watcher falls back to per-file watches for the `initial` set and
-    /// `NewTranscript` events will not fire.
+    /// here" signal and fabricating it would defeat that; a root that
+    /// appears later is attached by [`Self::start_local_backstop`]. When no
+    /// root can be watched recursively (empty `roots`, or every watch
+    /// failed), the watcher falls back to per-file watches for the
+    /// `initial` set and `notify` emits no `NewTranscript` (the backstop
+    /// poller still does).
     ///
     /// Emits an initial `Attention` update for each session in `initial`
     /// synchronously before the watcher thread starts, so the UI never
@@ -254,6 +288,7 @@ impl TranscriptWatcher {
         let mut watcher = notify::recommended_watcher(notify_tx)?;
 
         let mut watched_roots: Vec<(AgentKind, PathBuf)> = Vec::new();
+        let mut unwatched_roots: Vec<(AgentKind, PathBuf)> = Vec::new();
         for (kind, root) in roots {
             if *kind == AgentKind::Claude {
                 // Byte-identical to the pre-WP2 first-run behaviour: create
@@ -264,6 +299,8 @@ impl TranscriptWatcher {
             }
             if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
                 watched_roots.push((*kind, root.clone()));
+            } else {
+                unwatched_roots.push((*kind, root.clone()));
             }
         }
         let has_recursive_root = !watched_roots.is_empty();
@@ -296,6 +333,15 @@ impl TranscriptWatcher {
             }));
         }
 
+        let local_last_seen: LastSeen = Arc::new(Mutex::new(
+            initial
+                .iter()
+                .filter_map(|(_, p, _)| {
+                    let m = fs::metadata(p).and_then(|m| m.modified()).ok()?;
+                    Some((p.clone(), m))
+                })
+                .collect(),
+        ));
         let targets: Arc<Mutex<HashMap<PathBuf, (SessionId, AgentKind)>>> = Arc::new(Mutex::new(
             initial.into_iter().map(|(id, p, k)| (p, (id, k))).collect(),
         ));
@@ -303,7 +349,12 @@ impl TranscriptWatcher {
         let targets_for_thread = Arc::clone(&targets);
         let event_tx_for_thread = event_tx.clone();
         let host_for_thread = Arc::clone(&host);
-        let roots_for_thread = watched_roots;
+        let last_seen_for_thread = Arc::clone(&local_last_seen);
+        // Route by *every* configured root, not just the ones watched at
+        // startup: a root attached later by the backstop thread then routes
+        // without the notify thread needing to learn about it. An unwatched
+        // root yields no events, so including it is free.
+        let roots_for_thread: Vec<(AgentKind, PathBuf)> = roots.to_vec();
         thread::spawn(move || {
             for res in notify_rx {
                 let Ok(event) = res else { continue };
@@ -341,6 +392,9 @@ impl TranscriptWatcher {
                         // vanished, filesystem hiccup) is fine; the
                         // catalog keeps its existing value.
                         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+                        if let Some(m) = mtime {
+                            record_seen(&last_seen_for_thread, &path, m);
+                        }
                         let detail = derive_attention_detail(
                             host_for_thread.as_ref(),
                             &path,
@@ -371,6 +425,7 @@ impl TranscriptWatcher {
                         let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) else {
                             continue;
                         };
+                        record_seen(&last_seen_for_thread, &path, mtime);
                         WatcherEvent::NewTranscript {
                             host: HostId::local(),
                             agent: kind,
@@ -387,14 +442,83 @@ impl TranscriptWatcher {
 
         Ok((
             Self {
-                watcher,
+                watcher: Arc::new(Mutex::new(watcher)),
                 targets,
                 event_tx,
                 host,
                 has_recursive_root,
+                local_roots: roots.to_vec(),
+                unwatched_roots,
+                local_last_seen,
+                registered: Arc::new(Mutex::new(HashMap::new())),
             },
             event_rx,
         ))
+    }
+
+    /// Spawn the local mtime-poll backstop: every `interval`, list each
+    /// enabled agent's local root and act on any transcript whose mtime
+    /// advanced past what the `notify` thread already handled — and retry
+    /// attaching the recursive watch for roots that didn't exist at
+    /// startup (an agent first run while agent-mux is up).
+    ///
+    /// Why it exists: on macOS, `FSEvents` doesn't report content writes to
+    /// a file another process holds open until that file is closed. Codex
+    /// keeps its rollout open for the whole session and appends through
+    /// that handle, so the `notify` path alone never sees a running local
+    /// codex session change (verified 2026-10-02 against codex 0.142.5 —
+    /// a held-open append produced no event until close). The file's mtime
+    /// *does* advance on every write, so an mtime poll catches it — the
+    /// mechanism the remote pollers already rely on. Agents that
+    /// open/append/close (Claude Code) are served by `notify`, which
+    /// records what it handled in the shared `last_seen` map, so the
+    /// poller costs them only a stat.
+    ///
+    /// All enabled roots are polled, not just agents known to hold files
+    /// open: how a writer behaves is an upstream detail that can change
+    /// under us. The cost is one directory walk + one stat per transcript
+    /// per tick on a background thread; tail reads happen only for files
+    /// whose mtime moved, and transcripts first seen older than
+    /// [`crate::discovery::DISCOVERY_MAX_AGE`] are baselined silently
+    /// rather than announced.
+    ///
+    /// Thread exits when the event receiver drops.
+    pub fn start_local_backstop(&self, interval: Duration) {
+        let tx = self.event_tx.clone();
+        let host = Arc::clone(&self.host);
+        let roots = self.local_roots.clone();
+        let mut unwatched = self.unwatched_roots.clone();
+        let watcher = Arc::clone(&self.watcher);
+        let targets = Arc::clone(&self.targets);
+        let last_seen = Arc::clone(&self.local_last_seen);
+        thread::spawn(move || {
+            let host_id = host.id().clone();
+            // Discovery's reject verdicts are only snapshotted for remote
+            // hosts; locally a re-announced reject costs a disk read, not
+            // SSH round-trips.
+            let no_rejects = Mutex::new(HashMap::new());
+            let registered = |path: &Path| -> Option<SessionId> {
+                targets
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(path).map(|(id, _)| id.clone()))
+            };
+            loop {
+                thread::sleep(interval);
+                attach_late_roots(&watcher, &mut unwatched);
+                let ctx = PollCtx {
+                    last_seen: &last_seen,
+                    registered: &registered,
+                    rejected: &no_rejects,
+                    stale_before: crate::discovery::default_cutoff(),
+                };
+                for (kind, root) in &roots {
+                    if !poll_once(host.as_ref(), &host_id, root, *kind, &ctx, &tx) {
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     /// Register a newly-discovered transcript so future filesystem events
@@ -415,11 +539,16 @@ impl TranscriptWatcher {
         path: PathBuf,
         kind: AgentKind,
     ) -> notify::Result<()> {
-        if !self.has_recursive_root {
-            self.watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        if !self.has_recursive_root
+            && let Ok(mut w) = self.watcher.lock()
+        {
+            w.watch(&path, RecursiveMode::NonRecursive)?;
         }
         let detail = derive_attention_detail(self.host.as_ref(), &path, kind, Path::new(""));
         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if let Some(m) = mtime {
+            record_seen(&self.local_last_seen, &path, m);
+        }
         if let Ok(mut targets) = self.targets.lock() {
             targets.insert(path, (id.clone(), kind));
         }
@@ -435,11 +564,14 @@ impl TranscriptWatcher {
         Ok(())
     }
 
-    /// Register a `NewTranscript`-discovered session with the watcher.
-    /// For the local recursive watch this forwards to [`Self::add_target`]
-    /// so subsequent filesystem events route as `Attention`. For hosts
-    /// driven by a polling thread this is a no-op because the poll loop
-    /// already owns the path → session-id mapping for its host.
+    /// Register a `NewTranscript`-discovered session with the watcher —
+    /// the dashboard's "accepted into the catalog" signal. For the local
+    /// recursive watch this forwards to [`Self::add_target`] so subsequent
+    /// filesystem events route as `Attention`. For hosts driven by a
+    /// polling thread it records the path in the shared registry the
+    /// poller consults: until a path is registered the poller keeps
+    /// re-announcing it on each write (it may have been dropped as
+    /// stillborn); once registered, writes become `Attention` updates.
     ///
     /// # Errors
     /// Propagates [`Self::add_target`]'s error in the local case.
@@ -453,6 +585,9 @@ impl TranscriptWatcher {
         if host.is_local() {
             self.add_target(id, path, kind)
         } else {
+            if let Ok(mut reg) = self.registered.lock() {
+                reg.entry(host.clone()).or_default().insert(path, id);
+            }
             Ok(())
         }
     }
@@ -499,9 +634,30 @@ impl TranscriptWatcher {
         interval: Duration,
     ) {
         let tx = self.event_tx.clone();
+        let host_id = host.id().clone();
+        let registered = Arc::clone(&self.registered);
+        let last_seen: Mutex<HashMap<PathBuf, SystemTime>> = Mutex::new(
+            initial
+                .iter()
+                .map(|(_, path, mtime)| (path.clone(), *mtime))
+                .collect(),
+        );
+        let rejected: Mutex<HashMap<PathBuf, SystemTime>> =
+            Mutex::new(rejected.into_iter().map(|r| (r.path, r.mtime)).collect());
+        // The discovery seed is, by definition, accepted by the catalog.
+        if let Ok(mut reg) = registered.lock() {
+            let entry = reg.entry(host_id.clone()).or_default();
+            for (id, path, _) in initial {
+                entry.insert(path, id);
+            }
+        }
         thread::spawn(move || {
-            let host_id = host.id().clone();
-            let mut state = PollState::new(initial, rejected);
+            let lookup = |path: &Path| -> Option<SessionId> {
+                registered
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.get(&host_id).and_then(|m| m.get(path).cloned()))
+            };
             // WP8: hook markers live under each enabled agent's
             // `<root>/.agent-mux-hooks/` (claude + codex today). Poll each
             // one per tick over the same ControlMaster — an idle N-agent
@@ -542,16 +698,19 @@ impl TranscriptWatcher {
                         continue;
                     }
                 }
-                // Re-resolve the admission cutoff so the window slides
-                // with the clock rather than freezing at process start.
-                state.cutoff = crate::discovery::default_cutoff();
                 // One `find` per enabled agent root per tick. An idle
                 // N-agent host therefore costs N cheap finds (mtime-skip
                 // keeps the per-transcript reads down to actual changes);
                 // only *enabled* agents cost anything, and a root whose
                 // directory doesn't exist folds into an empty listing.
+                let ctx = PollCtx {
+                    last_seen: &last_seen,
+                    registered: &lookup,
+                    rejected: &rejected,
+                    stale_before: crate::discovery::default_cutoff(),
+                };
                 for (kind, root) in &roots {
-                    if !poll_once(host.as_ref(), &host_id, root, *kind, &mut state, &tx) {
+                    if !poll_once(host.as_ref(), &host_id, root, *kind, &ctx, &tx) {
                         return;
                     }
                 }
@@ -684,133 +843,139 @@ fn poll_hooks_once(host: &dyn Host, hooks_dir: &Path, tx: &Sender<WatcherEvent>)
     true
 }
 
-/// State the per-host polling loop carries between ticks, shared across
-/// every (agent, root) pair on that host.
-///
-/// Both maps exist to answer "have I already dealt with this path?"
-/// without touching the network. `known` answers it for paths that
-/// became sessions; `rejected` answers it for paths startup discovery
-/// deliberately declined — a distinction that matters because only the
-/// former reach the catalog, and therefore only the former survive into
-/// the disk cache that seeds the next launch.
-pub(crate) struct PollState {
-    /// Path → (session id, the newest mtime we've already reported).
-    known: HashMap<PathBuf, (SessionId, SystemTime)>,
+/// Inputs one poll tick shares with its caller: the mtime bookkeeping,
+/// the "has the dashboard accepted this path?" lookup, discovery's
+/// standing rejects, and the age below which a never-seen transcript is
+/// baselined rather than announced.
+struct PollCtx<'a> {
+    last_seen: &'a Mutex<HashMap<PathBuf, SystemTime>>,
+    registered: &'a dyn Fn(&Path) -> Option<SessionId>,
     /// Path → the mtime a discovery verdict of "not a session" was made
-    /// against. Seeded from the previous run's reject cache. A path in
-    /// here is skipped silently while its mtime is unchanged; a write to
-    /// the file invalidates the verdict and the path is reconsidered.
-    rejected: HashMap<PathBuf, SystemTime>,
-    /// Transcripts with an mtime older than this are never *announced*
-    /// as new. Mirrors the cutoff [`crate::discovery::discover`] applies,
-    /// refreshed each tick so the window slides with the clock. Sessions
-    /// already in `known` are unaffected — this gates admission, not
-    /// tracking.
-    cutoff: SystemTime,
+    /// against, seeded from the previous run's reject cache. An
+    /// unregistered path in here is not announced while its mtime is
+    /// unchanged; a write invalidates the verdict and the path is
+    /// reconsidered. Paths that became sessions never land here — only
+    /// they reach the catalog, and so the session cache `registered` is
+    /// seeded from.
+    rejected: &'a Mutex<HashMap<PathBuf, SystemTime>>,
+    /// Discovery's [`crate::discovery::default_cutoff`], re-resolved each
+    /// tick so the window slides with the clock.
+    stale_before: SystemTime,
 }
 
-impl PollState {
-    pub(crate) fn new(
-        initial: Vec<(SessionId, PathBuf, SystemTime)>,
-        rejected: Vec<crate::discovery::RejectedTranscript>,
-    ) -> Self {
-        Self {
-            known: initial
-                .into_iter()
-                .map(|(id, path, mtime)| (path, (id, mtime)))
-                .collect(),
-            rejected: rejected.into_iter().map(|r| (r.path, r.mtime)).collect(),
-            cutoff: crate::discovery::default_cutoff(),
+/// Record that `path` was handled at `mtime`, never moving it backwards.
+fn record_seen(last_seen: &Mutex<HashMap<PathBuf, SystemTime>>, path: &Path, mtime: SystemTime) {
+    if let Ok(mut m) = last_seen.lock() {
+        let e = m.entry(path.to_path_buf()).or_insert(mtime);
+        if mtime > *e {
+            *e = mtime;
         }
     }
 }
 
-/// One tick of the remote poller. Returns `false` iff the receiver
-/// dropped (the dashboard exited), at which point the caller exits
-/// the loop. Errors from `list_transcripts` are swallowed — a
-/// transient SSH hiccup must not stop the polling cadence, and the
-/// next tick retries from scratch.
+/// Retry the recursive `notify` watch for local roots that didn't exist at
+/// startup; a root that attaches is dropped from `unwatched`. Events under
+/// it route immediately because the notify thread routes by every
+/// configured root.
+fn attach_late_roots(
+    watcher: &Mutex<notify::RecommendedWatcher>,
+    unwatched: &mut Vec<(AgentKind, PathBuf)>,
+) {
+    if unwatched.is_empty() {
+        return;
+    }
+    let Ok(mut w) = watcher.lock() else {
+        return;
+    };
+    unwatched
+        .retain(|(_, root)| !(root.is_dir() && w.watch(root, RecursiveMode::Recursive).is_ok()));
+}
+
+/// One poll tick over one agent root (remote poller and local backstop).
+/// Returns `false` iff the receiver dropped (the dashboard exited), at
+/// which point the caller exits its loop. Errors from `list_transcripts`
+/// are swallowed — a transient SSH hiccup must not stop the cadence, and
+/// the next tick retries from scratch.
+///
+/// Per transcript, only when its mtime moved past `last_seen` (mtime-skip:
+/// derived state can only change via a write, and a write advances mtime,
+/// so an idle host costs one listing per tick):
+/// - **registered** (accepted by the dashboard) → an `Attention` update;
+/// - **not registered** → `NewTranscript` plus an immediate `Attention`
+///   (so a long-idle session doesn't sit at `Unknown` until its next
+///   write). Re-sent on every later write until the path is registered —
+///   the dashboard drops a stillborn transcript (no conversational content
+///   yet), and without the re-announce it would never surface.
+///
+/// Two admission gates keep a poller from re-admitting what startup
+/// discovery deliberately filtered (each announce costs the dashboard a
+/// full-file read to build the session): a never-seen path older than
+/// `stale_before` is recorded silently, so the first tick doesn't announce
+/// the archive; and an unregistered path discovery already rejected at
+/// this mtime (`rejected`) stays silent until it is written to.
 fn poll_once(
     host: &dyn Host,
     host_id: &HostId,
     root: &Path,
     kind: AgentKind,
-    state: &mut PollState,
+    ctx: &PollCtx<'_>,
     tx: &Sender<WatcherEvent>,
 ) -> bool {
     let cli = agent(kind);
-    let Ok(listing) = host.list_transcripts(root, &cli.listing()) else {
+    let Ok(stats) = host.list_transcripts(root, &cli.listing()) else {
         return true;
     };
-    for stat in listing {
-        if let Some((id, last_seen)) = state.known.get_mut(&stat.path) {
-            // mtime-skip: the only way a transcript's derived attention
-            // changes is via a write to it, and a write advances mtime.
-            // Skipping unchanged files keeps the cost of an idle host
-            // at one `find` per interval rather than N `tail -c`.
-            if stat.mtime > *last_seen {
-                *last_seen = stat.mtime;
-                let detail = derive_attention_detail(host, &stat.path, kind, Path::new(""));
-                if tx
-                    .send(WatcherEvent::Attention(AttentionUpdate {
-                        id: id.clone(),
-                        agent: kind,
-                        attention: detail.attention,
-                        from_tool_use: detail.from_tool_use,
-                        mtime: Some(stat.mtime),
-                        edited_files: detail.edited_files,
-                        last_message: detail.last_message,
-                    }))
-                    .is_err()
-                {
-                    return false;
+    for stat in stats {
+        let advanced = {
+            let Ok(mut seen) = ctx.last_seen.lock() else {
+                return true;
+            };
+            match seen.get(&stat.path) {
+                Some(prev) if stat.mtime <= *prev => false,
+                Some(_) => {
+                    seen.insert(stat.path.clone(), stat.mtime);
+                    true
+                }
+                None => {
+                    seen.insert(stat.path.clone(), stat.mtime);
+                    stat.mtime >= ctx.stale_before
                 }
             }
-            continue;
-        }
-        // An unknown path. Two gates before announcing it, both of them
-        // re-applying a decision startup discovery already made — the
-        // poller lists the raw tree, so without them it re-admits three
-        // seconds after connect exactly what discovery filtered out, and
-        // every admission costs a transcript read to build the session.
-        //
-        // (1) Age. `discover` drops transcripts older than
-        // `DISCOVERY_MAX_AGE` at the listing boundary; a poller with no
-        // equivalent bound would hand the dashboard every months-cold
-        // conversation on the host, silently undoing the filter.
-        if stat.mtime < state.cutoff {
-            continue;
-        }
-        // (2) A standing reject. Discovery read this file and declined
-        // to build a session from it. The verdict holds while the bytes
-        // do; a write invalidates it and we fall through to announce.
-        match state.rejected.get(&stat.path) {
-            Some(verdict_mtime) if stat.mtime <= *verdict_mtime => continue,
-            Some(_) => {
-                state.rejected.remove(&stat.path);
-            }
-            None => {}
-        }
-        let Some(id) = cli.session_id_from_path(&stat.path) else {
-            continue;
         };
-        state
-            .known
-            .insert(stat.path.clone(), (id.clone(), stat.mtime));
-        if tx
-            .send(WatcherEvent::NewTranscript {
-                host: host_id.clone(),
-                agent: kind,
-                path: stat.path.clone(),
-                mtime: stat.mtime,
-            })
-            .is_err()
-        {
-            return false;
+        if !advanced {
+            continue;
         }
-        // The dashboard would otherwise see this row sit at `Unknown`
-        // until the *next* write — for a session that's been idle for
-        // hours that could be a long time. Emit one Attention now.
+        let id = if let Some(id) = (ctx.registered)(&stat.path) {
+            id
+        } else {
+            // A standing reject: discovery read this file and declined to
+            // build a session from it. The verdict holds while the bytes
+            // do; a write invalidates it and we fall through to announce.
+            if let Ok(mut rejected) = ctx.rejected.lock() {
+                match rejected.get(&stat.path) {
+                    Some(verdict_mtime) if stat.mtime <= *verdict_mtime => continue,
+                    Some(_) => {
+                        rejected.remove(&stat.path);
+                    }
+                    None => {}
+                }
+            }
+            let Some(id) = cli.session_id_from_path(&stat.path) else {
+                continue;
+            };
+            if tx
+                .send(WatcherEvent::NewTranscript {
+                    host: host_id.clone(),
+                    agent: kind,
+                    path: stat.path.clone(),
+                    mtime: stat.mtime,
+                })
+                .is_err()
+            {
+                return false;
+            }
+            id
+        };
         let detail = derive_attention_detail(host, &stat.path, kind, Path::new(""));
         if tx
             .send(WatcherEvent::Attention(AttentionUpdate {
@@ -1184,15 +1349,82 @@ mod tests {
 "#
     }
 
-    /// Build a [`PollState`] for the `poll_once` tests. The mock host's
-    /// timestamps are small seconds-since-epoch values, far older than the
-    /// real 30-day admission window, so the cutoff is pinned open here —
-    /// these tests are about event emission; the age gate has its own
-    /// tests below.
-    fn poll_state(initial: Vec<(SessionId, PathBuf, SystemTime)>) -> PollState {
-        let mut state = PollState::new(initial, Vec::new());
-        state.cutoff = UNIX_EPOCH;
-        state
+    /// Bookkeeping for driving `poll_once` directly: a `last_seen` map, a
+    /// fixed set of registered (accepted-by-the-dashboard) paths, and the
+    /// standing discovery rejects. Uses an epoch `stale_before` so the tiny
+    /// test timestamps aren't baselined.
+    struct PollFixture {
+        last_seen: Mutex<HashMap<PathBuf, SystemTime>>,
+        registered: Mutex<HashMap<PathBuf, SessionId>>,
+        rejected: Mutex<HashMap<PathBuf, SystemTime>>,
+    }
+
+    impl PollFixture {
+        fn new() -> Self {
+            Self {
+                last_seen: Mutex::new(HashMap::new()),
+                registered: Mutex::new(HashMap::new()),
+                rejected: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// A path a previous run's discovery declined at `mtime`.
+        fn reject(&self, path: &Path, mtime: SystemTime) {
+            self.rejected
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), mtime);
+        }
+
+        /// A path the dashboard already accepted, last handled at `mtime`.
+        fn known(path: &Path, id: &str, mtime: SystemTime) -> Self {
+            let f = Self::new();
+            f.register(path, id);
+            f.last_seen
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), mtime);
+            f
+        }
+
+        fn register(&self, path: &Path, id: &str) {
+            self.registered
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), SessionId(id.into()));
+        }
+
+        fn seen(&self, path: &Path) -> Option<SystemTime> {
+            self.last_seen.lock().unwrap().get(path).copied()
+        }
+
+        fn poll_with_cutoff(
+            &self,
+            host: &dyn Host,
+            root: &str,
+            kind: AgentKind,
+            stale_before: SystemTime,
+            tx: &Sender<WatcherEvent>,
+        ) -> bool {
+            let lookup = |p: &Path| self.registered.lock().unwrap().get(p).cloned();
+            let ctx = PollCtx {
+                last_seen: &self.last_seen,
+                registered: &lookup,
+                rejected: &self.rejected,
+                stale_before,
+            };
+            poll_once(host, host.id(), Path::new(root), kind, &ctx, tx)
+        }
+
+        fn poll(
+            &self,
+            host: &dyn Host,
+            root: &str,
+            kind: AgentKind,
+            tx: &Sender<WatcherEvent>,
+        ) -> bool {
+            self.poll_with_cutoff(host, root, kind, UNIX_EPOCH, tx)
+        }
     }
 
     #[test]
@@ -1201,17 +1433,10 @@ mod tests {
         let path = PathBuf::from("/r/p/s.jsonl");
         host.put(&path, assistant_line(), ts(100));
 
-        let mut state = poll_state(vec![(SessionId("s".into()), path.clone(), ts(100))]);
+        let f = PollFixture::known(&path, "s", ts(100));
         let (tx, rx) = mpsc::channel();
 
-        assert!(poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx
-        ));
+        assert!(f.poll(&host, "/r", AgentKind::Claude, &tx));
         assert!(drain(&rx).is_empty());
     }
 
@@ -1223,16 +1448,9 @@ mod tests {
         // derives to NeedsInput.
         host.put(&path, assistant_line(), ts(200));
 
-        let mut state = poll_state(vec![(SessionId("s".into()), path.clone(), ts(100))]);
+        let f = PollFixture::known(&path, "s", ts(100));
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx,
-        );
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
 
         let events = drain(&rx);
         assert_eq!(events.len(), 1, "got: {events:?}");
@@ -1246,9 +1464,9 @@ mod tests {
             }
             other => panic!("expected Attention, got: {other:?}"),
         }
-        // Known-set should now record the new mtime so the next tick
-        // doesn't re-emit.
-        assert_eq!(state.known.get(&path).unwrap().1, ts(200));
+        // last_seen now records the new mtime so the next tick doesn't
+        // re-emit.
+        assert_eq!(f.seen(&path), Some(ts(200)));
     }
 
     #[test]
@@ -1257,16 +1475,9 @@ mod tests {
         let path = PathBuf::from("/r/p/fresh.jsonl");
         host.put(&path, user_line(), ts(50));
 
-        let mut state = poll_state(Vec::new());
+        let fixture = PollFixture::new();
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx,
-        );
+        fixture.poll(&host, "/r", AgentKind::Claude, &tx);
 
         let events = drain(&rx);
         assert_eq!(events.len(), 2, "got: {events:?}");
@@ -1291,96 +1502,74 @@ mod tests {
             }
             other => panic!("expected Attention second, got: {other:?}"),
         }
-        // The new path is now in known-set; a subsequent tick with no
-        // mtime change should be silent.
+        // A subsequent tick with no mtime change is silent.
         let (tx2, rx2) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx2,
-        );
+        fixture.poll(&host, "/r", AgentKind::Claude, &tx2);
         assert!(drain(&rx2).is_empty());
     }
 
     #[test]
-    fn poll_once_does_not_announce_a_transcript_older_than_the_cutoff() {
-        // The poller lists the raw transcript tree, with none of the age
-        // filtering `discover` applies at its own listing boundary. Without
-        // this gate every months-cold conversation on a remote host is
-        // announced as new within one tick of connecting — silently undoing
-        // DISCOVERY_MAX_AGE, and costing a full transcript read apiece to
-        // build rows the filter exists to suppress.
+    fn poll_once_reannounces_an_unregistered_path_on_each_write_until_registered() {
+        // The remote stillborn bug: a transcript first seen before it has
+        // conversational content is dropped by the dashboard (never
+        // registered). The poller must announce it again once it grows,
+        // not treat it as known forever.
         let host = MockHost::new("devbox");
-        let cold = PathBuf::from("/r/p/cold.jsonl");
-        let warm = PathBuf::from("/r/p/warm.jsonl");
-        host.put(&cold, user_line(), ts(100));
-        host.put(&warm, user_line(), ts(500));
+        let path = PathBuf::from("/r/p/late.jsonl");
+        host.put(&path, "{\"type\":\"summary\"}\n", ts(50));
+        let f = PollFixture::new();
 
-        let mut state = poll_state(Vec::new());
-        state.cutoff = ts(300);
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx,
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
+        assert!(matches!(
+            drain(&rx).first(),
+            Some(WatcherEvent::NewTranscript { .. })
+        ));
+
+        // Unchanged + still unregistered → silent (no announce storm).
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
+        assert!(drain(&rx).is_empty());
+
+        // It grows; still unregistered → announced again.
+        host.put(&path, user_line(), ts(60));
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
+        let events = drain(&rx);
+        assert!(
+            matches!(events.first(), Some(WatcherEvent::NewTranscript { mtime, .. }) if *mtime == ts(60)),
+            "re-announced after growing: {events:?}"
         );
 
+        // The dashboard accepts it; the next write is a plain Attention.
+        f.register(&path, "late");
+        host.put(&path, assistant_line(), ts(70));
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
         let events = drain(&rx);
-        let announced: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                WatcherEvent::NewTranscript { path, .. } => Some(path.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(announced, vec![warm], "got: {events:?}");
-        // The cold path is skipped, not remembered: it must stay out of
-        // the known-set so a later write re-admits it.
-        assert!(!state.known.contains_key(&cold));
+        assert_eq!(events.len(), 1, "got: {events:?}");
+        assert!(matches!(&events[0], WatcherEvent::Attention(u) if u.id.0 == "late"));
     }
 
     #[test]
-    fn poll_once_reconsiders_a_cold_transcript_once_it_is_written_to() {
-        // Resuming a months-old conversation advances its mtime past the
-        // cutoff, and the session has to appear.
+    fn poll_once_baselines_never_seen_stale_transcripts_silently() {
+        // The archive discovery skips (older than DISCOVERY_MAX_AGE) must
+        // not be announced wholesale on the first tick — each announce
+        // costs the dashboard a full-file read. A later write still
+        // surfaces it.
         let host = MockHost::new("devbox");
-        let path = PathBuf::from("/r/p/revived.jsonl");
-        host.put(&path, user_line(), ts(100));
-
-        let mut state = poll_state(Vec::new());
-        state.cutoff = ts(300);
+        let path = PathBuf::from("/r/p/ancient.jsonl");
+        host.put(&path, user_line(), ts(10));
+        let f = PollFixture::new();
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx,
-        );
-        assert!(drain(&rx).is_empty());
 
-        host.put(&path, user_line(), ts(900));
-        let (tx2, rx2) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx2,
-        );
-        let events = drain(&rx2);
-        assert!(
-            matches!(events.first(), Some(WatcherEvent::NewTranscript { path: p, .. }) if p == &path),
-            "got: {events:?}"
-        );
+        f.poll_with_cutoff(&host, "/r", AgentKind::Claude, ts(1_000), &tx);
+        assert!(drain(&rx).is_empty(), "stale file baselined silently");
+        assert_eq!(f.seen(&path), Some(ts(10)));
+
+        host.put(&path, user_line(), ts(2_000));
+        f.poll_with_cutoff(&host, "/r", AgentKind::Claude, ts(1_000), &tx);
+        assert!(matches!(
+            drain(&rx).first(),
+            Some(WatcherEvent::NewTranscript { .. })
+        ));
     }
 
     #[test]
@@ -1392,24 +1581,11 @@ mod tests {
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/dead.jsonl");
         host.put(&path, user_line(), ts(500));
+        let f = PollFixture::new();
+        f.reject(&path, ts(500));
 
-        let mut state = PollState::new(
-            Vec::new(),
-            vec![crate::discovery::RejectedTranscript {
-                path: path.clone(),
-                mtime: ts(500),
-            }],
-        );
-        state.cutoff = UNIX_EPOCH;
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx,
-        );
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
         assert!(drain(&rx).is_empty());
     }
 
@@ -1421,26 +1597,16 @@ mod tests {
         // into would stay invisible until the next launch.
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/revived.jsonl");
-        host.put(&path, user_line(), ts(900));
+        host.put(&path, user_line(), ts(500));
+        let f = PollFixture::new();
+        f.reject(&path, ts(500));
 
-        let mut state = PollState::new(
-            Vec::new(),
-            vec![crate::discovery::RejectedTranscript {
-                path: path.clone(),
-                mtime: ts(500),
-            }],
-        );
-        state.cutoff = UNIX_EPOCH;
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx,
-        );
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
+        assert!(drain(&rx).is_empty(), "silent while the verdict holds");
 
+        host.put(&path, user_line(), ts(900));
+        f.poll(&host, "/r", AgentKind::Claude, &tx);
         let events = drain(&rx);
         assert!(
             matches!(events.first(), Some(WatcherEvent::NewTranscript { path: p, .. }) if p == &path),
@@ -1448,7 +1614,46 @@ mod tests {
         );
         // And the spent verdict is dropped, so it can't suppress a future
         // tick for the same path.
-        assert!(!state.rejected.contains_key(&path));
+        assert!(!f.rejected.lock().unwrap().contains_key(&path));
+    }
+
+    #[test]
+    fn poll_once_sees_writes_through_a_held_open_handle() {
+        // The macOS bug: a writer that keeps the transcript open (codex)
+        // produces no FSEvents until close, but each write still advances
+        // mtime. The backstop poll — driven here directly against the real
+        // local filesystem — must turn such a write into an Attention.
+        use std::io::Write as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bucket = dir.path().join("p");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join("s.jsonl");
+        fs::write(&path, "{\"type\":\"user\",\"message\":\"hi\"}\n").unwrap();
+        let host = LocalHost::new();
+        let start = fs::metadata(&path).unwrap().modified().unwrap();
+        let f = PollFixture::known(&path, "s", start);
+
+        // Hold the file open across the write and the poll.
+        let mut held = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // Make sure the write lands on a later mtime tick even on a coarse
+        // filesystem clock.
+        thread::sleep(Duration::from_millis(20));
+        held.write_all(b"{\"type\":\"assistant\",\"message\":\"done\"}\n")
+            .unwrap();
+        held.flush().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        f.poll(&host, dir.path().to_str().unwrap(), AgentKind::Claude, &tx);
+        let events = drain(&rx);
+        assert_eq!(events.len(), 1, "got: {events:?}");
+        match &events[0] {
+            WatcherEvent::Attention(u) => {
+                assert_eq!(u.id.0, "s");
+                assert_eq!(u.attention, Attention::NeedsInput);
+            }
+            other => panic!("expected Attention, got: {other:?}"),
+        }
+        drop(held);
     }
 
     #[test]
@@ -1463,16 +1668,9 @@ mod tests {
         );
         host.put(&path, user_line(), ts(50));
 
-        let mut state = poll_state(Vec::new());
+        let f = PollFixture::new();
         let (tx, rx) = mpsc::channel();
-        poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Codex,
-            &mut state,
-            &tx,
-        );
+        f.poll(&host, "/r", AgentKind::Codex, &tx);
 
         let events = drain(&rx);
         assert_eq!(events.len(), 2, "got: {events:?}");
@@ -1542,16 +1740,9 @@ mod tests {
             }
         }
         let host = FlakyHost(HostId("flaky".into()));
-        let mut state = poll_state(Vec::new());
+        let f = PollFixture::new();
         let (tx, rx) = mpsc::channel();
-        assert!(poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx
-        ));
+        assert!(f.poll(&host, "/r", AgentKind::Claude, &tx));
         assert!(drain(&rx).is_empty());
     }
 
@@ -1560,19 +1751,12 @@ mod tests {
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/s.jsonl");
         host.put(&path, assistant_line(), ts(200));
-        let mut state = poll_state(vec![(SessionId("s".into()), path.clone(), ts(100))]);
+        let f = PollFixture::known(&path, "s", ts(100));
 
         let (tx, rx) = mpsc::channel();
         drop(rx);
         assert!(
-            !poll_once(
-                &host,
-                host.id(),
-                Path::new("/r"),
-                AgentKind::Claude,
-                &mut state,
-                &tx
-            ),
+            !f.poll(&host, "/r", AgentKind::Claude, &tx),
             "should signal shutdown when no receiver"
         );
     }
@@ -1588,19 +1772,83 @@ mod tests {
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/.hidden");
         host.put(&path, "{}\n", ts(10));
-        let mut state = poll_state(Vec::new());
+        let f = PollFixture::new();
         let (tx, rx) = mpsc::channel();
-        assert!(poll_once(
-            &host,
-            host.id(),
-            Path::new("/r"),
-            AgentKind::Claude,
-            &mut state,
-            &tx
-        ));
+        assert!(f.poll(&host, "/r", AgentKind::Claude, &tx));
         // `.hidden` has stem ".hidden" (no extension), so it does emit.
         // The point is no panic.
         assert!(!drain(&rx).is_empty());
+    }
+
+    // ---- local backstop / late roots / remote registration ----
+
+    #[test]
+    fn local_backstop_surfaces_a_root_created_after_startup() {
+        // An agent first run while agent-mux is up: its root doesn't exist
+        // at `start`, so the recursive watch can't attach. The backstop
+        // must attach it later and surface the new transcript.
+        let dir = tempfile::TempDir::new().unwrap();
+        let codex_root = dir.path().join("codex-sessions");
+        let roots = vec![(AgentKind::Codex, codex_root.clone())];
+        let (w, rx) =
+            TranscriptWatcher::start(Arc::new(LocalHost::new()), Vec::new(), &roots).unwrap();
+        assert_eq!(w.unwatched_roots.len(), 1, "missing root starts unwatched");
+        w.start_local_backstop(Duration::from_millis(50));
+
+        let day = codex_root.join("2026/10/02");
+        fs::create_dir_all(&day).unwrap();
+        let rollout =
+            day.join("rollout-2026-10-02T00-34-16-01a0fb89-084f-74f0-b001-3ab060227f2e.jsonl");
+        fs::write(&rollout, "{\"type\":\"session_meta\",\"payload\":{}}\n").unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(WatcherEvent::NewTranscript { path, agent, .. }) if path == rollout => {
+                    assert_eq!(agent, AgentKind::Codex);
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("late root never surfaced its transcript: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn attach_late_roots_attaches_once_the_directory_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("later");
+        let (tx, _rx) = mpsc::channel();
+        let watcher = Mutex::new(notify::recommended_watcher(tx).unwrap());
+        let mut unwatched = vec![(AgentKind::Pi, root.clone())];
+
+        attach_late_roots(&watcher, &mut unwatched);
+        assert_eq!(unwatched.len(), 1, "still missing → still pending");
+
+        fs::create_dir_all(&root).unwrap();
+        attach_late_roots(&watcher, &mut unwatched);
+        assert!(unwatched.is_empty(), "attached once it exists");
+    }
+
+    #[test]
+    fn track_new_transcript_registers_remote_paths_for_the_poller() {
+        let (mut w, _rx) =
+            TranscriptWatcher::start(Arc::new(LocalHost::new()), Vec::new(), &[]).unwrap();
+        let remote = HostId("devbox".into());
+        let path = PathBuf::from("/r/p/s.jsonl");
+        w.track_new_transcript(
+            &remote,
+            SessionId("s".into()),
+            path.clone(),
+            AgentKind::Claude,
+        )
+        .unwrap();
+        let reg = w.registered.lock().unwrap();
+        assert_eq!(
+            reg.get(&remote).and_then(|m| m.get(&path)),
+            Some(&SessionId("s".into()))
+        );
     }
 
     // ---- poll_hooks_once ----

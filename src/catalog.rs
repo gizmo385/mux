@@ -31,6 +31,33 @@ pub struct SessionCatalog {
     /// [`SessionCatalog::take_ready_pending_hooks`] once the session
     /// surfaces. Ephemeral — never persisted.
     pending_hooks: HashMap<SessionId, PendingHook>,
+    /// The latest heuristic derivation a hook pin suppressed, per
+    /// session. [`SessionCatalog::release_blocking_pin`] applies it, so a
+    /// release lands on what the transcript last said instead of a
+    /// guessed `Working`: a turn end the pin swallowed (the pin stamped
+    /// after the turn's own write by a late drain, or a remote clock
+    /// behind the local one) is not lost. Cleared whenever the pin is.
+    held: HashMap<SessionId, HeldDerivation>,
+}
+
+/// A heuristic derivation suppressed by a hook pin (see
+/// [`SessionCatalog::release_blocking_pin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldDerivation {
+    attention: Attention,
+    mtime: Option<SystemTime>,
+    last_message: Option<String>,
+}
+
+/// What [`SessionCatalog::release_blocking_pin`] did, for the caller to
+/// hand the notifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRelease {
+    pub previous: Attention,
+    pub attention: Attention,
+    /// The applied derivation's final assistant text (a turn end the pin
+    /// held back), for the toast body.
+    pub last_message: Option<String>,
 }
 
 impl SessionCatalog {
@@ -107,12 +134,17 @@ impl SessionCatalog {
     /// mtime releases hook authority and clears the blocking flag.
     /// Without this guard a permission prompt flickers to `working` the
     /// instant the triggering `tool_use` write out-races the hook.
+    ///
+    /// `last_message` (the derivation's final assistant text) is only
+    /// kept for a suppressed update, so a later pin release can replay
+    /// it whole.
     pub fn apply_heuristic_attention(
         &mut self,
         id: &SessionId,
         attention: Attention,
         event_mtime: Option<SystemTime>,
         from_tool_use: bool,
+        last_message: Option<&str>,
     ) -> Option<Attention> {
         for session in &mut self.sessions {
             if session.id == *id {
@@ -125,13 +157,26 @@ impl SessionCatalog {
                     let progressed = !from_tool_use && matches!(event_mtime, Some(m) if m > pin);
                     if progressed {
                         session.hook_pinned = None;
+                        self.held.remove(id);
                     } else {
+                        self.held.insert(
+                            id.clone(),
+                            HeldDerivation {
+                                attention,
+                                mtime: event_mtime,
+                                last_message: last_message.map(str::to_string),
+                            },
+                        );
                         return None;
                     }
                 }
                 let previous = session.attention;
                 session.attention = attention;
-                if previous != attention {
+                // A blocking prompt resolving into a turn end (blocked →
+                // done) is a new state even though both are `NeedsInput`:
+                // the user answered, so "done" counts from the turn end.
+                let resolved_prompt = session.blocking_prompt && !from_tool_use;
+                if previous != attention || resolved_prompt {
                     // Prefer the transcript mtime that drove this update
                     // (when the state actually changed) over wall-clock;
                     // fall back to now() for the rare mtime-less event.
@@ -196,6 +241,8 @@ impl SessionCatalog {
                 }
                 session.blocking_prompt = blocking_prompt;
                 session.hook_pinned = Some(received_at);
+                // Derivations held under an earlier pin predate this one.
+                self.held.remove(id);
                 return Some(previous);
             }
         }
@@ -203,32 +250,40 @@ impl SessionCatalog {
     }
 
     /// Release a *blocking* hook pin because the prompt behind it is
-    /// known to be gone — the falling edge of a pane-title signal (codex's
-    /// `[ ! ] Action Required` title clearing once the user answers). The
-    /// agent is back at work, so attention returns to `Working` and the
-    /// blocking flag clears; the next transcript update re-derives from
-    /// there. Returns the previous attention iff a blocking pin was
-    /// released, so the caller can feed the notifier the transition out of
-    /// `NeedsInput` (which re-arms its episodic flag for the turn-end
-    /// toast).
+    /// known to be gone — the falling edge of a pane-title signal (the
+    /// agent's "action required" title clearing once the user answers).
+    /// The blocking flag clears and attention moves to the latest
+    /// derivation the pin suppressed ([`HeldDerivation`]), or `Working`
+    /// when none was: the user answered, so the agent is back at work,
+    /// and the next transcript update re-derives from there. `at` stamps
+    /// `attention_entered_at` for a held derivation without an mtime.
     ///
-    /// A no-op when there is no blocking pin: the heuristic has already
-    /// moved past the prompt (a denied approval that aborted the turn, or
-    /// a turn that finished before this edge was seen), and overwriting
-    /// that state with `Working` would be wrong.
-    pub fn release_blocking_pin(&mut self, id: &SessionId, at: SystemTime) -> Option<Attention> {
+    /// Returns `None` when there is no blocking pin: the heuristic has
+    /// already moved past the prompt (a denied approval that aborted the
+    /// turn, or a turn that finished before this edge was seen), and
+    /// overwriting that state would be wrong.
+    pub fn release_blocking_pin(&mut self, id: &SessionId, at: SystemTime) -> Option<PinRelease> {
         let session = self.sessions.iter_mut().find(|s| s.id == *id)?;
         if session.hook_pinned.is_none() || !session.blocking_prompt {
             return None;
         }
+        let held = self.held.remove(id);
+        let (attention, entered_at, last_message) = match held {
+            Some(h) => (h.attention, h.mtime.unwrap_or(at), h.last_message),
+            None => (Attention::Working, at, None),
+        };
         let previous = session.attention;
         session.hook_pinned = None;
         session.blocking_prompt = false;
-        session.attention = Attention::Working;
-        if previous != Attention::Working {
-            session.attention_entered_at = Some(at);
-        }
-        Some(previous)
+        session.attention = attention;
+        // Always a new state: it was a blocking prompt (see the same rule
+        // in `apply_heuristic_attention`).
+        session.attention_entered_at = Some(entered_at);
+        Some(PinRelease {
+            previous,
+            attention,
+            last_message,
+        })
     }
 
     /// Hold a hook event whose session isn't in the catalog yet — the
@@ -917,6 +972,7 @@ mod tests {
             Attention::Working,
             Some(at(50)),
             false,
+            None,
         );
         assert_eq!(c.sessions()[0].attention_entered_at, Some(at(50)));
     }
@@ -929,7 +985,11 @@ mod tests {
         c.apply_hook_event(&id, true, at(10));
         assert_eq!(
             c.release_blocking_pin(&id, at(20)),
-            Some(Attention::NeedsInput)
+            Some(PinRelease {
+                previous: Attention::NeedsInput,
+                attention: Attention::Working,
+                last_message: None,
+            })
         );
         let s = &c.sessions()[0];
         assert_eq!(s.attention, Attention::Working);
@@ -939,7 +999,82 @@ mod tests {
         // Unpinned: an open-turn `tool_use`-style Working update now
         // applies, and the turn end transitions into NeedsInput.
         assert_eq!(
-            c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(30)), false),
+            c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(30)), false, None),
+            Some(Attention::Working)
+        );
+    }
+
+    #[test]
+    fn release_blocking_pin_replays_the_turn_end_the_pin_held_back() {
+        // The pin was stamped after the turn's own `task_complete` write
+        // (a late drain, or a remote clock behind ours), so the turn end
+        // was suppressed. The release must land on it — with its message
+        // — rather than inventing `Working` with no write left to fix it.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        c.apply_hook_event(&id, true, at(50));
+        c.apply_heuristic_attention(&id, Attention::Working, Some(at(40)), true, None);
+        c.apply_heuristic_attention(
+            &id,
+            Attention::NeedsInput,
+            Some(at(45)),
+            false,
+            Some("all done"),
+        );
+        assert_eq!(
+            c.sessions()[0].attention,
+            Attention::NeedsInput,
+            "held, not applied"
+        );
+        assert_eq!(
+            c.release_blocking_pin(&id, at(60)),
+            Some(PinRelease {
+                previous: Attention::NeedsInput,
+                attention: Attention::NeedsInput,
+                last_message: Some("all done".into()),
+            })
+        );
+        let s = &c.sessions()[0];
+        assert!(!s.blocking_prompt && s.hook_pinned.is_none());
+        assert_eq!(
+            s.attention_entered_at,
+            Some(at(45)),
+            "done counts from the turn end"
+        );
+        // Consumed: a fresh pin and release starts clean.
+        c.apply_hook_event(&id, true, at(70));
+        assert_eq!(
+            c.release_blocking_pin(&id, at(80)).map(|r| r.attention),
+            Some(Attention::Working)
+        );
+    }
+
+    #[test]
+    fn blocked_resolving_into_done_restamps_time_in_state() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        c.apply_heuristic_attention(&id, Attention::Working, Some(at(5)), false, None);
+        c.apply_hook_event(&id, true, at(10));
+        assert_eq!(c.sessions()[0].attention_entered_at, Some(at(10)));
+        c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(40)), false, None);
+        assert_eq!(c.sessions()[0].attention_entered_at, Some(at(40)));
+        // done → done keeps counting.
+        c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(50)), false, None);
+        assert_eq!(c.sessions()[0].attention_entered_at, Some(at(40)));
+    }
+
+    #[test]
+    fn a_new_pin_discards_derivations_held_under_the_old_one() {
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        c.apply_hook_event(&id, true, at(50));
+        c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(45)), false, Some("old"));
+        c.apply_hook_event(&id, true, at(90));
+        assert_eq!(
+            c.release_blocking_pin(&id, at(95)).map(|r| r.attention),
             Some(Attention::Working)
         );
     }
@@ -952,7 +1087,7 @@ mod tests {
         c.apply_hook_event(&id, true, at(10));
         // The turn ended (or was aborted) past the pin before the title
         // edge arrived: the heuristic released it already.
-        c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(15)), false);
+        c.apply_heuristic_attention(&id, Attention::NeedsInput, Some(at(15)), false, None);
         assert_eq!(c.release_blocking_pin(&id, at(20)), None);
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
         // A non-blocking pin (a turn-end nudge) isn't a prompt to clear.
@@ -987,6 +1122,7 @@ mod tests {
             Attention::Working,
             Some(at(8)),
             true,
+            None,
         );
         assert_eq!(prev, None, "stale heuristic update must be suppressed");
         let s = &c.sessions()[0];
@@ -1008,6 +1144,7 @@ mod tests {
             Attention::Working,
             Some(at(20)),
             false,
+            None,
         );
         assert_eq!(prev, Some(Attention::NeedsInput));
         let s = &c.sessions()[0];
@@ -1027,6 +1164,7 @@ mod tests {
             Attention::NeedsInput,
             Some(at(5)),
             false,
+            None,
         );
         assert_eq!(prev, Some(Attention::Unknown));
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
@@ -1053,6 +1191,7 @@ mod tests {
             Attention::Working,
             Some(at(20)),
             false,
+            None,
         );
         assert!(
             !c.sessions()[0].blocking_prompt,
@@ -1079,6 +1218,7 @@ mod tests {
             Attention::Working,
             Some(at(11)), // races a tick past the hook timestamp
             true,         // ...but it's the prompt's own tool_use entry
+            None,
         );
         assert_eq!(prev, None, "the prompt's own tool_use must be suppressed");
         let s = &c.sessions()[0];
@@ -1102,6 +1242,7 @@ mod tests {
             Attention::Working,
             Some(at(20)),
             false,
+            None,
         );
         assert_eq!(prev, Some(Attention::NeedsInput));
         let s = &c.sessions()[0];
@@ -1130,6 +1271,7 @@ mod tests {
             Attention::Working,
             Some(at(15)),
             true,
+            None,
         );
         assert_eq!(
             prev, None,
@@ -1149,6 +1291,7 @@ mod tests {
             Attention::NeedsInput,
             Some(at(20)),
             false,
+            None,
         );
         assert_eq!(prev, Some(Attention::NeedsInput));
         let s = &c.sessions()[0];
@@ -1178,8 +1321,13 @@ mod tests {
         let mut c = SessionCatalog::new();
         c.add(session("a"));
         c.apply_hook_event(&SessionId("a".into()), false, at(10));
-        let prev =
-            c.apply_heuristic_attention(&SessionId("a".into()), Attention::Working, None, true);
+        let prev = c.apply_heuristic_attention(
+            &SessionId("a".into()),
+            Attention::Working,
+            None,
+            true,
+            None,
+        );
         assert_eq!(prev, None);
         assert_eq!(c.sessions()[0].attention, Attention::NeedsInput);
     }

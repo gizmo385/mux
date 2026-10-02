@@ -546,6 +546,13 @@ struct SessionState {
     /// Cleared when the session leaves `NeedsInput` (the trigger no
     /// longer applies) or once the belated toast actually fires.
     pending_payload: Option<Payload>,
+    /// Whether the current `NeedsInput` episode is a *blocking* prompt
+    /// (`Transition::blocking`). Recorded ahead of every gate, so a
+    /// prompt whose toast was suppressed (startup replay, actively
+    /// viewed) still counts. A blocking prompt that resolves into a plain
+    /// turn end without leaving `NeedsInput` (blocked → done) starts a
+    /// new episode; see [`Notifier::on_attention_update`].
+    episode_blocking: bool,
 }
 
 pub struct Notifier {
@@ -627,12 +634,31 @@ impl Notifier {
                 // `on_terminal_focus_lost` from firing for an episode
                 // that's already over.
                 s.pending_payload = None;
+                s.episode_blocking = false;
             }
             return;
         }
         if t.prev == Attention::NeedsInput {
-            return;
+            // Still in `NeedsInput`. Normally the same episode, so no
+            // re-fire — except when a blocking prompt has resolved into a
+            // plain turn end (blocked → done). The user answered, the
+            // agent worked on and finished, and nothing ever left
+            // `NeedsInput`: a codex approval whose pin held through the
+            // rest of the turn, or a turn that ended before the release
+            // was seen. That finish is news, so it starts a new episode
+            // (found live 2026-10-02: approving a codex prompt sent no
+            // "finished" toast). A done → blocked escalation joins the
+            // episode as blocking so its eventual resolution counts too.
+            let entry = self.state.entry(t.id.clone()).or_default();
+            let resolved = entry.episode_blocking && !t.blocking;
+            if !resolved {
+                entry.episode_blocking |= t.blocking;
+                return;
+            }
+            entry.fired_for_current_episode = false;
+            entry.pending_payload = None;
         }
+        self.state.entry(t.id.clone()).or_default().episode_blocking = t.blocking;
         // Startup-replay gate: a transition whose underlying signal
         // pre-dates this `Notifier` is a replay of something that
         // happened while agent-mux wasn't running (canonical case:
@@ -1088,6 +1114,105 @@ mod tests {
             },
             now,
         );
+    }
+
+    /// One transition with an explicit `blocking` flag (the blocked vs
+    /// done distinction), not actively viewed.
+    fn fire_blocking(
+        n: &mut Notifier,
+        id: &SessionId,
+        prev: Attention,
+        new: Attention,
+        blocking: bool,
+        now: SystemTime,
+    ) {
+        n.on_attention_update(
+            &Transition {
+                id,
+                prev,
+                new,
+                title: "t",
+                host: &local(),
+                project: Path::new("/p"),
+                blocking,
+                message: None,
+                actively_viewed: false,
+                source_at: None,
+            },
+            now,
+        );
+    }
+
+    #[test]
+    fn blocked_resolving_into_done_without_leaving_needs_input_fires_again() {
+        // A codex approval: blocked toast, the user approves, the pin
+        // holds the row in NeedsInput through the rest of the turn, and
+        // the turn end clears `blocking` — the "finished" toast must fire.
+        use Attention::{NeedsInput, Working};
+        let (mut n, log) = notifier_with_log();
+        let id = sid("a");
+        fire_blocking(&mut n, &id, Working, NeedsInput, true, at(100));
+        fire_blocking(&mut n, &id, NeedsInput, NeedsInput, true, at(110));
+        assert_eq!(
+            log.log.lock().unwrap().len(),
+            1,
+            "a repeat block is the same episode"
+        );
+        fire_blocking(&mut n, &id, NeedsInput, NeedsInput, false, at(200));
+        {
+            let log = log.log.lock().unwrap();
+            assert_eq!(log.len(), 2);
+            assert!(log[0].blocking && !log[1].blocking);
+        }
+        fire_blocking(&mut n, &id, NeedsInput, NeedsInput, false, at(300));
+        assert_eq!(log.log.lock().unwrap().len(), 2, "done → done is not news");
+    }
+
+    #[test]
+    fn done_escalating_to_blocked_then_resolving_fires_once_more() {
+        // done → blocked inside NeedsInput joins the episode (no toast,
+        // as before) but marks it blocking, so its resolution is news.
+        use Attention::{NeedsInput, Working};
+        let (mut n, log) = notifier_with_log();
+        let id = sid("a");
+        fire_blocking(&mut n, &id, Working, NeedsInput, false, at(100));
+        fire_blocking(&mut n, &id, NeedsInput, NeedsInput, true, at(200));
+        assert_eq!(log.log.lock().unwrap().len(), 1);
+        fire_blocking(&mut n, &id, NeedsInput, NeedsInput, false, at(300));
+        assert_eq!(log.log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_suppressed_blocked_toast_still_counts_for_its_resolution() {
+        // The blocked toast was a startup replay (gated), but the turn
+        // that finishes after the user answers is live news.
+        let (mut n, log) = notifier_with_log();
+        let id = sid("a");
+        n.on_attention_update(
+            &Transition {
+                id: &id,
+                prev: Attention::Working,
+                new: Attention::NeedsInput,
+                title: "t",
+                host: &local(),
+                project: Path::new("/p"),
+                blocking: true,
+                message: None,
+                actively_viewed: false,
+                source_at: Some(SystemTime::UNIX_EPOCH),
+            },
+            at(100),
+        );
+        assert!(log.log.lock().unwrap().is_empty());
+        fire_blocking(
+            &mut n,
+            &id,
+            Attention::NeedsInput,
+            Attention::NeedsInput,
+            false,
+            at(200),
+        );
+        assert_eq!(log.log.lock().unwrap().len(), 1);
     }
 
     /// `fire`, but with the user actively engaged with the transitioning

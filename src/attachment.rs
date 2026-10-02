@@ -1163,6 +1163,18 @@ pub fn pending_spawn_nonce(session_name: &str) -> Option<&str> {
         .filter(|n| !n.is_empty())
 }
 
+/// The agent-mux session id a tmux session name carries under the
+/// `agent-mux-<id>` convention ([`tmux_resume_argv`], `spawn_session`),
+/// else `None`. The inverse mapping, kept here with the convention so the
+/// main loop can turn a live-panes snapshot into opaque `SessionId`s
+/// without spelling the prefix itself.
+#[must_use]
+pub fn session_id_from_tmux_name(session_name: &str) -> Option<&str> {
+    session_name
+        .strip_prefix("agent-mux-")
+        .filter(|id| !id.is_empty())
+}
+
 /// Rename the provisional `agent-mux-pending-<nonce>` session to the
 /// durable `agent-mux-<adopted_id>`, dispatching local vs remote the same
 /// way every other tmux op does. Shared by both drivers' identical

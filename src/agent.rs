@@ -228,12 +228,12 @@ pub trait AgentCli: Send + Sync {
     /// tmux resume fallback (`claude --resume <id>`).
     fn resume_command(&self, id: &SessionId) -> String;
 
-    /// Interpret a live tmux pane's title (`#{pane_title}`, i.e. the OSC
-    /// 0/2 title the agent's TUI sets) as an out-of-band attention signal.
-    /// Some states never reach the transcript — Codex's approval prompts
-    /// are never persisted — but the agent advertises them in its terminal
-    /// title, which the pane poller already reads every tick on every host.
-    /// `None` (the default) means the title carries nothing this agent
+    /// Interpret the terminal title the agent's TUI sets (OSC 0/2) as an
+    /// out-of-band attention signal. Some states never reach the
+    /// transcript — Codex's approval prompts are never persisted — but
+    /// the agent advertises them in its title, which the attachment
+    /// layer already reads for every live session on every host. `None`
+    /// (the default) means the title carries nothing this agent
     /// recognises.
     fn title_signal(&self, _title: &str) -> Option<TitleSignal> {
         None

@@ -25,7 +25,7 @@ use agent_mux::adoption::{ADOPTION_WINDOW, PendingSpawns, uuid_v7_created_at};
 use agent_mux::agent::{AgentKind, agent};
 use agent_mux::attachment::{
     AttachOutcome, AttachmentDriver, EmbedSpec, PtyDriver, SuspendCommand, TmuxDriver,
-    find_pane_local, pending_spawn_nonce, probe_live_writer,
+    find_pane_local, pending_spawn_nonce, probe_live_writer, session_id_from_tmux_name,
 };
 use agent_mux::cache;
 use agent_mux::catalog::{PendingHook, SessionCatalog};
@@ -670,7 +670,7 @@ struct App {
     /// tick for their host (see [`title_blocked_edges`]). Lets the
     /// `LivePanes` arm apply a title signal only on its rising edge
     /// instead of re-pinning (and re-notifying) every 3 s tick.
-    title_blocked: HashSet<(HostId, SessionId)>,
+    title_blocked: HashMap<HostId, HashSet<SessionId>>,
 }
 
 /// Captures the session a parallel-resume confirmation is armed for.
@@ -1012,7 +1012,7 @@ impl App {
             rename: None,
             attach_confirm: None,
             pending_spawns: PendingSpawns::default(),
-            title_blocked: HashSet::new(),
+            title_blocked: HashMap::new(),
         })
     }
 
@@ -2249,6 +2249,7 @@ impl App {
                         update.attention,
                         update.mtime,
                         update.from_tool_use,
+                        update.last_message.as_deref(),
                     );
                     if let Some(mtime) = update.mtime {
                         // Keeps the sidebar's "last activity" cell live
@@ -2325,7 +2326,13 @@ impl App {
                     // (it out-raced discovery) is held, not dropped — the
                     // marker is already consumed — and applied by
                     // `apply_ready_pending_hooks` once the session lands.
-                    if !self.apply_hook(&id, blocking_prompt, received_at, message.as_deref()) {
+                    if !self.apply_hook(
+                        &id,
+                        blocking_prompt,
+                        received_at,
+                        received_at,
+                        message.as_deref(),
+                    ) {
                         self.catalog.defer_hook_event(
                             id,
                             PendingHook {
@@ -2365,8 +2372,9 @@ impl App {
                     cwds,
                     session_names,
                     titles,
+                    captured_at,
                 } => {
-                    self.apply_title_signals(&host, &session_names, &cwds, &titles);
+                    self.apply_title_signals(&host, &session_names, &cwds, &titles, captured_at);
                     let cwd_set: HashSet<PathBuf> = cwds.into_iter().collect();
                     // Keep a codex spawn adoptable for as long as its
                     // provisional `agent-mux-pending-<nonce>` session is
@@ -2390,14 +2398,13 @@ impl App {
                     // to opaque `SessionId`s here so the catalog never
                     // deals in tmux strings (per the "tmux specifics
                     // live behind the Attachment Driver" discipline in
-                    // ARCHITECTURE.md). The convention itself is owned
-                    // by `tmux_resume_argv` in `attachment.rs`; this
-                    // call site recognises the inverse mapping.
+                    // ARCHITECTURE.md). The convention and its inverse
+                    // (`session_id_from_tmux_name`) are owned by
+                    // `attachment.rs`.
                     let live_session_ids: HashSet<SessionId> = session_names
                         .into_iter()
                         .filter_map(|name| {
-                            name.strip_prefix("agent-mux-")
-                                .map(|id| SessionId(id.into()))
+                            session_id_from_tmux_name(&name).map(|id| SessionId(id.into()))
                         })
                         .collect();
                     self.catalog
@@ -2426,15 +2433,24 @@ impl App {
     }
 
     /// Apply one hook event through the normal path: pin + force
-    /// `NeedsInput` in the catalog, fire the notifier transition (with
-    /// `received_at` as `source_at` for the startup-replay gate), and kick
+    /// `NeedsInput` in the catalog, fire the notifier transition, and kick
     /// the turn-end git refresh. Returns `false` when the session isn't in
     /// the catalog (the caller defers the event).
+    ///
+    /// `source_at` is the notifier's startup-replay clock — a hook
+    /// marker's `received_at`, or a pre-startup instant for a pane title
+    /// already reading blocked on agent-mux's first look at a host.
+    ///
+    /// A *non-blocking* hook (an idle nudge) on a session already in
+    /// `NeedsInput` doesn't reach the notifier: it can't be news, and it
+    /// downgrades a blocking prompt, which the notifier would otherwise
+    /// read as the prompt resolving into a turn end (blocked → done).
     fn apply_hook(
         &mut self,
         id: &SessionId,
         blocking_prompt: bool,
         received_at: SystemTime,
+        source_at: SystemTime,
         message: Option<&str>,
     ) -> bool {
         let Some(prev) = self
@@ -2443,13 +2459,15 @@ impl App {
         else {
             return false;
         };
-        self.fire_attention_notification(
-            id,
-            prev,
-            Attention::NeedsInput,
-            Some(received_at),
-            message,
-        );
+        if blocking_prompt || prev != Attention::NeedsInput {
+            self.fire_attention_notification(
+                id,
+                prev,
+                Attention::NeedsInput,
+                Some(source_at),
+                message,
+            );
+        }
         // A hook (permission prompt / turn-end nudge) that moves the
         // session into NeedsInput is the same "agent stopped, user may
         // act" boundary the heuristic arm refreshes on.
@@ -2458,23 +2476,28 @@ impl App {
     }
 
     /// Pane-title signals (Codex's approval title) for one host's pane
-    /// snapshot — applied through the hook path on their rising edge
-    /// only, so a prompt left open across many ticks pins and notifies
-    /// once. Trust-free and host-agnostic: the pane poller already runs
-    /// on every host.
+    /// snapshot, captured at `captured_at` on the poller thread — applied
+    /// through the hook path on their rising edge only, so a prompt left
+    /// open across many ticks pins and notifies once. Trust-free and
+    /// host-agnostic: the pane poller already runs on every host. The pin
+    /// is stamped with the capture time, not the drain time, so a drain
+    /// that runs late (a `--no-embed` handoff) can't stamp it past the
+    /// turn's own later writes.
     ///
-    /// The falling edge releases the pin back to `Working`
+    /// The falling edge releases the pin
     /// ([`SessionCatalog::release_blocking_pin`]). Without it the row
     /// read "blocked" for the rest of the turn after an approval —
-    /// codex's open-turn derivation holds the pin — and, because
-    /// blocked → done never left `NeedsInput`, the turn-end toast never
-    /// fired (found live 2026-10-02).
+    /// codex's open-turn derivation holds the pin (found live
+    /// 2026-10-02). Edges on a host's first snapshot pin without a toast,
+    /// like the hook path's startup-replay gate: the prompt predates this
+    /// run.
     fn apply_title_signals(
         &mut self,
         host: &HostId,
         session_names: &[String],
         cwds: &[PathBuf],
         titles: &[String],
+        captured_at: SystemTime,
     ) {
         let edges = title_blocked_edges(
             host,
@@ -2484,13 +2507,24 @@ impl App {
             titles,
             &mut self.title_blocked,
         );
-        let now = SystemTime::now();
+        let source_at = if edges.first_snapshot {
+            SystemTime::UNIX_EPOCH
+        } else {
+            captured_at
+        };
         for (id, message) in edges.rising {
-            self.apply_hook(&id, true, now, Some(message));
+            self.apply_hook(&id, true, captured_at, source_at, Some(message));
         }
         for id in edges.cleared {
-            if let Some(prev) = self.catalog.release_blocking_pin(&id, now) {
-                self.fire_attention_notification(&id, prev, Attention::Working, Some(now), None);
+            if let Some(release) = self.catalog.release_blocking_pin(&id, captured_at) {
+                self.fire_attention_notification(
+                    &id,
+                    release.previous,
+                    release.attention,
+                    Some(captured_at),
+                    release.last_message.as_deref(),
+                );
+                self.maybe_refresh_git_on_needs_input(&id, release.previous, release.attention);
             }
         }
     }
@@ -2503,6 +2537,7 @@ impl App {
             self.apply_hook(
                 &id,
                 hook.blocking_prompt,
+                hook.received_at,
                 hook.received_at,
                 hook.message.as_deref(),
             );
@@ -4143,41 +4178,60 @@ struct TitleEdges {
     /// empty snapshot is also what a failed `tmux list-panes` produces,
     /// and an agent that exited mid-prompt never reached past it.
     cleared: Vec<SessionId>,
+    /// This is the first non-empty snapshot seen for the host: any
+    /// blocked title predates this run.
+    first_snapshot: bool,
 }
 
 /// Edges of pane-title "blocked" signals for one host's pane snapshot.
-/// Each pane is mapped to a session on `host` — by its `agent-mux-<id>`
-/// tmux session name first, else by cwd when exactly one session on the
-/// host lives there and the pane isn't an `agent-mux-` pane (the same
-/// precedence as attach-side pane resolution) — and its title is read
-/// through that session's agent
-/// ([`agent_mux::agent::AgentCli::title_signal`]). `prev` holds the
-/// sessions whose title read blocked last tick; this host's entries are
-/// updated to the current blocked set (keeping unseen panes', per
-/// [`TitleEdges::cleared`]), so a prompt held open across ticks fires once
-/// and a re-block after it clears fires again. Pure (no I/O) so the
-/// mapping and edge rules are unit-testable without an `App`.
+///
+/// Each pane maps to at most one session on `host`:
+/// - by its `agent-mux-<id>` tmux session name;
+/// - else (an externally-started agent in a plain pane) by cwd, among the
+///   sessions the title is meaningful for — those whose agent reads it as
+///   blocked ([`agent_mux::agent::AgentCli::title_signal`]), or that read
+///   blocked last tick — and that have no named pane of their own, taking
+///   the most recently active. Counting every session ever seen in the
+///   directory instead made any repo with an older session ambiguous, so
+///   the signal was silently dropped.
+///
+/// `prev` holds, per host, the sessions whose title read blocked last
+/// tick; this host's set is updated to the current blocked set (keeping
+/// unseen panes', per [`TitleEdges::cleared`]), so a prompt held open
+/// across ticks fires once and a re-block after it clears fires again.
+/// Pure (no I/O) so the mapping and edge rules are unit-testable without
+/// an `App`.
 fn title_blocked_edges(
     host: &HostId,
     sessions: &[Session],
     session_names: &[String],
     cwds: &[PathBuf],
     titles: &[String],
-    prev: &mut HashSet<(HostId, SessionId)>,
+    prev: &mut HashMap<HostId, HashSet<SessionId>>,
 ) -> TitleEdges {
     use agent_mux::agent::TitleSignal;
+    let first_snapshot = !session_names.is_empty() && !prev.contains_key(host);
+    let host_prev = prev.entry(host.clone()).or_default();
     let on_host: Vec<&Session> = sessions.iter().filter(|s| s.host == *host).collect();
+    let named: HashSet<&str> = session_names
+        .iter()
+        .filter_map(|n| session_id_from_tmux_name(n))
+        .collect();
     let mut seen: HashSet<SessionId> = HashSet::new();
     let mut blocked: Vec<(SessionId, &'static str)> = Vec::new();
     for ((name, cwd), title) in session_names.iter().zip(cwds).zip(titles) {
-        let session = if let Some(id) = name.strip_prefix("agent-mux-") {
+        let session = if let Some(id) = session_id_from_tmux_name(name) {
             on_host.iter().find(|s| s.id.0 == id)
         } else {
-            let mut in_cwd = on_host.iter().filter(|s| s.project_dir == *cwd);
-            match (in_cwd.next(), in_cwd.next()) {
-                (Some(only), None) => Some(only),
-                _ => None,
-            }
+            on_host
+                .iter()
+                .filter(|s| {
+                    s.project_dir == *cwd
+                        && !named.contains(s.id.0.as_str())
+                        && (agent(s.agent).title_signal(title).is_some()
+                            || host_prev.contains(&s.id))
+                })
+                .max_by_key(|s| s.last_activity)
         };
         let Some(session) = session else { continue };
         seen.insert(session.id.clone());
@@ -4187,20 +4241,28 @@ fn title_blocked_edges(
             blocked.push((session.id.clone(), message));
         }
     }
-    let is_blocked = |id: &SessionId| blocked.iter().any(|(b, _)| b == id);
     let rising = blocked
         .iter()
-        .filter(|(id, _)| !prev.contains(&(host.clone(), id.clone())))
+        .filter(|(id, _)| !host_prev.contains(id))
         .cloned()
         .collect();
-    let cleared = prev
+    let cleared = host_prev
         .iter()
-        .filter(|(h, id)| h == host && seen.contains(id) && !is_blocked(id))
-        .map(|(_, id)| id.clone())
+        .filter(|id| seen.contains(*id) && !blocked.iter().any(|(b, _)| b == *id))
+        .cloned()
         .collect();
-    prev.retain(|(h, id)| h != host || !seen.contains(id));
-    prev.extend(blocked.into_iter().map(|(id, _)| (host.clone(), id)));
-    TitleEdges { rising, cleared }
+    host_prev.retain(|id| !seen.contains(id));
+    host_prev.extend(blocked.into_iter().map(|(id, _)| id));
+    if session_names.is_empty() && host_prev.is_empty() {
+        // Don't let an empty (possibly failed) first snapshot count as
+        // the host's first look.
+        prev.remove(host);
+    }
+    TitleEdges {
+        rising,
+        cleared,
+        first_snapshot,
+    }
 }
 
 /// Construct the M4 notifier from the resolved `[notifications]`
@@ -6824,7 +6886,7 @@ mod tests {
     fn title_tick(
         sessions: &[Session],
         panes: &[(&str, &str, &str)],
-        prev: &mut HashSet<(HostId, SessionId)>,
+        prev: &mut HashMap<HostId, HashSet<SessionId>>,
     ) -> Vec<SessionId> {
         let names: Vec<String> = panes.iter().map(|p| p.0.to_string()).collect();
         let cwds: Vec<PathBuf> = panes.iter().map(|p| PathBuf::from(p.1)).collect();
@@ -6840,7 +6902,7 @@ mod tests {
     fn title_tick_cleared(
         sessions: &[Session],
         panes: &[(&str, &str, &str)],
-        prev: &mut HashSet<(HostId, SessionId)>,
+        prev: &mut HashMap<HostId, HashSet<SessionId>>,
     ) -> Vec<SessionId> {
         let names: Vec<String> = panes.iter().map(|p| p.0.to_string()).collect();
         let cwds: Vec<PathBuf> = panes.iter().map(|p| PathBuf::from(p.1)).collect();
@@ -6851,7 +6913,7 @@ mod tests {
     #[test]
     fn title_blocked_edges_clear_when_a_live_pane_stops_reading_blocked() {
         let sessions = vec![codex_session("cx", "/w")];
-        let mut prev = HashSet::new();
+        let mut prev = HashMap::new();
         let blocked = [("agent-mux-cx", "/w", BLOCKED_TITLE)];
         title_tick(&sessions, &blocked, &mut prev);
         assert!(
@@ -6874,7 +6936,7 @@ mod tests {
         // codex that exited mid-prompt never got past it. Neither clears,
         // and the pane coming back still blocked is not a fresh edge.
         let sessions = vec![codex_session("cx", "/w")];
-        let mut prev = HashSet::new();
+        let mut prev = HashMap::new();
         let blocked = [("agent-mux-cx", "/w", BLOCKED_TITLE)];
         title_tick(&sessions, &blocked, &mut prev);
         assert!(title_tick_cleared(&sessions, &[], &mut prev).is_empty());
@@ -6886,7 +6948,7 @@ mod tests {
         // A split in the session's tmux window (a shell beside codex)
         // reports its own title; it must not clear codex's prompt.
         let sessions = vec![codex_session("cx", "/w")];
-        let mut prev = HashSet::new();
+        let mut prev = HashMap::new();
         let panes = [
             ("agent-mux-cx", "/w", BLOCKED_TITLE),
             ("agent-mux-cx", "/w", "zsh"),
@@ -6898,7 +6960,7 @@ mod tests {
     #[test]
     fn title_blocked_edges_fire_once_per_rising_edge() {
         let sessions = vec![codex_session("cx", "/w")];
-        let mut prev = HashSet::new();
+        let mut prev = HashMap::new();
         let blocked = [("agent-mux-cx", "/w", BLOCKED_TITLE)];
         let normal = [("agent-mux-cx", "/w", "proj")];
         assert_eq!(title_tick(&sessions, &blocked, &mut prev), vec![sid("cx")]);
@@ -6915,29 +6977,77 @@ mod tests {
     }
 
     #[test]
-    fn title_blocked_edges_map_unnamed_panes_by_unambiguous_cwd_only() {
-        let mut prev = HashSet::new();
+    fn title_blocked_edges_map_unnamed_panes_by_cwd_to_the_likeliest_session() {
+        let at = |secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let mut prev = HashMap::new();
         // Externally-started codex in a plain tmux pane: matched by cwd.
         let one = vec![codex_session("ext", "/w")];
         assert_eq!(
             title_tick(&one, &[("main", "/w", BLOCKED_TITLE)], &mut prev),
             vec![sid("ext")]
         );
-        // Two sessions in that cwd: ambiguous, so nothing is applied.
-        let mut prev = HashSet::new();
-        let two = vec![codex_session("a", "/w"), codex_session("b", "/w")];
-        assert!(title_tick(&two, &[("main", "/w", BLOCKED_TITLE)], &mut prev).is_empty());
-        // A named pane never falls back to cwd matching.
+        // An older claude session and an older codex session in the same
+        // repo don't make it ambiguous: claude doesn't read codex's title,
+        // and the most recently active codex session wins.
+        let mut prev = HashMap::new();
+        let mut old = codex_session("old", "/w");
+        old.last_activity = at(100);
+        let mut live = codex_session("live", "/w");
+        live.last_activity = at(200);
+        let mut claude = mock_session("cl");
+        claude.project_dir = PathBuf::from("/w");
+        claude.last_activity = at(300);
+        let sessions = vec![old, live, claude];
+        assert_eq!(
+            title_tick(&sessions, &[("main", "/w", BLOCKED_TITLE)], &mut prev),
+            vec![sid("live")]
+        );
+        // ...and its falling edge maps back to the same session.
+        assert_eq!(
+            title_tick_cleared(&sessions, &[("main", "/w", "w")], &mut prev),
+            vec![sid("live")]
+        );
+        // A session with its own named pane isn't a cwd candidate for an
+        // unnamed one, and a named pane never falls back to cwd matching.
+        let mut prev = HashMap::new();
+        assert!(
+            title_tick(
+                &one,
+                &[("agent-mux-ext", "/w", "w"), ("main", "/w", BLOCKED_TITLE)],
+                &mut prev
+            )
+            .is_empty()
+        );
         assert!(
             title_tick(&one, &[("agent-mux-other", "/w", BLOCKED_TITLE)], &mut prev).is_empty()
         );
     }
 
     #[test]
+    fn title_blocked_edges_flag_only_a_hosts_first_non_empty_snapshot() {
+        let sessions = vec![codex_session("cx", "/w")];
+        let mut prev = HashMap::new();
+        let blocked = [("agent-mux-cx", "/w", BLOCKED_TITLE)];
+        let tick = |panes: &[(&str, &str, &str)], prev: &mut HashMap<_, _>| {
+            let names: Vec<String> = panes.iter().map(|p| p.0.to_string()).collect();
+            let cwds: Vec<PathBuf> = panes.iter().map(|p| PathBuf::from(p.1)).collect();
+            let titles: Vec<String> = panes.iter().map(|p| p.2.to_string()).collect();
+            title_blocked_edges(&HostId::local(), &sessions, &names, &cwds, &titles, prev)
+        };
+        // An empty (possibly failed) snapshot doesn't use up the first look.
+        assert!(!tick(&[], &mut prev).first_snapshot);
+        let first = tick(&blocked, &mut prev);
+        assert!(first.first_snapshot && first.rising.len() == 1);
+        assert!(!tick(&[("agent-mux-cx", "/w", "w")], &mut prev).first_snapshot);
+        let again = tick(&blocked, &mut prev);
+        assert!(!again.first_snapshot && again.rising.len() == 1);
+    }
+
+    #[test]
     fn title_blocked_edges_read_titles_through_the_sessions_agent() {
         // A claude session whose pane happens to carry codex's wording
         // is not blocked — interpretation is per agent.
-        let mut prev = HashSet::new();
+        let mut prev = HashMap::new();
         let sessions = vec![mock_session("cl")];
         assert!(
             title_tick(
@@ -6951,7 +7061,7 @@ mod tests {
 
     #[test]
     fn title_blocked_edges_track_hosts_independently() {
-        let mut prev = HashSet::new();
+        let mut prev = HashMap::new();
         let mut remote = codex_session("r", "/w");
         remote.host = HostId("box".into());
         let sessions = vec![codex_session("l", "/w"), remote];

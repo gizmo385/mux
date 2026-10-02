@@ -153,6 +153,10 @@ pub enum WatcherEvent {
         cwds: Vec<PathBuf>,
         session_names: Vec<String>,
         titles: Vec<String>,
+        /// When the poller thread took the snapshot. Title signals pin
+        /// with it, so a late drain can't stamp a pin after the
+        /// transcript writes that followed the prompt.
+        captured_at: SystemTime,
     },
     /// An off-thread [`crate::discovery::build_session`] finished for
     /// `path` on `host` (see [`crate::session_builder`]). Emitted in
@@ -772,12 +776,14 @@ impl TranscriptWatcher {
                     Ok(_) => list_live_panes(host.as_ref()),
                     Err(_) => LivePaneSnapshot::default(),
                 };
+                let captured_at = SystemTime::now();
                 if tx
                     .send(WatcherEvent::LivePanes {
                         host: host_id.clone(),
                         cwds: snap.cwds,
                         session_names: snap.session_names,
                         titles: snap.titles,
+                        captured_at,
                     })
                     .is_err()
                 {

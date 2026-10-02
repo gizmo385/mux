@@ -37,6 +37,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
+use crate::discovery::RejectedTranscript;
 use crate::session::{Attention, HostId, Session, SessionId};
 
 /// Location of the per-host snapshot directory. Returns `None` only
@@ -85,6 +86,77 @@ pub fn write_for_host(dir: &Path, host: &HostId, sessions: &[Session]) -> io::Re
 
 fn cache_file(dir: &Path, host: &HostId) -> PathBuf {
     dir.join(format!("{}.json", host.as_str()))
+}
+
+/// Read the cached reject list for `host` from `dir`. Same best-effort
+/// contract as [`read_for_host`]: any failure yields an empty list, which
+/// simply means "re-announce everything", the pre-cache behaviour.
+#[must_use]
+pub fn read_rejects_for_host(dir: &Path, host: &HostId) -> Vec<RejectedTranscript> {
+    let Ok(bytes) = fs::read(rejects_file(dir, host)) else {
+        return Vec::new();
+    };
+    let cached: Vec<CachedReject> = match serde_json::from_slice(&bytes) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    cached
+        .into_iter()
+        .map(|c| RejectedTranscript {
+            path: c.transcript_path,
+            mtime: epoch_secs_to_systemtime(c.mtime_secs),
+        })
+        .collect()
+}
+
+/// Atomically write `rejected` for `host` into `dir`, alongside the
+/// session snapshot.
+///
+/// Kept in a *separate* file from the session snapshot rather than
+/// folded into it as a second top-level key: the session cache's wire
+/// format is a bare JSON array, so wrapping it in an object to make room
+/// would make every pre-existing snapshot unparseable and silently cost
+/// one startup's worth of first-frame rows. A sibling file costs one
+/// extra `read`/`write` and keeps both schemas independent — the same
+/// "one bad file must not poison the others" reasoning that put each
+/// host in its own file.
+///
+/// # Errors
+/// As [`write_for_host`].
+pub fn write_rejects_for_host(
+    dir: &Path,
+    host: &HostId,
+    rejected: &[RejectedTranscript],
+) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = rejects_file(dir, host);
+    let tmp = path.with_extension("json.tmp");
+    let cached: Vec<CachedReject> = rejected
+        .iter()
+        .map(|r| CachedReject {
+            transcript_path: r.path.clone(),
+            mtime_secs: systemtime_to_epoch_secs(r.mtime),
+        })
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&cached).map_err(io::Error::other)?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn rejects_file(dir: &Path, host: &HostId) -> PathBuf {
+    dir.join(format!("{}.rejects.json", host.as_str()))
+}
+
+/// Wire format for one [`RejectedTranscript`]. Only the path and the
+/// mtime the verdict was made against — a reject carries no session
+/// state because discovery never built one.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedReject {
+    transcript_path: PathBuf,
+    /// Unix epoch seconds, signed for the same clock-skew reason as
+    /// [`CachedSession::last_activity_secs`].
+    mtime_secs: i64,
 }
 
 /// Serde default for [`CachedSession::agent`]: the label of the agent a
@@ -232,6 +304,66 @@ fn epoch_secs_to_systemtime(s: i64) -> SystemTime {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn rejects_round_trip_through_their_own_file() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostId("devbox".into());
+        let rejects = vec![
+            RejectedTranscript {
+                path: PathBuf::from("/r/p/dead.jsonl"),
+                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            },
+            RejectedTranscript {
+                path: PathBuf::from("/r/p/stale.jsonl"),
+                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_500),
+            },
+        ];
+        write_rejects_for_host(tmp.path(), &host, &rejects).unwrap();
+        assert_eq!(read_rejects_for_host(tmp.path(), &host), rejects);
+    }
+
+    #[test]
+    fn rejects_live_beside_the_session_snapshot_without_disturbing_it() {
+        // The session cache's wire format is a bare JSON array; the whole
+        // reason rejects get their own file is that folding them in would
+        // have made every existing snapshot unparseable. Pin that the two
+        // are independent.
+        let tmp = TempDir::new().unwrap();
+        let host = HostId("devbox".into());
+        let sessions = vec![sample_session("abc", &host)];
+        write_for_host(tmp.path(), &host, &sessions).unwrap();
+        write_rejects_for_host(
+            tmp.path(),
+            &host,
+            &[RejectedTranscript {
+                path: PathBuf::from("/r/p/dead.jsonl"),
+                mtime: SystemTime::UNIX_EPOCH,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(read_for_host(tmp.path(), &host).len(), 1);
+        assert_eq!(read_rejects_for_host(tmp.path(), &host).len(), 1);
+    }
+
+    #[test]
+    fn missing_reject_file_reads_as_empty() {
+        // Best-effort: a host that has never been discovered, or whose
+        // file was hand-deleted, must degrade to "re-announce everything"
+        // rather than erroring. That's exactly the pre-cache behaviour.
+        let tmp = TempDir::new().unwrap();
+        assert!(read_rejects_for_host(tmp.path(), &HostId("nope".into())).is_empty());
+    }
+
+    #[test]
+    fn corrupt_reject_file_reads_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostId("devbox".into());
+        fs::create_dir_all(tmp.path()).unwrap();
+        fs::write(rejects_file(tmp.path(), &host), b"{not json").unwrap();
+        assert!(read_rejects_for_host(tmp.path(), &host).is_empty());
+    }
 
     fn sample_session(id: &str, host: &HostId) -> Session {
         Session {

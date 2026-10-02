@@ -33,10 +33,59 @@ pub const DISCOVERY_MAX_AGE: Duration = Duration::from_hours(720);
 /// reads fail. A missing `root` directory is treated as "no sessions"
 /// (see [`crate::host::Host::list_transcripts`]) and yields an empty `Vec`.
 pub fn discover(host: &dyn Host, root: &Path, kind: AgentKind) -> io::Result<Vec<Session>> {
-    let cutoff = SystemTime::now()
+    Ok(discover_with_rejects(host, root, kind)?.sessions)
+}
+
+/// The age cutoff [`discover`] applies, resolved against the current
+/// clock. Shared with the remote poller so a transcript too old for
+/// discovery is also too old to be *announced* as new — without this the
+/// poller would re-admit, three seconds after connect, every session the
+/// cutoff just excluded.
+#[must_use]
+pub fn default_cutoff() -> SystemTime {
+    SystemTime::now()
         .checked_sub(DISCOVERY_MAX_AGE)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    discover_with_cutoff(host, root, kind, cutoff)
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// A transcript that was listed but produced no [`Session`] — discovery
+/// looked at its contents and rejected it (no usable `project_dir`, a
+/// stillborn transcript with no user message, an unparseable path).
+///
+/// Carried out of discovery so the caller can *remember* the verdict.
+/// Rejects never reach the catalog, so they never reach the disk cache
+/// either, which means the remote poller's "have I seen this path?" seed
+/// doesn't know about them and re-announces the same dead file on every
+/// launch — paying a full transcript read each time to reach the same
+/// `None`. `mtime` pins the verdict to the bytes it was made against: a
+/// later write to the file invalidates it and the path is reconsidered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedTranscript {
+    pub path: PathBuf,
+    pub mtime: SystemTime,
+}
+
+/// Everything one discovery pass learned about a (host, agent, root)
+/// triple: the sessions it built, and the transcripts it deliberately
+/// declined to build. A transcript that merely failed to *read* is in
+/// neither list — that's a transient error, not a verdict, and the next
+/// pass should retry it.
+#[derive(Debug, Default)]
+pub struct Discovered {
+    pub sessions: Vec<Session>,
+    pub rejected: Vec<RejectedTranscript>,
+}
+
+/// Variant of [`discover`] that also reports the transcripts it rejected.
+///
+/// # Errors
+/// See [`discover`].
+pub fn discover_with_rejects(
+    host: &dyn Host,
+    root: &Path,
+    kind: AgentKind,
+) -> io::Result<Discovered> {
+    discover_with_cutoff(host, root, kind, default_cutoff())
 }
 
 /// Per-transcript intermediate built during phase 1 of bulk discovery.
@@ -60,7 +109,7 @@ pub fn discover_with_cutoff(
     root: &Path,
     kind: AgentKind,
     cutoff: SystemTime,
-) -> io::Result<Vec<Session>> {
+) -> io::Result<Discovered> {
     // One (host, agent, root) triple: list via this agent's `ListingSpec`
     // and parse via its `parse_meta` / `derive`. Callers iterate
     // (host × enabled agents); each root is a distinct `list_transcripts`,
@@ -72,7 +121,7 @@ pub fn discover_with_cutoff(
         .filter(|s| s.mtime >= cutoff)
         .collect();
     if stats.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Discovered::default());
     }
 
     // Phase 1 — bulk-fetch every transcript in one round-trip. The
@@ -164,7 +213,12 @@ pub fn discover_with_cutoff(
 
     // Phase 4 — assemble sessions from the now-resolved data. No I/O
     // beyond this point; this loop is pure CPU over in-memory inputs.
+    // A partial that assembles to `None` is a *verdict* (stale cwd,
+    // stillborn transcript) and is recorded as a reject; a transcript
+    // that failed the read above never got here and is deliberately
+    // absent from both lists so the next pass retries it.
     let mut sessions = Vec::with_capacity(partials.len());
+    let mut rejected = Vec::new();
     for partial in &partials {
         let project_dir_exists = *exists_by_dir
             .get(partial.project_dir.as_path())
@@ -187,9 +241,14 @@ pub fn discover_with_cutoff(
             partial.attention,
         ) {
             sessions.push(s);
+        } else {
+            rejected.push(RejectedTranscript {
+                path: partial.stat.path.clone(),
+                mtime: partial.stat.mtime,
+            });
         }
     }
-    Ok(sessions)
+    Ok(Discovered { sessions, rejected })
 }
 
 /// Pure session-assembly: given a fully-fetched payload for one
@@ -493,6 +552,39 @@ mod tests {
 
         let sessions = discover_local(&projects).unwrap();
         assert!(sessions.is_empty(), "got: {sessions:?}");
+    }
+
+    #[test]
+    fn filtered_transcript_is_reported_as_a_reject() {
+        // The flip side of the stillborn filter: dropping the session
+        // from the dashboard is right, but the *verdict* has to escape
+        // discovery too. Without it the remote poller re-announces the
+        // same dead transcript on every launch (it's not in the session
+        // cache, so the poll seed never learns it exists) and pays a full
+        // transcript read each time to reach the same `None`.
+        let (_tmp, projects, cwd) = setup_with_real_cwd();
+        let entry = projects.join("-real-cwd");
+        create_dir_all(&entry).unwrap();
+        let dead = entry.join("dead.jsonl");
+        fs::write(
+            &dead,
+            format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+        )
+        .unwrap();
+        fs::write(
+            entry.join("alive.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":\"hi\"}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let found = discover_with_rejects(&LocalHost::new(), &projects, AgentKind::Claude).unwrap();
+        assert_eq!(found.sessions.len(), 1);
+        assert_eq!(found.sessions[0].id.0, "alive");
+        assert_eq!(found.rejected.len(), 1, "{:?}", found.rejected);
+        assert_eq!(found.rejected[0].path, dead);
     }
 
     #[test]
@@ -1060,13 +1152,18 @@ mod tests {
         set_mtime(&path, now - Duration::from_hours(1440));
 
         let cutoff = now - Duration::from_hours(720);
-        let sessions =
-            discover_with_cutoff(&LocalHost::new(), &projects, AgentKind::Claude, cutoff)
-                .expect("discover");
+        let found = discover_with_cutoff(&LocalHost::new(), &projects, AgentKind::Claude, cutoff)
+            .expect("discover");
         assert!(
-            sessions.is_empty(),
-            "cold transcript should be filtered: {sessions:?}"
+            found.sessions.is_empty(),
+            "cold transcript should be filtered: {:?}",
+            found.sessions
         );
+        // And it is filtered at the *listing* boundary, not by a content
+        // verdict — so it must not be reported as a reject either. A cold
+        // transcript isn't "dead", it's just out of the window; recording
+        // it as a reject would suppress it forever if it later warms up.
+        assert!(found.rejected.is_empty(), "{:?}", found.rejected);
     }
 
     #[test]
@@ -1092,11 +1189,10 @@ mod tests {
         set_mtime(&path, now - Duration::from_hours(120));
 
         let cutoff = now - Duration::from_hours(720);
-        let sessions =
-            discover_with_cutoff(&LocalHost::new(), &projects, AgentKind::Claude, cutoff)
-                .expect("discover");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id.0, "warm");
+        let found = discover_with_cutoff(&LocalHost::new(), &projects, AgentKind::Claude, cutoff)
+            .expect("discover");
+        assert_eq!(found.sessions.len(), 1);
+        assert_eq!(found.sessions[0].id.0, "warm");
     }
 
     #[test]

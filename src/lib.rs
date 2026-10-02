@@ -22,6 +22,7 @@ pub mod notifications;
 pub mod quickswitcher;
 pub mod repo;
 pub mod session;
+pub mod session_builder;
 pub mod session_names;
 pub mod tool_launches;
 pub mod watcher;

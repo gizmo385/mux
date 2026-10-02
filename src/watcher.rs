@@ -11,7 +11,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use crate::agent::{AgentDerivation, AgentKind, agent};
 use crate::attachment::{LivePaneSnapshot, list_live_panes};
 use crate::host::Host;
-use crate::session::{Attention, HostId, SessionId};
+use crate::session::{Attention, HostId, Session, SessionId};
 
 /// How much of the transcript's tail to read when deriving attention.
 /// Transcripts are append-only JSONL; reading the last few KB is enough
@@ -119,6 +119,27 @@ pub enum WatcherEvent {
         host: HostId,
         cwds: Vec<PathBuf>,
         session_names: Vec<String>,
+    },
+    /// An off-thread [`crate::discovery::build_session`] finished for
+    /// `path` on `host` (see [`crate::session_builder`]). Emitted in
+    /// response to the main loop's handling of a [`Self::NewTranscript`],
+    /// which no longer does that construction itself — on a remote host
+    /// it is four sequential SSH round-trips, and doing them inline froze
+    /// the dashboard for seconds per transcript.
+    ///
+    /// `session` is `None` when the transcript yielded nothing usable:
+    /// a read failure, or a deliberate discovery filter (no surviving
+    /// `project_dir`, a stillborn transcript). The event is emitted
+    /// either way, because `path` is what clears the builder's in-flight
+    /// marker — drop the `None` case and a partially-written transcript
+    /// could never be retried.
+    ///
+    /// Boxed because a `Session` is much larger than every other variant
+    /// in this enum and would otherwise set the size of all of them.
+    SessionBuilt {
+        host: HostId,
+        path: PathBuf,
+        session: Option<Box<Session>>,
     },
     /// A background `git status` refresh (see [`crate::git_status`])
     /// finished for `id` on `host`. `changed` is the absolute path of
@@ -438,6 +459,16 @@ impl TranscriptWatcher {
     /// discovery and the first poll tick still surfaces a live
     /// `Attention` update.
     ///
+    /// `rejected` seeds the complementary set: paths a *previous* run's
+    /// discovery read and declined to build a session from. They never
+    /// reach the catalog, so they never reach the disk cache `initial` is
+    /// built from — without this second seed the poller treats every such
+    /// path as brand new on every launch and asks the dashboard to build
+    /// a session from it, paying a full transcript read to reach the same
+    /// rejection. Both seeds are optimisations: startup discovery runs
+    /// independently and remains authoritative, so a stale or empty
+    /// reject list costs work, never correctness.
+    ///
     /// The thread terminates cleanly when the event receiver drops
     /// (i.e. the dashboard exits). No explicit shutdown handle.
     ///
@@ -454,15 +485,13 @@ impl TranscriptWatcher {
         host: Arc<dyn Host>,
         roots: Vec<(AgentKind, PathBuf)>,
         initial: Vec<(SessionId, PathBuf, SystemTime)>,
+        rejected: Vec<crate::discovery::RejectedTranscript>,
         interval: Duration,
     ) {
         let tx = self.event_tx.clone();
         thread::spawn(move || {
             let host_id = host.id().clone();
-            let mut known: HashMap<PathBuf, (SessionId, SystemTime)> = initial
-                .into_iter()
-                .map(|(id, path, mtime)| (path, (id, mtime)))
-                .collect();
+            let mut state = PollState::new(initial, rejected);
             // WP8: hook markers live under each enabled agent's
             // `<root>/.agent-mux-hooks/` (claude + codex today). Poll each
             // one per tick over the same ControlMaster — an idle N-agent
@@ -503,13 +532,16 @@ impl TranscriptWatcher {
                         continue;
                     }
                 }
+                // Re-resolve the admission cutoff so the window slides
+                // with the clock rather than freezing at process start.
+                state.cutoff = crate::discovery::default_cutoff();
                 // One `find` per enabled agent root per tick. An idle
                 // N-agent host therefore costs N cheap finds (mtime-skip
                 // keeps the per-transcript reads down to actual changes);
                 // only *enabled* agents cost anything, and a root whose
                 // directory doesn't exist folds into an empty listing.
                 for (kind, root) in &roots {
-                    if !poll_once(host.as_ref(), &host_id, root, *kind, &mut known, &tx) {
+                    if !poll_once(host.as_ref(), &host_id, root, *kind, &mut state, &tx) {
                         return;
                     }
                 }
@@ -642,6 +674,47 @@ fn poll_hooks_once(host: &dyn Host, hooks_dir: &Path, tx: &Sender<WatcherEvent>)
     true
 }
 
+/// State the per-host polling loop carries between ticks, shared across
+/// every (agent, root) pair on that host.
+///
+/// Both maps exist to answer "have I already dealt with this path?"
+/// without touching the network. `known` answers it for paths that
+/// became sessions; `rejected` answers it for paths startup discovery
+/// deliberately declined — a distinction that matters because only the
+/// former reach the catalog, and therefore only the former survive into
+/// the disk cache that seeds the next launch.
+pub(crate) struct PollState {
+    /// Path → (session id, the newest mtime we've already reported).
+    known: HashMap<PathBuf, (SessionId, SystemTime)>,
+    /// Path → the mtime a discovery verdict of "not a session" was made
+    /// against. Seeded from the previous run's reject cache. A path in
+    /// here is skipped silently while its mtime is unchanged; a write to
+    /// the file invalidates the verdict and the path is reconsidered.
+    rejected: HashMap<PathBuf, SystemTime>,
+    /// Transcripts with an mtime older than this are never *announced*
+    /// as new. Mirrors the cutoff [`crate::discovery::discover`] applies,
+    /// refreshed each tick so the window slides with the clock. Sessions
+    /// already in `known` are unaffected — this gates admission, not
+    /// tracking.
+    cutoff: SystemTime,
+}
+
+impl PollState {
+    pub(crate) fn new(
+        initial: Vec<(SessionId, PathBuf, SystemTime)>,
+        rejected: Vec<crate::discovery::RejectedTranscript>,
+    ) -> Self {
+        Self {
+            known: initial
+                .into_iter()
+                .map(|(id, path, mtime)| (path, (id, mtime)))
+                .collect(),
+            rejected: rejected.into_iter().map(|r| (r.path, r.mtime)).collect(),
+            cutoff: crate::discovery::default_cutoff(),
+        }
+    }
+}
+
 /// One tick of the remote poller. Returns `false` iff the receiver
 /// dropped (the dashboard exited), at which point the caller exits
 /// the loop. Errors from `list_transcripts` are swallowed — a
@@ -652,15 +725,15 @@ fn poll_once(
     host_id: &HostId,
     root: &Path,
     kind: AgentKind,
-    known: &mut HashMap<PathBuf, (SessionId, SystemTime)>,
+    state: &mut PollState,
     tx: &Sender<WatcherEvent>,
 ) -> bool {
     let cli = agent(kind);
-    let Ok(stats) = host.list_transcripts(root, &cli.listing()) else {
+    let Ok(listing) = host.list_transcripts(root, &cli.listing()) else {
         return true;
     };
-    for stat in stats {
-        if let Some((id, last_seen)) = known.get_mut(&stat.path) {
+    for stat in listing {
+        if let Some((id, last_seen)) = state.known.get_mut(&stat.path) {
             // mtime-skip: the only way a transcript's derived attention
             // changes is via a write to it, and a write advances mtime.
             // Skipping unchanged files keeps the cost of an idle host
@@ -684,10 +757,35 @@ fn poll_once(
             }
             continue;
         }
+        // An unknown path. Two gates before announcing it, both of them
+        // re-applying a decision startup discovery already made — the
+        // poller lists the raw tree, so without them it re-admits three
+        // seconds after connect exactly what discovery filtered out, and
+        // every admission costs a transcript read to build the session.
+        //
+        // (1) Age. `discover` drops transcripts older than
+        // `DISCOVERY_MAX_AGE` at the listing boundary; a poller with no
+        // equivalent bound would hand the dashboard every months-cold
+        // conversation on the host, silently undoing the filter.
+        if stat.mtime < state.cutoff {
+            continue;
+        }
+        // (2) A standing reject. Discovery read this file and declined
+        // to build a session from it. The verdict holds while the bytes
+        // do; a write invalidates it and we fall through to announce.
+        match state.rejected.get(&stat.path) {
+            Some(verdict_mtime) if stat.mtime <= *verdict_mtime => continue,
+            Some(_) => {
+                state.rejected.remove(&stat.path);
+            }
+            None => {}
+        }
         let Some(id) = cli.session_id_from_path(&stat.path) else {
             continue;
         };
-        known.insert(stat.path.clone(), (id.clone(), stat.mtime));
+        state
+            .known
+            .insert(stat.path.clone(), (id.clone(), stat.mtime));
         if tx
             .send(WatcherEvent::NewTranscript {
                 host: host_id.clone(),
@@ -1047,16 +1145,24 @@ mod tests {
 "#
     }
 
+    /// Build a [`PollState`] for the `poll_once` tests. The mock host's
+    /// timestamps are small seconds-since-epoch values, far older than the
+    /// real 30-day admission window, so the cutoff is pinned open here —
+    /// these tests are about event emission; the age gate has its own
+    /// tests below.
+    fn poll_state(initial: Vec<(SessionId, PathBuf, SystemTime)>) -> PollState {
+        let mut state = PollState::new(initial, Vec::new());
+        state.cutoff = UNIX_EPOCH;
+        state
+    }
+
     #[test]
     fn poll_once_emits_nothing_when_no_transcripts_changed() {
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/s.jsonl");
         host.put(&path, assistant_line(), ts(100));
 
-        let mut known: HashMap<PathBuf, (SessionId, SystemTime)> =
-            [(path.clone(), (SessionId("s".into()), ts(100)))]
-                .into_iter()
-                .collect();
+        let mut state = poll_state(vec![(SessionId("s".into()), path.clone(), ts(100))]);
         let (tx, rx) = mpsc::channel();
 
         assert!(poll_once(
@@ -1064,7 +1170,7 @@ mod tests {
             host.id(),
             Path::new("/r"),
             AgentKind::Claude,
-            &mut known,
+            &mut state,
             &tx
         ));
         assert!(drain(&rx).is_empty());
@@ -1078,17 +1184,14 @@ mod tests {
         // derives to NeedsInput.
         host.put(&path, assistant_line(), ts(200));
 
-        let mut known: HashMap<PathBuf, (SessionId, SystemTime)> =
-            [(path.clone(), (SessionId("s".into()), ts(100)))]
-                .into_iter()
-                .collect();
+        let mut state = poll_state(vec![(SessionId("s".into()), path.clone(), ts(100))]);
         let (tx, rx) = mpsc::channel();
         poll_once(
             &host,
             host.id(),
             Path::new("/r"),
             AgentKind::Claude,
-            &mut known,
+            &mut state,
             &tx,
         );
 
@@ -1106,7 +1209,7 @@ mod tests {
         }
         // Known-set should now record the new mtime so the next tick
         // doesn't re-emit.
-        assert_eq!(known.get(&path).unwrap().1, ts(200));
+        assert_eq!(state.known.get(&path).unwrap().1, ts(200));
     }
 
     #[test]
@@ -1115,14 +1218,14 @@ mod tests {
         let path = PathBuf::from("/r/p/fresh.jsonl");
         host.put(&path, user_line(), ts(50));
 
-        let mut known: HashMap<PathBuf, (SessionId, SystemTime)> = HashMap::new();
+        let mut state = poll_state(Vec::new());
         let (tx, rx) = mpsc::channel();
         poll_once(
             &host,
             host.id(),
             Path::new("/r"),
             AgentKind::Claude,
-            &mut known,
+            &mut state,
             &tx,
         );
 
@@ -1157,10 +1260,156 @@ mod tests {
             host.id(),
             Path::new("/r"),
             AgentKind::Claude,
-            &mut known,
+            &mut state,
             &tx2,
         );
         assert!(drain(&rx2).is_empty());
+    }
+
+    #[test]
+    fn poll_once_does_not_announce_a_transcript_older_than_the_cutoff() {
+        // The poller lists the raw transcript tree, with none of the age
+        // filtering `discover` applies at its own listing boundary. Without
+        // this gate every months-cold conversation on a remote host is
+        // announced as new within one tick of connecting — silently undoing
+        // DISCOVERY_MAX_AGE, and costing a full transcript read apiece to
+        // build rows the filter exists to suppress.
+        let host = MockHost::new("devbox");
+        let cold = PathBuf::from("/r/p/cold.jsonl");
+        let warm = PathBuf::from("/r/p/warm.jsonl");
+        host.put(&cold, user_line(), ts(100));
+        host.put(&warm, user_line(), ts(500));
+
+        let mut state = poll_state(Vec::new());
+        state.cutoff = ts(300);
+        let (tx, rx) = mpsc::channel();
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut state,
+            &tx,
+        );
+
+        let events = drain(&rx);
+        let announced: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                WatcherEvent::NewTranscript { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, vec![warm], "got: {events:?}");
+        // The cold path is skipped, not remembered: it must stay out of
+        // the known-set so a later write re-admits it.
+        assert!(!state.known.contains_key(&cold));
+    }
+
+    #[test]
+    fn poll_once_reconsiders_a_cold_transcript_once_it_is_written_to() {
+        // Resuming a months-old conversation advances its mtime past the
+        // cutoff, and the session has to appear.
+        let host = MockHost::new("devbox");
+        let path = PathBuf::from("/r/p/revived.jsonl");
+        host.put(&path, user_line(), ts(100));
+
+        let mut state = poll_state(Vec::new());
+        state.cutoff = ts(300);
+        let (tx, rx) = mpsc::channel();
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut state,
+            &tx,
+        );
+        assert!(drain(&rx).is_empty());
+
+        host.put(&path, user_line(), ts(900));
+        let (tx2, rx2) = mpsc::channel();
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut state,
+            &tx2,
+        );
+        let events = drain(&rx2);
+        assert!(
+            matches!(events.first(), Some(WatcherEvent::NewTranscript { path: p, .. }) if p == &path),
+            "got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn poll_once_stays_silent_for_a_standing_reject() {
+        // A transcript a previous run's discovery declined. It isn't in
+        // the session cache (it never became a row), so without the reject
+        // seed the poller calls it new on every launch and the dashboard
+        // pays a full transcript read to reach the same rejection.
+        let host = MockHost::new("devbox");
+        let path = PathBuf::from("/r/p/dead.jsonl");
+        host.put(&path, user_line(), ts(500));
+
+        let mut state = PollState::new(
+            Vec::new(),
+            vec![crate::discovery::RejectedTranscript {
+                path: path.clone(),
+                mtime: ts(500),
+            }],
+        );
+        state.cutoff = UNIX_EPOCH;
+        let (tx, rx) = mpsc::channel();
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut state,
+            &tx,
+        );
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[test]
+    fn poll_once_reconsiders_a_reject_whose_transcript_changed() {
+        // The verdict is pinned to the bytes it was made against. A write
+        // means discovery hasn't seen this content, so the path is live
+        // again — otherwise a stillborn transcript the user later typed
+        // into would stay invisible until the next launch.
+        let host = MockHost::new("devbox");
+        let path = PathBuf::from("/r/p/revived.jsonl");
+        host.put(&path, user_line(), ts(900));
+
+        let mut state = PollState::new(
+            Vec::new(),
+            vec![crate::discovery::RejectedTranscript {
+                path: path.clone(),
+                mtime: ts(500),
+            }],
+        );
+        state.cutoff = UNIX_EPOCH;
+        let (tx, rx) = mpsc::channel();
+        poll_once(
+            &host,
+            host.id(),
+            Path::new("/r"),
+            AgentKind::Claude,
+            &mut state,
+            &tx,
+        );
+
+        let events = drain(&rx);
+        assert!(
+            matches!(events.first(), Some(WatcherEvent::NewTranscript { path: p, .. }) if p == &path),
+            "got: {events:?}"
+        );
+        // And the spent verdict is dropped, so it can't suppress a future
+        // tick for the same path.
+        assert!(!state.rejected.contains_key(&path));
     }
 
     #[test]
@@ -1175,14 +1424,14 @@ mod tests {
         );
         host.put(&path, user_line(), ts(50));
 
-        let mut known: HashMap<PathBuf, (SessionId, SystemTime)> = HashMap::new();
+        let mut state = poll_state(Vec::new());
         let (tx, rx) = mpsc::channel();
         poll_once(
             &host,
             host.id(),
             Path::new("/r"),
             AgentKind::Codex,
-            &mut known,
+            &mut state,
             &tx,
         );
 
@@ -1254,14 +1503,14 @@ mod tests {
             }
         }
         let host = FlakyHost(HostId("flaky".into()));
-        let mut known = HashMap::new();
+        let mut state = poll_state(Vec::new());
         let (tx, rx) = mpsc::channel();
         assert!(poll_once(
             &host,
             host.id(),
             Path::new("/r"),
             AgentKind::Claude,
-            &mut known,
+            &mut state,
             &tx
         ));
         assert!(drain(&rx).is_empty());
@@ -1272,10 +1521,7 @@ mod tests {
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/s.jsonl");
         host.put(&path, assistant_line(), ts(200));
-        let mut known: HashMap<PathBuf, (SessionId, SystemTime)> =
-            [(path.clone(), (SessionId("s".into()), ts(100)))]
-                .into_iter()
-                .collect();
+        let mut state = poll_state(vec![(SessionId("s".into()), path.clone(), ts(100))]);
 
         let (tx, rx) = mpsc::channel();
         drop(rx);
@@ -1285,7 +1531,7 @@ mod tests {
                 host.id(),
                 Path::new("/r"),
                 AgentKind::Claude,
-                &mut known,
+                &mut state,
                 &tx
             ),
             "should signal shutdown when no receiver"
@@ -1303,14 +1549,14 @@ mod tests {
         let host = MockHost::new("devbox");
         let path = PathBuf::from("/r/p/.hidden");
         host.put(&path, "{}\n", ts(10));
-        let mut known = HashMap::new();
+        let mut state = poll_state(Vec::new());
         let (tx, rx) = mpsc::channel();
         assert!(poll_once(
             &host,
             host.id(),
             Path::new("/r"),
             AgentKind::Claude,
-            &mut known,
+            &mut state,
             &tx
         ));
         // `.hidden` has stem ".hidden" (no extension), so it does emit.

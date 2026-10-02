@@ -40,7 +40,7 @@ use agent_mux::dashboard::{
 use agent_mux::delete_worktree_modal::{
     DeleteWorktreeModal, KeyOutcome as DeleteWorktreeKeyOutcome,
 };
-use agent_mux::discovery::{build_session, discover};
+use agent_mux::discovery::{RejectedTranscript, discover, discover_with_rejects};
 use agent_mux::edited_files_modal::{EditedFileEntry, EditedFilesModal, EditedFilesOutcome};
 use agent_mux::embedded_pty::{
     EmbeddedPty, PtyEvent, encode_key_for_pty, encode_mouse_event, encode_paste,
@@ -56,6 +56,7 @@ use agent_mux::quickswitcher::{
 };
 use agent_mux::repo::{Repo, RepoRegistry, scan_host_workspaces};
 use agent_mux::session::{Attention, HostId, Session, SessionId};
+use agent_mux::session_builder::SessionBuilders;
 use agent_mux::session_names::{SessionNameStore, default_store_path};
 use agent_mux::tool_launches::{ToolLaunch, ToolLaunchRegistry};
 use agent_mux::watcher::{REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent};
@@ -471,6 +472,18 @@ struct App {
     /// back-pressure session discovery.
     repo_scan_tx: Sender<RepoScanResult>,
     repo_scan_rx: Receiver<RepoScanResult>,
+    /// Per-host workers that run [`agent_mux::discovery::build_session`]
+    /// off the UI thread. The main loop requests a build when the watcher
+    /// announces an unknown transcript and applies the result when the
+    /// matching `SessionBuilt` event comes back; it never does the I/O
+    /// itself. See `session_builder` for why.
+    builders: SessionBuilders,
+    /// Per-host transcripts a *previous* run's discovery declined to turn
+    /// into sessions, loaded from the disk cache at startup. Handed to
+    /// each host's poller when it connects so a known-dead transcript
+    /// isn't re-announced (and re-read) on every launch. Empty for hosts
+    /// with no cache file, which simply restores the previous behaviour.
+    host_rejects: HashMap<HostId, Vec<RejectedTranscript>>,
     /// Background SSH discovery results stream in here for the lifetime of
     /// the app — one message per configured host (success or failure).
     /// Drained each tick; once every configured host has reported, the
@@ -794,11 +807,20 @@ impl App {
         // entries that no longer exist on the remote and refreshing
         // attention/title on the rest. Caching is best-effort —
         // missing/corrupt files silently yield empty lists.
+        // The reject half of the same snapshot: transcripts the previous
+        // run's discovery read and declined. They never become rows, so
+        // they're loaded into a side map rather than the catalog, and
+        // handed to each host's poller at `Connected` time.
+        let mut host_rejects: HashMap<HostId, Vec<RejectedTranscript>> = HashMap::new();
         if let Some(dir) = cache_dir.as_ref() {
             for name in config.hosts.keys() {
                 let host_id = HostId(name.clone());
                 for session in cache::read_for_host(dir, &host_id) {
                     catalog.add(session);
+                }
+                let rejects = cache::read_rejects_for_host(dir, &host_id);
+                if !rejects.is_empty() {
+                    host_rejects.insert(host_id, rejects);
                 }
             }
         }
@@ -867,6 +889,8 @@ impl App {
         let notifier = build_notifier(&config.notifications);
         let theme = Theme::from_config(&config.theme).map_err(io::Error::other)?;
 
+        let builders = SessionBuilders::new(watcher.event_sender());
+
         Ok(Self {
             catalog,
             list_state,
@@ -891,6 +915,8 @@ impl App {
             repo_scan_tx,
             repo_scan_rx,
             creating: None,
+            builders,
+            host_rejects,
             remote_rx,
             pending_hosts,
             connect_errors: Vec::new(),
@@ -1339,10 +1365,19 @@ impl App {
                         .map(|s| (s.id.clone(), s.transcript_path.clone(), s.last_activity))
                         .collect();
                     self.hosts.insert(host_id.clone(), Arc::clone(&host));
+                    // The reject half of the seed (see `host_rejects`).
+                    // Taken, not cloned: `Connected` fires exactly once
+                    // per host (a later dead-master recovery happens
+                    // inside the poller via `ensure_connected`, which
+                    // never re-enters this arm), so the map has no second
+                    // reader and holding the paths after handoff would
+                    // just be a leak.
+                    let reject_seed = self.host_rejects.remove(&host_id).unwrap_or_default();
                     self.watcher.start_polling_host(
                         Arc::clone(&host),
                         roots,
                         poll_seed,
+                        reject_seed,
                         REMOTE_POLL_INTERVAL,
                     );
                     // Pane-presence polling on the same cadence.
@@ -2231,6 +2266,13 @@ impl App {
                     self.try_adopt_spawn(&host, agent, &path);
                     self.handle_new_transcript(&host, agent, &path, mtime);
                 }
+                WatcherEvent::SessionBuilt {
+                    host,
+                    path,
+                    session,
+                } => {
+                    self.handle_session_built(&host, &path, session);
+                }
                 WatcherEvent::LivePanes {
                     host,
                     cwds,
@@ -2371,11 +2413,21 @@ impl App {
     }
 
     /// React to a watcher-emitted "previously-unknown transcript appeared"
-    /// event. The file may be only partially written on the first event,
-    /// in which case `build_session` returns `Ok(None)` (no usable cwd
-    /// yet) and we silently drop it — the next event re-fires
-    /// `NewTranscript` and we retry until the file has enough content to
-    /// build a session from.
+    /// event by *queuing* the session build, not performing it.
+    ///
+    /// `build_session` reads the transcript and three more paths through
+    /// the host; on a remote that is four sequential SSH round-trips and
+    /// seconds of wall-clock. This method runs on the main event loop, so
+    /// doing that work inline froze the dashboard once per newly-seen
+    /// transcript — the startup lockup measured 2026-10-01. The build now
+    /// happens on the host's builder thread and comes back as
+    /// [`WatcherEvent::SessionBuilt`], handled by
+    /// [`Self::handle_session_built`].
+    ///
+    /// A file that is only partially written still builds to nothing; the
+    /// watcher re-fires `NewTranscript` and the request is made again once
+    /// the first one has reported (see `session_builder`'s in-flight
+    /// de-duplication), so the retry contract is unchanged.
     fn handle_new_transcript(
         &mut self,
         host_id: &HostId,
@@ -2386,13 +2438,33 @@ impl App {
         let Some(host) = self.hosts.get(host_id).cloned() else {
             return;
         };
-        let Ok(Some(session)) = build_session(host.as_ref(), path, kind, mtime) else {
+        self.builders
+            .request(host_id, &host, kind, path.to_path_buf(), mtime);
+    }
+
+    /// Apply a finished off-thread session build. This is the second half
+    /// of what [`Self::handle_new_transcript`] used to do inline, with all
+    /// the I/O already paid for on a background thread — everything here
+    /// is in-memory catalog and UI state.
+    fn handle_session_built(
+        &mut self,
+        host_id: &HostId,
+        path: &Path,
+        session: Option<Box<Session>>,
+    ) {
+        // Clear the in-flight marker first and unconditionally: a build
+        // that yielded nothing must leave the path requestable, or a
+        // transcript that was mid-write when we first saw it could never
+        // be picked up.
+        self.builders.finish(host_id, path);
+        let Some(session) = session else {
             return;
         };
         let id = session.id.clone();
+        let kind = session.agent;
         let attention = session.attention;
         let transcript_path = session.transcript_path.clone();
-        if !self.catalog.add(session) {
+        if !self.catalog.add(*session) {
             return;
         }
         if self.list_state.selected().is_none() {
@@ -3367,9 +3439,13 @@ fn connect_and_discover(
     // missing agent costs one cheap `find` and yields nothing rather than
     // erroring the whole host.
     let mut sessions = Vec::new();
+    let mut rejected = Vec::new();
     for (kind, root) in roots {
-        match discover(host.as_ref(), root, *kind) {
-            Ok(s) => sessions.extend(s),
+        match discover_with_rejects(host.as_ref(), root, *kind) {
+            Ok(found) => {
+                sessions.extend(found.sessions);
+                rejected.extend(found.rejected);
+            }
             Err(e) => {
                 let _ = tx.send(RemoteDiscoveryResult::Failed {
                     host_id,
@@ -3389,6 +3465,11 @@ fn connect_and_discover(
     // discovery, since the cache is strictly an optimisation.
     if let Some(dir) = cache_dir {
         let _ = cache::write_for_host(&dir, &host_id, &sessions);
+        // Sibling snapshot: the transcripts this pass looked at and
+        // declined. Next launch seeds the poller with both halves, so a
+        // dead transcript stops being re-announced (and re-read in full)
+        // on every start. Best-effort for the same reason as above.
+        let _ = cache::write_rejects_for_host(&dir, &host_id, &rejected);
     }
     let _ = tx.send(RemoteDiscoveryResult::Ready { host_id, sessions });
 }

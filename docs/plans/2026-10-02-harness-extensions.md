@@ -1,6 +1,6 @@
 # Plan: generalizing agent support into pluggable harnesses
 
-Status: **draft for review, 2026-10-02.** Nothing in §4–§5 is implemented. §7 records the investigation of wrapping a general, agent-agnostic layer instead; its conclusion is that this folds into this design as extra sources rather than replacing it. Follows on from `docs/plans/2026-07-09-multi-agent-cli.md`, which put Claude Code, Codex and Pi behind the `AgentCli` trait.
+Status: **draft for review, 2026-10-02.** Nothing in §4–§5 is implemented. §7 records the investigation of wrapping a general, agent-agnostic layer instead; its conclusion is that this folds into this design as extra sources rather than replacing it. §9 records the adapter-protocol spike (branch `worktree-agent-a72cf8d720073d635`, `SPIKE.md`, not for merging), which found the protocol viable and confirmed the H1–H7 ordering. Follows on from `docs/plans/2026-07-09-multi-agent-cli.md`, which put Claude Code, Codex and Pi behind the `AgentCli` trait.
 
 Origin: the user asked, after a 2026-10-02 notification-parity audit of Codex/Pi, for a spec that makes new harnesses easier to add. Each harness should be able to supply its own handling for notifications, remote support, setup checks and so on. Driving example: a work harness whose session state is only available through a **remote task-execution HTTP API**, with no transcript file and possibly no tmux pane. That harness is *not* to be built now; the design must leave a clean place for it.
 
@@ -117,6 +117,11 @@ Today's hook "pin" rule, restated for the new model:
   - A harness can mark its heuristic `Working` reports as **not** releasing a pin. That is today's `from_tool_use` flag, renamed `Status { .. }.holds_pin` so its meaning is explicit.
 - **Heuristic** status applies when nothing above it is pinned.
 - **Signals for unknown keys** go into a pending table with a time limit and are applied on `Upsert`. This is the 2026-10-02 bug fix, generalized.
+- **Lessons from the pane-title signal (shipped 2026-10-02).** Three event-ordering bugs were found in a single pin-release path, which is the case for writing H2 as a pure, table-driven state machine:
+  - **Stamp a signal with the producer's clock** (`observed_at`), never the drain time. A late drain otherwise pins *after* the writes that followed the prompt, and the turn end is suppressed for good.
+  - **A release replays what was held back.** Keep the latest status a pin suppressed and apply it on release, instead of guessing a state.
+  - **A signal with a falling edge** (a title that clears) can release its own pin; a fire-once hook can't. `SignalSetup` should declare which kind it is.
+  - **A blocking prompt resolving inside the same coarse state** (blocked → done) is a new notification episode.
 
 ### 4.4 Capabilities a harness provides
 
@@ -165,6 +170,15 @@ Notes on the table:
    - **Isolation:** the HTTP client, auth, retries and API quirks live in the adapter, in whatever language the work team prefers. agent-mux never holds the credentials.
    - **Supervision:** crash means restart with backoff and a footer error, mirroring `ensure_connected`. Requests have timeouts. Capabilities are negotiated in `initialize`.
    - This is how the work harness lands without a Rust change, and without loading unsafe code into agent-mux's process.
+   - **Spike findings (§9) that change this sketch:**
+     - Requests carry an `id`, and responses echo it.
+     - Events carry `observed_at_ms`, the API's clock, which makes the startup-replay gate and pin ordering work for free.
+     - `initialize` must be awaited with a timeout and its capabilities honoured.
+     - Every request needs a timeout.
+     - A `gone` event is required.
+     - `blocked` carries `kind` (`approval` | `input` | `auth`), and `awaiting_input` carries ACP's `stop_reason` verbatim.
+     - Attach plans are fetched right after `upsert` and cached, so Enter does no I/O.
+     - A command plan that exits 0 at once (a finished task's log) needs the pane to linger, or a `none { reason }` plan.
 3. **Config-only harness** (later and optional): `kind = "command"` with shell templates for `list`/`status`/`attach` that print JSON. That is the adapter protocol with polling instead of streaming. Defer until someone needs it.
 
 ### 4.6 Config
@@ -255,6 +269,32 @@ The best signals come from what **each agent already exposes in structured form*
   - a herdr source (users already on herdr)
   - the HTTP/adapter source for the work harness
 - **The work harness** stays an adapter-backed source (§4.5). Its API's task states map onto `SessionState` the same way A2A's `working` / `input-required` / `completed` would.
+
+## 9. Adapter-protocol spike (2026-10-02)
+
+A fake task-execution HTTP API was put behind a ~150-line stdlib-Python adapter, which agent-mux supervised as a child process. That drove real rows end to end (tests, plus a live TUI run):
+- discovery under a `── work ──` group;
+- `working` / `! blocked` / `✓ done`;
+- toasts carrying the API's text, with the startup-replay gate honoured;
+- Enter streaming the task log in the embedded pane.
+
+The agent-mux side was about 470 lines plus about 100 of glue, with **no spine refactor**, by mapping onto today's `WatcherEvent`s. Full write-up, with file:line references: `SPIKE.md` on the spike branch.
+
+**Verdict.** The protocol is viable. The spike shape is **not shippable**, because its bends are user-visible, and each one maps to a work package:
+
+| Bend | Visible effect | Package |
+|---|---|---|
+| `Session` needs a transcript path, project dir and `AgentKind`, so the adapter fills in placeholders | a blank project header; a `claude` tag with ≥2 agents | H2, H5 |
+| `HostId` doubles as the location | `t` and `[[tools]]` keys silently no-op; attach needs a special-case | H4 |
+| The catalog is keyed by id | ids namespaced `harness:raw` | H1 |
+| No upsert or gone | renamed tasks keep old titles; finished tasks never leave | H2 |
+| No terminal states | `done` = `awaiting_input`; `failed` shown as a turn end | H2 |
+| "Blocked" rides the hook pin | works only while the API clock is monotonic | H2 (`Authority`) |
+| Command-only attach plans | Enter on a finished task shows nothing | H4 |
+
+**State vocabulary.** The spike confirms §7's ACP-aligned `SessionState`, with one addition: ACP's `cancelled` stop reason and A2A's `canceled` fold into `AwaitingInput { stop_reason: Cancelled }` for conversational harnesses, and into `Failed { reason }` for task-shaped ones. No separate variant.
+
+**Estimate.** About 2–3 weeks of focused work for a shippable adapter harness on the refactored spine (H1 1–2 d, H2 3–4 d, H3 2–3 d, H4 2–3 d, H5 1–2 d, H7 2–3 d). A spike-shaped adapter behind a flag would take 3–4 days, but isn't recommended beyond a private trial.
 
 ## 8. Open questions
 

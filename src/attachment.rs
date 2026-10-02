@@ -1134,7 +1134,23 @@ fn agent_mux_session_name(session_uuid: &str) -> String {
 /// can never collide with this name either.
 #[must_use]
 fn agent_mux_pending_session_name(nonce: &str) -> String {
-    format!("agent-mux-pending-{nonce}")
+    format!("{PENDING_SESSION_PREFIX}{nonce}")
+}
+
+/// Prefix of [`agent_mux_pending_session_name`].
+const PENDING_SESSION_PREFIX: &str = "agent-mux-pending-";
+
+/// Inverse of [`agent_mux_pending_session_name`]: the spawn nonce a tmux
+/// session name carries when it is a still-provisional
+/// `agent-mux-pending-<nonce>` session, else `None`. Lets the main loop feed
+/// a live-panes snapshot into the pending-spawn table (keeping a codex
+/// spawn adoptable for as long as its session lives) without the
+/// provisional naming convention leaking out of this module.
+#[must_use]
+pub fn pending_spawn_nonce(session_name: &str) -> Option<&str> {
+    session_name
+        .strip_prefix(PENDING_SESSION_PREFIX)
+        .filter(|n| !n.is_empty())
 }
 
 /// Rename the provisional `agent-mux-pending-<nonce>` session to the
@@ -1938,6 +1954,16 @@ mod tests {
             8,
             "no --session-id pin for codex; got {remote_cmd:?}"
         );
+    }
+
+    #[test]
+    fn pending_spawn_nonce_inverts_the_provisional_name() {
+        let name = agent_mux_pending_session_name("abc-123");
+        assert_eq!(pending_spawn_nonce(&name), Some("abc-123"));
+        // Durable and foreign names are not pending.
+        assert_eq!(pending_spawn_nonce("agent-mux-0198-real-id"), None);
+        assert_eq!(pending_spawn_nonce("work"), None);
+        assert_eq!(pending_spawn_nonce("agent-mux-pending-"), None);
     }
 
     #[test]

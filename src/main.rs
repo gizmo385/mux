@@ -21,11 +21,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use agent_mux::adoption::{ADOPTION_WINDOW, PendingSpawns};
+use agent_mux::adoption::{ADOPTION_WINDOW, PendingSpawns, uuid_v7_created_at};
 use agent_mux::agent::{AgentKind, agent};
 use agent_mux::attachment::{
     AttachOutcome, AttachmentDriver, EmbedSpec, PtyDriver, SuspendCommand, TmuxDriver,
-    find_pane_local, probe_live_writer,
+    find_pane_local, pending_spawn_nonce, probe_live_writer,
 };
 use agent_mux::cache;
 use agent_mux::catalog::SessionCatalog;
@@ -1944,13 +1944,14 @@ impl App {
                             let placeholder = spawn_placeholder_id(&path);
                             // A `DiscoverAfterSpawn` agent (codex) carries
                             // its adoption nonce here: record a pending
-                            // spawn keyed on cwd so the rollout that
-                            // appears within `ADOPTION_WINDOW` adopts the
-                            // real id and renames the provisional tmux
+                            // spawn keyed on (host, cwd) so the rollout that
+                            // appears while its provisional tmux session is
+                            // alive adopts the real id and renames that
                             // session (plan §2.4). `None` for pinned-id
                             // agents, so this is a no-op for claude/pi.
                             if let Some(nonce) = spec.adopt_pending.clone() {
                                 self.pending_spawns.record(
+                                    host_id.clone(),
                                     path.clone(),
                                     nonce,
                                     agent_kind,
@@ -2297,6 +2298,24 @@ impl App {
                     session_names,
                 } => {
                     let cwd_set: HashSet<PathBuf> = cwds.into_iter().collect();
+                    // Keep a codex spawn adoptable for as long as its
+                    // provisional `agent-mux-pending-<nonce>` session is
+                    // alive: interactive codex writes no rollout until the
+                    // first prompt, which can be minutes after launch. The
+                    // driver owns the naming convention
+                    // (`pending_spawn_nonce`); this site only folds the
+                    // live nonces into the pending table.
+                    if !self.pending_spawns.is_empty() {
+                        let live_nonces: HashSet<&str> = session_names
+                            .iter()
+                            .filter_map(|name| pending_spawn_nonce(name))
+                            .collect();
+                        self.pending_spawns.observe_live(
+                            &host,
+                            |nonce| live_nonces.contains(nonce),
+                            SystemTime::now(),
+                        );
+                    }
                     // Map the tmux-naming convention `agent-mux-<id>`
                     // to opaque `SessionId`s here so the catalog never
                     // deals in tmux strings (per the "tmux specifics
@@ -2550,7 +2569,17 @@ impl App {
         let Some(cwd) = cli.parse_meta(&content).cwd else {
             return;
         };
-        let Some(pending) = self.pending_spawns.adopt(kind, &cwd, SystemTime::now()) else {
+        // The rollout id's embedded creation time (codex ids are v7 uuids
+        // minted at launch) guards against adopting an unrelated codex the
+        // user started earlier in the same cwd whose first prompt — and so
+        // whose rollout — only lands now.
+        let Some(pending) = self.pending_spawns.adopt(
+            host_id,
+            kind,
+            &cwd,
+            uuid_v7_created_at(&adopted_id.0),
+            SystemTime::now(),
+        ) else {
             return;
         };
         // Rename `agent-mux-pending-<nonce>` → `agent-mux-<id>` through the
@@ -2577,17 +2606,17 @@ impl App {
         }
     }
 
-    /// Drop pending spawns whose adoption window has elapsed, surfacing
-    /// each as a footer/status spawn error (plan §2.4 step 4). The tmux
-    /// session, if it launched at all, is still reachable via the cwd
-    /// fallback — this only reports that the id could not be adopted.
+    /// Drop pending spawns that have expired — their provisional tmux
+    /// session hasn't been seen alive for `ADOPTION_WINDOW` (codex exited
+    /// before its first prompt, or never started), or they hit the hard
+    /// cap — surfacing each as a footer/status note (plan §2.4 step 4).
     /// Called on every tick and every `NewTranscript`; a no-op when
     /// nothing is outstanding.
     fn sweep_pending_spawns(&mut self) {
         let expired = self.pending_spawns.sweep_expired(SystemTime::now());
         if let Some(last) = expired.last() {
             self.status = Some(format!(
-                "codex spawn in {} produced no rollout within {}s — dropped",
+                "codex spawn in {} ended (no session seen for {}s) before writing a rollout — dropped",
                 last.cwd.display(),
                 ADOPTION_WINDOW.as_secs(),
             ));

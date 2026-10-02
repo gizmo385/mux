@@ -1,6 +1,6 @@
 # Plan: generalizing agent support into pluggable harnesses
 
-Status: **draft for review, 2026-10-02.** Nothing here is implemented. Path B in §7 (wrapping a general, agent-agnostic layer) is being investigated in parallel, and that section is filled in from those findings. Follows on from `docs/plans/2026-07-09-multi-agent-cli.md`, which put Claude Code, Codex and Pi behind the `AgentCli` trait.
+Status: **draft for review, 2026-10-02.** Nothing in §4–§5 is implemented. §7 records the investigation of wrapping a general, agent-agnostic layer instead; its conclusion is that this folds into this design as extra sources rather than replacing it. Follows on from `docs/plans/2026-07-09-multi-agent-cli.md`, which put Claude Code, Codex and Pi behind the `AgentCli` trait.
 
 Origin: the user asked, after a 2026-10-02 notification-parity audit of Codex/Pi, for a spec that makes new harnesses easier to add. Each harness should be able to supply its own handling for notifications, remote support, setup checks and so on. Driving example: a work harness whose session state is only available through a **remote task-execution HTTP API**, with no transcript file and possibly no tmux pane. That harness is *not* to be built now; the design must leave a clean place for it.
 
@@ -91,7 +91,7 @@ enum SourceEvent {
     /// State observation. `authority` decides precedence (§4.3).
     Status {
         key: SessionKey,
-        state: SessionState,          // Working | AwaitingInput | Blocked | Done | Failed | Unknown
+        state: SessionState,          // Working | Blocked{kind} | AwaitingInput{stop_reason} | Done | Failed | Unknown (ACP-aligned, §7)
         authority: Authority,         // Heuristic | Signal | Authoritative
         observed_at: SystemTime,      // replaces "transcript mtime" as the clock
         message: Option<String>,      // toast body / last assistant text
@@ -229,9 +229,32 @@ Ordered so that every step is shippable and Claude-only stays unchanged. A "pure
 - **Pin semantics** are the subtle part. Write them as a small pure state machine with table-driven tests before wiring them in.
 - **Open-ended scope.** The SPEC criterion in H0 keeps "any agent" bounded.
 
-## 7. Path B: wrap a general, agent-agnostic layer instead
+## 7. Path B: wrap a general, agent-agnostic layer instead?
 
-*Pending: being investigated in parallel (herdr; Pi as a universal runtime; protocol layers such as ACP and coder/agentapi). This section will be filled in with the findings and a recommendation, including whether such a layer replaces §4–§5 or simply becomes one more adapter-backed harness under §4.5.*
+Investigated 2026-10-02 with hands-on tests wherever possible. Every candidate was run against a localhost mock model, so no API spend. The candidates were Pi, herdr, coder/agentapi, and ACP; the protocol work also turned up Codex's own app-server. Scratch traces are noted in TODO.md.
+
+| Layer | What it is | State fidelity for Claude/Codex | Native TUI in tmux | Remote | Verdict |
+|---|---|---|---|---|---|
+| **Pi** (1.0.0) | A coding agent with providers, extensions and RPC mode | Excellent *for Pi sessions*. One extension gives working (`agent_start`), done (`agent_settled`) and blocked (`ui_prompt_start`). | Yes, for Pi itself | Pi on the remote; markers over SSH | **Not a wrapper: it replaces Claude Code and Codex.** You lose native permissions, sandbox, hooks and subagents, and Claude through Pi is billed per token as extra usage. Keep Pi as a first-class harness and use its extension as the reference "rich signals" design. |
+| **herdr** (v0.9.3) | An agent-first multiplexer with its own PTY server and a socket API | Screen-scraped. Codex blocked came from the OSC title; Codex turn-end read `unknown`. No last message or edited files. | Replaces tmux; a server restart kills agents | Its own server on each host | **Not a substrate.** At most an optional *source* if users run herdr. Ideas worth borrowing: per-agent detection manifests, **OSC-title signals** (now shipped for Codex), a monotonic `seq`, and an `explain` view. |
+| **coder/agentapi** (v0.12.2) | An HTTP wrapper over an emulated terminal | `running`/`stable` only. A Codex approval prompt reads `stable`, the same as done. | Fixed 80-column emulated screen | HTTP | **Not viable.** Archived, and it loses the blocked state. |
+| **ACP** | A JSON-RPC client↔agent protocol; ~40 agents, Claude/Codex/Pi via adapters | Excellent. `session/request_permission` is first-class; turns end with `stopReason`. | **No.** The ACP client *is* the UI, so it can't observe a native TUI. Shared multi-client sessions (Agent Host Protocol) are early. | stdio; an HTTP/WS transport is at the RFD stage | **Borrow its vocabulary** for `SessionState` (below). An ACP *client* source is only for agents with no TUI. Gotcha: `codex-acp` defaults to a model-based auto-review of approvals. |
+| **Codex app-server** (0.142) | Codex's own daemon (`app-server --listen ws://…`); the native TUI connects with `codex --remote` | **Exact and push-based.** An observer that only called `initialize` received `thread/status/changed`: `active` → `active["waitingOnApproval"]` → `active` → `idle`. Approval *requests* go only to the TUI. | Yes, the native TUI is kept in tmux | Port-forward over the existing ControlMaster | **Best Codex source when agent-mux spawns the session.** Needs a spawn-plan change and daemon lifecycle management, and doesn't cover plain `codex` started outside agent-mux. |
+
+**Conclusion: don't wrap one universal layer.** No single layer gives agent-agnostic fidelity while keeping native TUIs in tmux:
+- The general layers either replace the user's agents (Pi), replace tmux (herdr), or replace the UI (ACP).
+- The one that wraps arbitrary terminal agents (agentapi, or herdr's scraping) loses exactly the states agent-mux exists to surface.
+
+The best signals come from what **each agent already exposes in structured form**: Claude's transcript and hooks, Codex's title, hook or app-server, Pi's extension events. That is the §4 design: a normalized event model plus per-harness `Source` and signal capabilities. Path B therefore *folds into* Path A as additional sources rather than replacing it:
+
+- **`SessionState` adopts ACP's vocabulary:** `Working`, `Blocked { kind: Approval | Input }`, `AwaitingInput { stop_reason }`, `Done`, `Failed`, `Unknown`. `Blocked.kind` distinguishes an approval from a question (`request_user_input`), which no current signal does.
+- **Candidate sources under §4.4/§4.5:**
+  - a Codex app-server observer (exact, push)
+  - a Pi signal extension
+  - an ACP client source (headless agents)
+  - a herdr source (users already on herdr)
+  - the HTTP/adapter source for the work harness
+- **The work harness** stays an adapter-backed source (§4.5). Its API's task states map onto `SessionState` the same way A2A's `working` / `input-required` / `completed` would.
 
 ## 8. Open questions
 

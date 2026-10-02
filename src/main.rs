@@ -915,7 +915,7 @@ impl App {
             watcher,
             updates,
             driver,
-            status: None,
+            status: codex_hook_startup_hint(&config),
             config,
             registry,
             modal: None,
@@ -3890,6 +3890,37 @@ fn init_hook_watcher(
     }
 }
 
+/// One-shot startup footer hint when Codex is enabled and its agent-mux
+/// `PermissionRequest` hook is installed but Codex won't run it (never
+/// trusted at Codex's "Hooks need review" prompt, or disabled there).
+/// Without it a blocked Codex session silently reads as working. Like any
+/// footer status it clears on the next keypress. A missing hook stays
+/// quiet — installing it is opt-in and the README covers it. Local host
+/// only: a remote's trust state would need an SSH read, which startup
+/// deliberately doesn't block on.
+fn codex_hook_startup_hint(config: &Config) -> Option<String> {
+    use agent_mux::hook_install::{codex_hook_trust_at, default_codex_hooks_path};
+    if !config.enabled_agents().contains(&AgentKind::Codex) {
+        return None;
+    }
+    let trust = codex_hook_trust_at(&default_codex_hooks_path()?).ok()?;
+    codex_hook_hint_text(&trust).map(str::to_string)
+}
+
+/// Footer wording for [`codex_hook_startup_hint`], split out for tests.
+fn codex_hook_hint_text(trust: &agent_mux::hook_install::CodexHookTrust) -> Option<&'static str> {
+    use agent_mux::hook_install::CodexHookTrust;
+    match trust {
+        CodexHookTrust::Untrusted => Some(
+            "codex approvals won't show as blocked: trust the agent-mux hook at codex's \"Hooks need review\" prompt",
+        ),
+        CodexHookTrust::Disabled => Some(
+            "codex approvals won't show as blocked: the agent-mux hook is disabled in codex's hooks review",
+        ),
+        CodexHookTrust::NotInstalled | CodexHookTrust::Trusted => None,
+    }
+}
+
 /// Construct the M4 notifier from the resolved `[notifications]`
 /// config. Picks a platform-aware dispatcher via
 /// [`pick_dispatcher`] and logs the chosen backend label to stderr
@@ -6385,6 +6416,17 @@ mod tests {
             Some(&id),
             &id,
         ));
+    }
+
+    // ---- codex_hook_hint_text ----
+
+    #[test]
+    fn codex_hook_hint_only_for_installed_but_not_running_hooks() {
+        use agent_mux::hook_install::CodexHookTrust;
+        assert!(codex_hook_hint_text(&CodexHookTrust::Untrusted).is_some());
+        assert!(codex_hook_hint_text(&CodexHookTrust::Disabled).is_some());
+        assert_eq!(codex_hook_hint_text(&CodexHookTrust::NotInstalled), None);
+        assert_eq!(codex_hook_hint_text(&CodexHookTrust::Trusted), None);
     }
 
     // ---- resolve_notification_title ----

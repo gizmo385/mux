@@ -176,7 +176,7 @@ Codex's "blocked on approval" state is never written to its transcript, so witho
 agent-mux install-hooks --agent codex
 ```
 
-**Codex gates hooks on trust.** Codex runs a hook only after you approve it in Codex itself. The next time you start `codex` on that machine, it shows **"Hooks need review"**: choose *Trust all and continue* (or *Review hooks* to approve just the agent-mux one). Until you do, Codex silently skips the hook. Trust is tied to the exact command and its position in `hooks.json`, so re-running the installer after moving the `agent-mux` binary asks you to review it again. The installer reports where the hook stands (from the `[hooks.state]` table in `~/.codex/config.toml`), and agent-mux never writes that trust itself; trusting the hook is your decision, made in Codex.
+**Codex gates hooks on trust.** Codex runs a hook only after you approve it in Codex itself. The next time you start `codex` on that machine, it shows **"Hooks need review"**: choose *Trust all and continue* (or *Review hooks* to approve just the agent-mux one). Until you do, Codex silently skips the hook. Trust is tied to the exact command and its position in `hooks.json`, so re-running the installer after moving the `agent-mux` binary asks you to review it again. The installer reports where the hook stands (from the `[hooks.state]` table in `~/.codex/config.toml`), and while it's untrusted the dashboard shows a reminder in the footer at startup, and agent-mux never writes that trust itself; trusting the hook is your decision, made in Codex.
 
 Codex's turn-complete state needs no hook — it comes from the rollout's `task_complete` event. Earlier agent-mux versions also installed a `Stop` handler; re-running the installer removes it.
 

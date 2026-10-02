@@ -207,8 +207,10 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
 /// in `~/.codex/hooks.json` with the event JSON on **stdin** (Appendix A
 /// §5 of `docs/plans/2026-07-09-multi-agent-cli.md`, researched 2026-07-09
 /// against rust-v0.144.1 — no `codex` on the build box, so the payload
-/// shape is best-effort). Documented fields: `session_id`, `cwd`,
-/// `hook_event_name`, `model`. agent-mux installs exactly two handlers:
+/// shape was best-effort; the 0.142.5 binary's hook input struct carries
+/// `session_id`, `transcript_path`, `cwd`, `hook_event_name`,
+/// `permission_mode`, `turn_id`, `stop_hook_active`,
+/// `last_assistant_message`, `prompt`). agent-mux installs exactly two handlers:
 ///
 /// - `PermissionRequest` — the agent is blocked waiting on an approval →
 ///   normalise to a **blocking** marker (the `permission_prompt`
@@ -216,10 +218,12 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
 /// - `Stop` — the turn completed → normalise to a **non-blocking**
 ///   turn-complete marker (the `idle_prompt` equivalent).
 ///
-/// Codex payloads carry no `transcript_path`, so the caller resolves
-/// `hooks_dir` from the codex transcript root
+/// Codex 0.142.5 payloads do carry `transcript_path` (verified against
+/// the real binary 2026-10-02), but the caller still resolves `hooks_dir`
+/// from the configured codex transcript root
 /// (`~/.codex/sessions/.agent-mux-hooks/`) the same way config/agents do,
-/// and passes it in. The marker is written using the **existing** claude
+/// and passes it in — config is the source of truth for where the
+/// consumer watches. The marker is written using the **existing** claude
 /// marker vocabulary (`session_id` + a synthesised `notification_type` +
 /// an optional `message`), so the consumer ([`parse_marker_content`],
 /// [`crate::watcher`]'s `poll_hooks_once`, and the catalog's
@@ -248,7 +252,10 @@ pub fn receive_codex_hook_from_stdin<R: Read, W: Write>(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing session_id field"))?;
     let event_name = parse_hook_event_name(&buf);
     let label = event_name.as_deref().unwrap_or("<missing>");
-    let Some((notification_type, message)) = codex_marker_for_event(event_name.as_deref()) else {
+    let last_assistant_message = parse_string_field(&buf, "last_assistant_message");
+    let Some((notification_type, message)) =
+        codex_marker_for_event(event_name.as_deref(), last_assistant_message.as_deref())
+    else {
         let _ = writeln!(
             stderr_log,
             "agent-mux: codex hook hook_event_name={label} session_id={session_id} \u{2192} skipped (not attention-relevant)"
@@ -269,16 +276,20 @@ pub fn receive_codex_hook_from_stdin<R: Read, W: Write>(
 /// normalised marker carries — reusing the claude vocabulary so the
 /// consumer's classification ([`is_blocking_prompt`], the input-required
 /// allowlist) needs no codex awareness. `PermissionRequest` → blocking
-/// approval; `Stop` → turn complete. Any other event is dropped (`None`).
-fn codex_marker_for_event(
+/// approval; `Stop` → turn complete, carrying the payload's
+/// `last_assistant_message` (when present) as the toast body so a codex
+/// turn-end toast reads like a claude one rather than a bare project
+/// line. Any other event is dropped (`None`).
+fn codex_marker_for_event<'a>(
     event_name: Option<&str>,
-) -> Option<(&'static str, Option<&'static str>)> {
+    last_assistant_message: Option<&'a str>,
+) -> Option<(&'static str, Option<&'a str>)> {
     match event_name {
         Some("PermissionRequest") => Some((
             "permission_prompt",
             Some("Codex is waiting for your approval"),
         )),
-        Some("Stop") => Some(("idle_prompt", None)),
+        Some("Stop") => Some(("idle_prompt", last_assistant_message)),
         _ => None,
     }
 }
@@ -310,18 +321,26 @@ fn normalized_codex_marker(
     serde_json::Value::Object(obj).to_string()
 }
 
-/// Pull `hook_event_name` out of a codex hook payload (the codex
-/// equivalent of claude's `notification_type` discriminator). Returns
-/// `None` when absent, non-string, or empty after trimming.
+/// Pull a non-empty (after trimming) string field out of a JSON hook
+/// payload. `None` when the payload isn't an object, the field is absent
+/// or non-string, or it is blank.
 #[must_use]
-fn parse_hook_event_name(payload: &str) -> Option<String> {
+fn parse_string_field(payload: &str, field: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let raw = v.as_object()?.get("hook_event_name")?.as_str()?;
+    let raw = v.as_object()?.get(field)?.as_str()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// Pull `hook_event_name` out of a codex hook payload (the codex
+/// equivalent of claude's `notification_type` discriminator). Returns
+/// `None` when absent, non-string, or empty after trimming.
+#[must_use]
+fn parse_hook_event_name(payload: &str) -> Option<String> {
+    parse_string_field(payload, "hook_event_name")
 }
 
 /// Notification types we treat as "user input is required for this
@@ -714,6 +733,28 @@ mod tests {
             !ev.blocking_prompt,
             "Stop is a turn-complete nudge, not a blocking prompt"
         );
+    }
+
+    #[test]
+    fn codex_stop_forwards_last_assistant_message_as_toast_body() {
+        // Codex's Stop payload carries the turn's final assistant text;
+        // it becomes the marker `message`, i.e. the toast body.
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"cx-4","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"  Refactor done; tests pass.\n"}"#;
+        let (result, _) = dispatch_codex(payload, tmp.path());
+        let ev = parse_marker(&result.unwrap().expect("marker written")).unwrap();
+        assert!(!ev.blocking_prompt);
+        assert_eq!(ev.message.as_deref(), Some("Refactor done; tests pass."));
+    }
+
+    #[test]
+    fn codex_stop_without_last_assistant_message_has_no_body() {
+        let tmp = TempDir::new().unwrap();
+        let payload =
+            r#"{"session_id":"cx-5","hook_event_name":"Stop","last_assistant_message":null}"#;
+        let (result, _) = dispatch_codex(payload, tmp.path());
+        let ev = parse_marker(&result.unwrap().expect("marker written")).unwrap();
+        assert_eq!(ev.message, None);
     }
 
     #[test]

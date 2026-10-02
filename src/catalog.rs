@@ -223,7 +223,24 @@ impl SessionCatalog {
         }
         for session in &mut self.sessions {
             if session.id == *id {
-                let mut combined = recent;
+                // Live tail derivations run without the transcript header
+                // (the watcher has only the tail window), so an agent that
+                // records edit paths relative to its cwd (pi) hands us
+                // relative paths here. Resolve them against the session's
+                // project dir — the same cwd the agent ran in — so the
+                // `{file}` picker never opens a path relative to the
+                // *tool's* cwd. Absolute paths pass through unchanged.
+                let mut combined: Vec<PathBuf> = Vec::with_capacity(recent.len());
+                for p in recent {
+                    let p = if p.is_relative() {
+                        session.project_dir.join(p)
+                    } else {
+                        p
+                    };
+                    if !combined.contains(&p) {
+                        combined.push(p);
+                    }
+                }
                 for p in &session.edited_files {
                     if !combined.contains(p) {
                         combined.push(p.clone());
@@ -952,6 +969,31 @@ mod tests {
         let files = &c.sessions()[0].edited_files;
         assert_eq!(files.len(), EDITED_FILES_CAP);
         assert_eq!(files[0], pb("/w/fresh.rs"));
+    }
+
+    #[test]
+    fn merge_edited_files_resolves_relative_paths_against_project_dir() {
+        // A live tail derivation has no transcript header, so pi's
+        // relative `edit`/`write` paths arrive unresolved; the catalog
+        // anchors them to the session's project dir and dedups against
+        // the absolute form discovery already seeded.
+        let mut c = SessionCatalog::new();
+        c.add(session("a"));
+        let id = SessionId("a".into());
+        let root = c.sessions()[0].project_dir.clone();
+        c.merge_edited_files(&id, vec![root.join("src/lib.rs")]);
+        c.merge_edited_files(
+            &id,
+            vec![pb("src/main.rs"), pb("src/lib.rs"), pb("/abs/x.rs")],
+        );
+        assert_eq!(
+            c.sessions()[0].edited_files,
+            vec![
+                root.join("src/main.rs"),
+                root.join("src/lib.rs"),
+                pb("/abs/x.rs")
+            ]
+        );
     }
 
     #[test]

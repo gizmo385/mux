@@ -29,13 +29,17 @@ remote hosts that you want notifications on:
 agent-mux install-hooks
 ```
 
-If you've enabled Codex (`[agents.codex]`), install its lifecycle hooks too — this is what surfaces
+If you've enabled Codex (`[agents.codex]`), install its approval hook too — this is what surfaces
 Codex's "blocked on approval" state, which is otherwise invisible in its transcript (writes
 `~/.codex/hooks.json`; idempotent; `--dry-run` previews):
 
 ```bash
 agent-mux install-hooks --agent codex
 ```
+
+Then **trust the hook in Codex**: Codex won't run a newly added hook until you approve it. Start
+`codex` once and choose "Trust all and continue" at the "Hooks need review" prompt (see
+[Setup: Codex hooks](#setup-codex-hooks)).
 
 ## Keybinds
 
@@ -128,11 +132,11 @@ agent-mux is a multiplexer for terminal agent CLIs that persist tail-parseable t
 | Capability | Claude | Codex | Pi |
 | --- | --- | --- | --- |
 | Discovery (cwd, title) | ✓ `~/.claude/projects` | ✓ `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | ✓ `~/.pi/agent/sessions/--<cwd>--/<ts>_<id>.jsonl` |
-| Attention (working / needs-input) | ✓ `stop_reason` | ✓ `turn_started`/`turn_complete`/`turn_aborted` | ✓ `stopReason` |
+| Attention (working / needs-input) | ✓ `stop_reason` | ✓ `task_started`/`task_complete`/`turn_aborted` (older `turn_*` names also matched) | ✓ `stopReason` |
 | Edited-files picker | ✓ Edit/Write/… | ✓ `patch_apply_end` + `FileChange` (apply_patch edits only) | ✓ `write`/`edit` tool calls |
 | Spawn (`n`/`N`) | ✓ pinned `--session-id` | ✓ launch + post-spawn adoption | ✓ pinned `--session-id` |
 | Resume (no live pane) | ✓ `claude --resume` | ✓ `codex resume <id>` | ✓ `pi --session-id <id>` |
-| Blocked-on-approval | ✓ Notification hook | ✓ lifecycle hook (`install-hooks --agent codex`) | n/a (no built-in gates) |
+| Blocked-on-approval | ✓ Notification hook | ✓ `PermissionRequest` hook (`install-hooks --agent codex`, then trust it in Codex) | n/a (no built-in gates) |
 
 ### Enabling an agent
 
@@ -166,11 +170,15 @@ When two or more agents are enabled, the dashboard marks each session row (and q
 
 ### Setup: Codex hooks
 
-Codex's "blocked on approval" state is never written to its transcript, so without a hook a blocked Codex session reads as *working*. Install Codex's lifecycle hooks — on your local machine and every remote host that runs Codex — to surface it (writes `~/.codex/hooks.json`; idempotent; `--dry-run` previews):
+Codex's "blocked on approval" state is never written to its transcript, so without a hook a blocked Codex session reads as *working*. Install Codex's `PermissionRequest` hook — on your local machine and every remote host that runs Codex — to surface it (writes `~/.codex/hooks.json`; idempotent; `--dry-run` previews):
 
 ```bash
 agent-mux install-hooks --agent codex
 ```
+
+**Codex gates hooks on trust.** Codex runs a hook only after you approve it in Codex itself. The next time you start `codex` on that machine, it shows **"Hooks need review"**: choose *Trust all and continue* (or *Review hooks* to approve just the agent-mux one). Until you do, Codex silently skips the hook. Trust is tied to the exact command and its position in `hooks.json`, so re-running the installer after moving the `agent-mux` binary asks you to review it again. The installer reports where the hook stands (from the `[hooks.state]` table in `~/.codex/config.toml`), and agent-mux never writes that trust itself; trusting the hook is your decision, made in Codex.
+
+Codex's turn-complete state needs no hook — it comes from the rollout's `task_complete` event. Earlier agent-mux versions also installed a `Stop` handler; re-running the installer removes it.
 
 Pi has no built-in permission gates, so it needs no hook for parity; a lower-latency extension is a possible future add.
 
@@ -180,10 +188,9 @@ Per-agent capability limits at this release. They are documented here rather tha
 
 - **Codex `.jsonl.zst` cold rollouts are skipped.** A background worker zstd-compresses cold Codex rollouts; discovery skips `.jsonl.zst` siblings. They're weeks old — far outside the 30-day hot set — and an append re-materialises a plain `.jsonl`, so this only hides long-dormant sessions.
 - **Codex shell-command edits are uncaptured *by the transcript source*.** The transcript half of the file picker sees Codex edits made through `apply_patch` (`patch_apply_end` / `FileChange`), not files a Codex turn changed via a raw shell command. The `git status` half now covers most of that gap — a shell-command change in a git working tree shows up there regardless of which tool made it — so this caveat only bites for a non-git directory.
-- **Codex blocked-on-approval requires the hook.** Without `install-hooks --agent codex`, a Codex session waiting on an approval reads as *working* (the approval prompt is never persisted to the rollout). The hook is the only signal for it.
+- **Codex blocked-on-approval requires the hook, trusted in Codex.** Without `install-hooks --agent codex` *and* trusting the hook at Codex's "Hooks need review" prompt, a Codex session waiting on an approval reads as *working* (the approval prompt is never persisted to the rollout). Codex's `PermissionRequest` hook also doesn't fire for `request_user_input` questions or MCP elicitations, nor under `strict_auto_review`.
 - **Pi permission gates are invisible to the tail.** Pi has no built-in gates; any an extension adds are not written to the transcript, so they don't surface as *blocked*.
-- **Codex/Pi are not yet verified live end-to-end.** As of 2026-07-10 the Codex and Pi paths are tested against synthetic fixtures authored from format research (Codex rust-v0.144.1 and Pi v0.80.6, researched 2026-07-09); they have not been run against real `codex`/`pi` binaries. Treat Codex/Pi support as current-release best-effort.
-- **Codex `hooks.json` schema is best-effort.** The installer mirrors Claude Code's proven hook layout; the exact Codex `hooks.json` schema is pending validation on a real install.
+- **Codex/Pi live verification is partial.** Read paths (discovery, title, attention) were verified against real `codex` 0.142.5 and `pi` 0.80.6 on 2026-07-10. On 2026-10-02, real interactive Codex 0.142.5 runs against a local mock model confirmed the attention events, approval → `function_call_output` flow, and the `hooks.json` format the installer writes. A trusted hook actually firing, and Pi spawn/resume, are still unverified live. Treat Codex/Pi support as current-release best-effort.
 - **Transcript-root relocation env vars are partially honoured.** Pi's `PI_CODING_AGENT_SESSION_DIR` / `PI_CODING_AGENT_DIR` are honoured for the local process; Codex's `$CODEX_HOME` relocation is *not* auto-detected. For either, the supported cross-host path is the `transcript_root` config override.
 
 The `[agents.<label>] binary` PATH override is read by discovery but is **not yet consumed by spawn/resume** — a new session always launches the bare `claude`/`codex`/`pi` on `PATH` (tracked as a follow-up).

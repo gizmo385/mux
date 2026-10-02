@@ -49,6 +49,10 @@ pub enum InstallAction {
     /// updated in place. Carries the previous command string for
     /// the user-facing diff line.
     Updated { previous_command: String },
+    /// Nothing to add or update, but a legacy agent-mux handler the
+    /// current installer no longer writes (codex's `Stop`, superseded by
+    /// the rollout's `task_complete`) was removed.
+    RemovedLegacy,
 }
 
 /// Outcome of one [`plan_install`] call: the merged settings content
@@ -137,25 +141,30 @@ pub fn plan_install(current: &str, binary_path: &Path) -> Result<InstallPlan, In
     })
 }
 
-/// Codex hooks-file variant of [`plan_install`]. Writes `type:"command"`
-/// handlers for the two lifecycle events agent-mux cares about —
-/// `PermissionRequest` (needs-approval → blocking marker) and `Stop`
-/// (turn complete → non-blocking marker) — each invoking
-/// `<binary> hook --agent codex`.
+/// Codex hooks-file variant of [`plan_install`]. Writes a `type:"command"`
+/// handler for the one lifecycle event the rollout can't show —
+/// `PermissionRequest` (needs-approval → blocking marker) — invoking
+/// `<binary> hook --agent codex`, and removes the legacy agent-mux `Stop`
+/// handler earlier installers wrote: turn completion is already in the
+/// rollout (`task_complete`, with `last_agent_message`), so a `Stop` hook
+/// only added a second handler for the user to trust in Codex.
 ///
-/// ## hooks.json schema assumption (BEST-EFFORT)
+/// ## hooks.json schema (validated 2026-10-02 against codex 0.142.5)
 ///
-/// Codex configures lifecycle hooks in `~/.codex/hooks.json`
-/// (Appendix A §5 of `docs/plans/2026-07-09-multi-agent-cli.md`,
-/// researched 2026-07-09 — no `codex` on the build box to verify against).
-/// The exact top-level key layout is **not independently confirmed**; we
-/// mirror Claude Code's proven shape (Codex's hooks mechanism was modelled
-/// on it): a top-level `"hooks"` object keyed by event name, each value an
-/// array of `{ "hooks": [ { "type": "command", "command": … } ] }`
-/// entries. If upstream turns out to use a different layout, the fix is
-/// localised to this one function plus [`merge_command_into_array`]'s
-/// appended-entry shape — everything else (recognition, idempotency,
-/// merge, dry-run, the I/O wrapper) is schema-agnostic.
+/// A top-level `"hooks"` object keyed by event name, each value an array of
+/// `{ "matcher"?, "hooks": [ { "type": "command", "command": … } ] }`
+/// groups — the same shape as Claude Code's settings. Codex parses the file
+/// silently when it matches and warns (`failed to parse hooks config`) when
+/// it doesn't.
+///
+/// ## Trust
+///
+/// Codex runs a non-managed hook only after the user trusts it in Codex's
+/// own hooks review (the interactive TUI prompts "Hooks need review" at
+/// startup). Trust is keyed by the handler's *position* and hashed over its
+/// command, so any install that adds or changes the handler needs a fresh
+/// review — see [`codex_hook_trust`]. agent-mux never writes trust state:
+/// that is the user's security decision inside Codex.
 ///
 /// # Errors
 ///
@@ -173,14 +182,19 @@ pub fn plan_install_codex(current: &str, binary_path: &Path) -> Result<InstallPl
     let root_obj = root.as_object_mut().ok_or(InstallError::NotJsonObject)?;
     let hooks_obj = ensure_object(root_obj, "hooks")?;
 
-    // Aggregate across both event arrays: any stale update wins (carries
+    // Aggregate across the event arrays: any stale update wins (carries
     // its previous command for the notice), else any fresh append, else a
-    // clean no-op when both handlers were already present.
+    // clean no-op when every handler was already present.
     let mut action = InstallAction::NoOp;
     for event in CODEX_HOOK_EVENTS {
         let arr = ensure_array(hooks_obj, event)?;
         let this = merge_command_into_array(arr, &desired_command, None);
         action = combine_actions(action, this);
+    }
+    for event in CODEX_LEGACY_HOOK_EVENTS {
+        if remove_agent_mux_handlers(hooks_obj, event)? {
+            action = combine_actions(action, InstallAction::RemovedLegacy);
+        }
     }
 
     let new_content = serde_json::to_string_pretty(&root).map_err(InstallError::Parse)? + "\n";
@@ -191,9 +205,169 @@ pub fn plan_install_codex(current: &str, binary_path: &Path) -> Result<InstallPl
 }
 
 /// The codex lifecycle events agent-mux installs command handlers for.
-/// `PermissionRequest` is the needs-approval signal (→ blocking marker);
-/// `Stop` is turn-complete (→ non-blocking marker).
-const CODEX_HOOK_EVENTS: &[&str] = &["PermissionRequest", "Stop"];
+/// `PermissionRequest` is the needs-approval signal (→ blocking marker) —
+/// the one state codex never persists to its rollout.
+const CODEX_HOOK_EVENTS: &[&str] = &["PermissionRequest"];
+
+/// Codex events earlier installers wrote an agent-mux handler for and the
+/// current one removes. `Stop` duplicated the rollout's `task_complete`.
+/// (`hook --agent codex` still ingests a `Stop` event, so a not-yet-migrated
+/// install keeps working.)
+const CODEX_LEGACY_HOOK_EVENTS: &[&str] = &["Stop"];
+
+/// Remove every agent-mux command handler from `hooks_obj[event]`,
+/// dropping matcher groups left empty and the event key itself when no
+/// group remains. Foreign handlers are untouched. Returns whether anything
+/// was removed.
+fn remove_agent_mux_handlers(
+    hooks_obj: &mut Map<String, Value>,
+    event: &str,
+) -> Result<bool, InstallError> {
+    let Some(groups) = hooks_obj.get_mut(event) else {
+        return Ok(false);
+    };
+    let groups = groups
+        .as_array_mut()
+        .ok_or_else(|| InstallError::SchemaMismatch(format!("`{event}` is not a JSON array")))?;
+    let mut removed = false;
+    for group in groups.iter_mut() {
+        let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = inner.len();
+        inner.retain(|h| {
+            !h.get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_agent_mux_hook_command)
+        });
+        removed |= inner.len() != before;
+    }
+    if !removed {
+        return Ok(false);
+    }
+    groups.retain(|g| {
+        g.get("hooks")
+            .and_then(Value::as_array)
+            .is_none_or(|h| !h.is_empty())
+    });
+    if groups.is_empty() {
+        hooks_obj.remove(event);
+    }
+    Ok(true)
+}
+
+/// Whether Codex will actually run the agent-mux `PermissionRequest`
+/// handler, as far as agent-mux can tell from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexHookTrust {
+    /// No agent-mux `PermissionRequest` handler in the hooks file.
+    NotInstalled,
+    /// Installed, but Codex has no trust record for it — Codex skips it
+    /// until the user reviews hooks in the Codex TUI.
+    Untrusted,
+    /// The user disabled it in Codex's hooks review.
+    Disabled,
+    /// A trust record exists. Codex also compares a hash of the command, so
+    /// a record made before the handler changed reads as "modified" to
+    /// Codex (it re-prompts at startup); agent-mux doesn't replicate that
+    /// hash, so this means "trusted at some point", not "currently valid".
+    Trusted,
+}
+
+/// Classify the agent-mux codex handler's trust from the hooks file
+/// (`hooks_json`, at `hooks_path`) and Codex's `config.toml` content.
+///
+/// Mirrors codex 0.142.5's state lookup: trust lives in the user config as
+/// `[hooks.state."<source>:<event>:<group>:<handler>"]` with `enabled` and
+/// `trusted_hash`, where `<source>` is the hooks file's path and the
+/// indices are the handler's position. Read-only; best-effort — unparseable
+/// input degrades to `NotInstalled` / `Untrusted` rather than erroring.
+#[must_use]
+pub fn codex_hook_trust(hooks_path: &Path, hooks_json: &str, config_toml: &str) -> CodexHookTrust {
+    let Some((group, handler)) = find_agent_mux_handler(hooks_json, "PermissionRequest") else {
+        return CodexHookTrust::NotInstalled;
+    };
+    let key = format!(
+        "{}:permission_request:{group}:{handler}",
+        hooks_path.display()
+    );
+    let config: toml::Table = config_toml.parse().unwrap_or_default();
+    let state = config
+        .get("hooks")
+        .and_then(|h| h.get("state"))
+        .and_then(|s| s.get(&key));
+    let Some(state) = state else {
+        return CodexHookTrust::Untrusted;
+    };
+    if state.get("enabled").and_then(toml::Value::as_bool) == Some(false) {
+        return CodexHookTrust::Disabled;
+    }
+    if state
+        .get("trusted_hash")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|h| !h.is_empty())
+    {
+        CodexHookTrust::Trusted
+    } else {
+        CodexHookTrust::Untrusted
+    }
+}
+
+/// Read `hooks_path` and its sibling `config.toml` (both under
+/// `$CODEX_HOME`) and classify trust via [`codex_hook_trust`]. A missing
+/// file reads as empty.
+///
+/// # Errors
+///
+/// I/O errors other than not-found.
+pub fn codex_hook_trust_at(hooks_path: &Path) -> io::Result<CodexHookTrust> {
+    let hooks_json = read_current(hooks_path)?;
+    let config_path = hooks_path.with_file_name("config.toml");
+    let config_toml = read_current(&config_path)?;
+    Ok(codex_hook_trust(hooks_path, &hooks_json, &config_toml))
+}
+
+/// Position `(group_index, handler_index)` of the first agent-mux command
+/// handler under `hooks.<event>` in a hooks-file JSON document.
+fn find_agent_mux_handler(hooks_json: &str, event: &str) -> Option<(usize, usize)> {
+    let root: Value = serde_json::from_str(hooks_json).ok()?;
+    let groups = root.get("hooks")?.get(event)?.as_array()?;
+    groups.iter().enumerate().find_map(|(g, group)| {
+        group
+            .get("hooks")?
+            .as_array()?
+            .iter()
+            .position(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_agent_mux_hook_command)
+            })
+            .map(|h| (g, h))
+    })
+}
+
+/// User-facing explanation of a [`CodexHookTrust`] state, printed by
+/// `install-hooks --agent codex`. `None` when nothing needs saying.
+#[must_use]
+pub fn describe_codex_trust(trust: &CodexHookTrust) -> Option<&'static str> {
+    match trust {
+        CodexHookTrust::NotInstalled => None,
+        CodexHookTrust::Untrusted => Some(
+            "Codex will NOT run this hook until you trust it. Start `codex` once on this \
+             machine and choose \"Trust all and continue\" (or \"Review hooks\") at the \
+             \"Hooks need review\" prompt. Until then a Codex session waiting on an \
+             approval reads as working in agent-mux.",
+        ),
+        CodexHookTrust::Disabled => Some(
+            "The agent-mux hook is disabled in Codex's hooks review; re-enable it there \
+             or Codex approvals won't surface in agent-mux.",
+        ),
+        CodexHookTrust::Trusted => Some(
+            "Codex has a trust record for this hook. If you just changed it, Codex will \
+             ask you to review it again the next time it starts.",
+        ),
+    }
+}
 
 /// Merge `desired_command` into one hook-event array (claude's
 /// `Notification` array, or one of codex's event arrays), preserving every
@@ -255,6 +429,9 @@ fn combine_actions(acc: InstallAction, next: InstallAction) -> InstallAction {
         (prev @ InstallAction::Updated { .. }, _) => prev,
         (_, next @ InstallAction::Updated { .. }) => next,
         (InstallAction::Added, _) | (_, InstallAction::Added) => InstallAction::Added,
+        (InstallAction::RemovedLegacy, _) | (_, InstallAction::RemovedLegacy) => {
+            InstallAction::RemovedLegacy
+        }
         (InstallAction::NoOp, InstallAction::NoOp) => InstallAction::NoOp,
     }
 }
@@ -387,7 +564,24 @@ pub fn install_codex_hooks_at<W: Write>(
         "lifecycle hooks",
         dry_run,
         out,
-    )
+    )?;
+    // Codex gates every non-managed hook on the user's trust; report where
+    // this handler stands so a silent "installed but never runs" can't
+    // happen. On a dry run, classify the *planned* content.
+    let hooks_json = if dry_run {
+        plan.new_content.clone()
+    } else {
+        read_current(hooks_path)?
+    };
+    let config_toml = read_current(&hooks_path.with_file_name("config.toml"))?;
+    let trust = codex_hook_trust(hooks_path, &hooks_json, &config_toml);
+    // A trusted, unchanged handler needs no commentary.
+    let unchanged_and_trusted =
+        trust == CodexHookTrust::Trusted && plan.action == InstallAction::NoOp;
+    if let Some(msg) = describe_codex_trust(&trust).filter(|_| !unchanged_and_trusted) {
+        writeln!(out, "\n{msg}")?;
+    }
+    Ok(())
 }
 
 /// Read the current hooks/settings file, treating a missing file as empty
@@ -496,6 +690,9 @@ pub fn describe_action(action: &InstallAction, what: &str) -> String {
         InstallAction::Added => format!("added agent-mux {what} entry"),
         InstallAction::Updated { previous_command } => {
             format!("updated stale agent-mux {what} entry (was: {previous_command})")
+        }
+        InstallAction::RemovedLegacy => {
+            format!("removed a legacy agent-mux {what} entry no longer needed")
         }
     }
 }
@@ -744,27 +941,30 @@ mod tests {
         assert!(s.contains("/old/agent-mux hook"), "got: {s}");
     }
 
-    // ---- codex installer (WP8) ----
+    // ---- codex installer (WP8; PermissionRequest-only since 2026-10-02) ----
+
+    const CODEX_CMD: &str = "/usr/local/bin/agent-mux hook --agent codex";
 
     #[test]
-    fn plan_install_codex_creates_both_event_handlers_when_empty() {
+    fn plan_install_codex_creates_only_the_permission_request_handler_when_empty() {
         let plan = plan_install_codex("", &binary()).unwrap();
         assert_eq!(plan.action, InstallAction::Added);
         let value: Value = serde_json::from_str(&plan.new_content).unwrap();
-        for event in ["PermissionRequest", "Stop"] {
-            let cmd = value["hooks"][event][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap_or_else(|| panic!("missing command for {event}"));
-            assert_eq!(cmd, "/usr/local/bin/agent-mux hook --agent codex");
-        }
+        assert_eq!(
+            value["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            CODEX_CMD
+        );
+        assert!(
+            value["hooks"].get("Stop").is_none(),
+            "turn-complete comes from the rollout; no Stop handler"
+        );
     }
 
     #[test]
-    fn plan_install_codex_is_noop_when_both_handlers_present() {
+    fn plan_install_codex_is_noop_when_handler_present() {
         let input = r#"{
   "hooks": {
-    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}]
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}]
   }
 }"#;
         let plan = plan_install_codex(input, &binary()).unwrap();
@@ -772,11 +972,48 @@ mod tests {
     }
 
     #[test]
+    fn plan_install_codex_removes_legacy_stop_handler() {
+        // An earlier install wrote both handlers; re-running drops ours from
+        // Stop (and the now-empty key) while keeping PermissionRequest.
+        let input = r#"{
+  "hooks": {
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/agent-mux hook --agent codex"}]}]
+  }
+}"#;
+        let plan = plan_install_codex(input, &binary()).unwrap();
+        assert_eq!(plan.action, InstallAction::RemovedLegacy);
+        let value: Value = serde_json::from_str(&plan.new_content).unwrap();
+        assert!(value["hooks"].get("Stop").is_none());
+        assert_eq!(
+            value["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            CODEX_CMD
+        );
+    }
+
+    #[test]
+    fn plan_install_codex_legacy_stop_removal_keeps_foreign_stop_handlers() {
+        let input = r#"{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/other/tool"}, {"type": "command", "command": "/old/agent-mux hook --agent codex"}]},
+      {"hooks": [{"type": "command", "command": "/old/agent-mux hook --agent codex"}]}
+    ]
+  }
+}"#;
+        let plan = plan_install_codex(input, &binary()).unwrap();
+        let value: Value = serde_json::from_str(&plan.new_content).unwrap();
+        let stop = value["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "the emptied group is dropped");
+        assert_eq!(stop[0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(stop[0]["hooks"][0]["command"], "/other/tool");
+    }
+
+    #[test]
     fn plan_install_codex_updates_stale_path_in_place() {
         let input = r#"{
   "hooks": {
-    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/old/agent-mux hook --agent codex"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "/old/agent-mux hook --agent codex"}]}]
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "/old/agent-mux hook --agent codex"}]}]
   }
 }"#;
         let plan = plan_install_codex(input, &binary()).unwrap();
@@ -787,19 +1024,15 @@ mod tests {
             other => panic!("expected Updated, got {other:?}"),
         }
         let value: Value = serde_json::from_str(&plan.new_content).unwrap();
-        for event in ["PermissionRequest", "Stop"] {
-            assert_eq!(
-                value["hooks"][event][0]["hooks"][0]["command"],
-                "/usr/local/bin/agent-mux hook --agent codex",
-                "{event} stale entry replaced in place"
-            );
-        }
+        assert_eq!(
+            value["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
+            CODEX_CMD
+        );
     }
 
     #[test]
     fn plan_install_codex_preserves_unrelated_hook_events() {
-        // A user's own SessionStart handler must survive untouched
-        // alongside the two we add.
+        // A user's own SessionStart handler must survive untouched.
         let input = r#"{
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command", "command": "/other/tool"}]}]
@@ -813,7 +1046,6 @@ mod tests {
             "/other/tool"
         );
         assert!(value["hooks"]["PermissionRequest"].is_array());
-        assert!(value["hooks"]["Stop"].is_array());
     }
 
     #[test]
@@ -829,9 +1061,69 @@ mod tests {
         let arr = value["hooks"]["PermissionRequest"].as_array().unwrap();
         assert_eq!(arr.len(), 2, "foreign handler preserved, ours appended");
         assert_eq!(arr[0]["hooks"][0]["command"], "/other/tool");
+        assert_eq!(arr[1]["hooks"][0]["command"], CODEX_CMD);
+    }
+
+    // ---- codex hook trust ----
+
+    fn hooks_with_ours_at_group(group: usize) -> String {
+        let mut groups: Vec<Value> = (0..group)
+            .map(|_| json!({"hooks": [{"type": "command", "command": "/other/tool"}]}))
+            .collect();
+        groups.push(json!({"hooks": [{"type": "command", "command": CODEX_CMD}]}));
+        json!({"hooks": {"PermissionRequest": groups}}).to_string()
+    }
+
+    #[test]
+    fn codex_hook_trust_not_installed_without_our_handler() {
+        let p = Path::new("/h/.codex/hooks.json");
+        assert_eq!(codex_hook_trust(p, "", ""), CodexHookTrust::NotInstalled);
         assert_eq!(
-            arr[1]["hooks"][0]["command"],
-            "/usr/local/bin/agent-mux hook --agent codex"
+            codex_hook_trust(p, r#"{"hooks":{"Stop":[]}}"#, ""),
+            CodexHookTrust::NotInstalled
+        );
+    }
+
+    #[test]
+    fn codex_hook_trust_untrusted_without_a_state_record() {
+        let p = Path::new("/h/.codex/hooks.json");
+        assert_eq!(
+            codex_hook_trust(p, &hooks_with_ours_at_group(0), "model = \"x\"\n"),
+            CodexHookTrust::Untrusted
+        );
+    }
+
+    #[test]
+    fn codex_hook_trust_reads_the_positional_state_key() {
+        // Key shape mirrors codex 0.142.5 `hook_key`:
+        // "<hooks file>:permission_request:<group>:<handler>".
+        let p = Path::new("/h/.codex/hooks.json");
+        let config = r#"
+[hooks.state."/h/.codex/hooks.json:permission_request:1:0"]
+trusted_hash = "sha256:abc"
+"#;
+        assert_eq!(
+            codex_hook_trust(p, &hooks_with_ours_at_group(1), config),
+            CodexHookTrust::Trusted
+        );
+        // A record for a different position doesn't count.
+        assert_eq!(
+            codex_hook_trust(p, &hooks_with_ours_at_group(0), config),
+            CodexHookTrust::Untrusted
+        );
+    }
+
+    #[test]
+    fn codex_hook_trust_disabled_wins_over_trusted_hash() {
+        let p = Path::new("/h/.codex/hooks.json");
+        let config = r#"
+[hooks.state."/h/.codex/hooks.json:permission_request:0:0"]
+enabled = false
+trusted_hash = "sha256:abc"
+"#;
+        assert_eq!(
+            codex_hook_trust(p, &hooks_with_ours_at_group(0), config),
+            CodexHookTrust::Disabled
         );
     }
 
@@ -855,10 +1147,31 @@ mod tests {
             value["hooks"]["PermissionRequest"][0]["hooks"][0]["command"],
             "/usr/local/bin/agent-mux hook --agent codex"
         );
-        assert_eq!(
-            value["hooks"]["Stop"][0]["hooks"][0]["command"],
-            "/usr/local/bin/agent-mux hook --agent codex"
+        assert!(value["hooks"].get("Stop").is_none());
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("NOT run this hook until you trust it"),
+            "fresh install explains Codex's trust gate: {out}"
         );
+    }
+
+    #[test]
+    fn install_codex_hooks_at_is_quiet_about_trust_when_unchanged_and_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = tmp.path().join("hooks.json");
+        install_codex_hooks_at(&hooks, &binary(), false, &mut Vec::new()).unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                "[hooks.state.\"{}:permission_request:0:0\"]\ntrusted_hash = \"sha256:x\"\n",
+                hooks.display()
+            ),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        install_codex_hooks_at(&hooks, &binary(), false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("trust"), "nothing to say: {out}");
     }
 
     #[test]

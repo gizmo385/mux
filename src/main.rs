@@ -171,27 +171,20 @@ fn main() -> io::Result<()> {
             // file into `<transcripts-root>/.agent-mux-hooks/`. Default is
             // Claude Code; `--agent codex` selects the codex vocabulary.
             let mut stderr = io::stderr();
-            let written = if arg_agent_is_codex(&argv) {
-                // Codex payloads carry no `transcript_path`, so resolve the
-                // marker dir from the codex transcript root (config override
-                // → agent default), which is exactly what the local hook
-                // watcher + remote poller drain. Best-effort config load —
-                // the hook is a short-lived fire-and-forget subprocess.
-                let cfg = Config::load().unwrap_or_default();
-                let root = cfg
-                    .transcript_root_for(None, AgentKind::Codex)
-                    .map(|r| config::expand_tilde(&r))
-                    .ok_or_else(|| {
-                        io::Error::other("no codex transcript root resolved on this platform")
-                    })?;
-                let hooks_dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
-                agent_mux::hook_ingest::receive_codex_hook_from_stdin(
-                    &mut io::stdin().lock(),
-                    &hooks_dir,
-                    SystemTime::now(),
-                    &mut stderr,
-                )?
-            } else {
+            if arg_agent_is_codex(&argv) {
+                // Codex parses hook stdout as a JSON decision and exit code
+                // 2 as "block": a plain-text stdout line marks a `Stop` run
+                // Failed ("invalid stop hook JSON output") on every turn, and
+                // exit 2 on `Stop` feeds stderr back to the model as a
+                // continuation prompt. So the codex producer is silent on
+                // stdout and always exits 0 — errors go to stderr only,
+                // which codex ignores on a zero exit.
+                if let Err(e) = run_codex_hook(&mut stderr) {
+                    let _ = writeln!(stderr, "agent-mux: codex hook failed: {e}");
+                }
+                return Ok(());
+            }
+            let written = {
                 // Claude: the transcripts root comes from the payload's
                 // `transcript_path` field — same path shape on local and
                 // remote machines. The cache-dir fallback only fires for
@@ -252,6 +245,28 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// Codex hook producer body: resolve the marker dir from the codex
+/// transcript root (config override → agent default) — exactly what the
+/// local hook watcher + remote poller drain — and write the marker. The
+/// payload's own `transcript_path` is deliberately not used: config is the
+/// source of truth for where the consumer watches. Best-effort config load
+/// — the hook is a short-lived fire-and-forget subprocess.
+fn run_codex_hook(stderr: &mut impl Write) -> io::Result<()> {
+    let cfg = Config::load().unwrap_or_default();
+    let root = cfg
+        .transcript_root_for(None, AgentKind::Codex)
+        .map(|r| config::expand_tilde(&r))
+        .ok_or_else(|| io::Error::other("no codex transcript root resolved on this platform"))?;
+    let hooks_dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
+    agent_mux::hook_ingest::receive_codex_hook_from_stdin(
+        &mut io::stdin().lock(),
+        &hooks_dir,
+        SystemTime::now(),
+        stderr,
+    )?;
+    Ok(())
 }
 
 /// Whether a `hook` / `install-hooks` invocation carried `--agent codex`.

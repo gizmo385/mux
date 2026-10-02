@@ -512,10 +512,16 @@ impl TmuxDriver {
 /// cost as the pre-2026-05-20 cwd-only call. Session names
 /// disambiguate the "two sessions in the same `project_dir`" collision
 /// that cwd-only matching otherwise resolves arbitrarily.
+///
+/// `titles` carries each pane's `#{pane_title}` (the OSC 0/2 title the
+/// program inside set) for agents that advertise out-of-band state there
+/// (Codex's `[ ! ] Action Required` approval title). All three vectors
+/// are index-aligned: index `i` describes one pane.
 #[derive(Debug, Clone, Default)]
 pub struct LivePaneSnapshot {
     pub cwds: Vec<PathBuf>,
     pub session_names: Vec<String>,
+    pub titles: Vec<String>,
 }
 
 /// List the live tmux panes on `host` — their owning `session_name`
@@ -527,17 +533,21 @@ pub struct LivePaneSnapshot {
 ///
 /// Dispatches by host: local invokes `tmux` directly, remote shells
 /// out via `host.ssh_argv(false, ...)` over the existing
-/// `ControlMaster`. Output format is `#{session_name}\t#{pane_current_path}`
-/// — tab keeps cwds with spaces intact, and tmux's default session
-/// naming rules disallow tabs in names so the parser doesn't have to
-/// guess the split.
+/// `ControlMaster`. Output format is
+/// `#{session_name}\t#{pane_current_path}\t#{pane_title}` — tab keeps
+/// cwds with spaces intact, and tmux's default session naming rules
+/// disallow tabs in names so the parser doesn't have to guess the split.
+/// The title is *last* because it is program-controlled text that may
+/// itself contain tabs: the parser splits off the first two fields and
+/// takes the remainder verbatim. (A cwd containing a tab would shift the
+/// split — accepted, as before.)
 #[must_use]
 pub fn list_live_panes(host: &dyn Host) -> LivePaneSnapshot {
     let tmux_args = [
         "list-panes",
         "-a",
         "-F",
-        "#{session_name}\t#{pane_current_path}",
+        "#{session_name}\t#{pane_current_path}\t#{pane_title}",
     ];
     let output = if host.id().is_local() {
         Command::new("tmux").args(tmux_args).output()
@@ -565,28 +575,28 @@ pub fn list_live_panes(host: &dyn Host) -> LivePaneSnapshot {
     parse_pane_records(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Pure parser for `#{session_name}\t#{pane_current_path}` records:
-/// one pane per line, blank lines skipped, lines without a tab
+/// Pure parser for `#{session_name}\t#{pane_current_path}\t#{pane_title}`
+/// records: one pane per line, blank lines skipped, lines without a tab
 /// dropped (defensive — should not occur with the format string above
-/// but a malformed line shouldn't poison the whole snapshot).
+/// but a malformed line shouldn't poison the whole snapshot). A line with
+/// no title field (an older two-field record) yields an empty title; any
+/// further tabs belong to the title.
 #[must_use]
 pub fn parse_pane_records(tmux_output: &str) -> LivePaneSnapshot {
-    let mut cwds = Vec::new();
-    let mut session_names = Vec::new();
+    let mut snap = LivePaneSnapshot::default();
     for line in tmux_output.lines() {
         if line.is_empty() {
             continue;
         }
-        let Some((name, cwd)) = line.split_once('\t') else {
+        let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        session_names.push(name.to_string());
-        cwds.push(PathBuf::from(cwd));
+        let (cwd, title) = rest.split_once('\t').unwrap_or((rest, ""));
+        snap.session_names.push(name.to_string());
+        snap.cwds.push(PathBuf::from(cwd));
+        snap.titles.push(title.to_string());
     }
-    LivePaneSnapshot {
-        cwds,
-        session_names,
-    }
+    snap
 }
 
 fn find_pane_remote(
@@ -2412,6 +2422,29 @@ mod tests {
             ]
         );
         assert_eq!(snap.session_names, vec!["main", "agent-mux-abc"]);
+    }
+
+    #[test]
+    fn parse_pane_records_captures_titles_verbatim_including_tabs() {
+        // The title is program-controlled and last: separators and odd
+        // characters inside it must not shift the session/cwd split.
+        let out = "agent-mux-abc\t/w\t[ ! ] Action Required | w\n\
+                   main\t/x\ta\tb | c\n\
+                   plain\t/y\t\n\
+                   old\t/z\n";
+        let snap = parse_pane_records(out);
+        assert_eq!(
+            snap.session_names,
+            vec!["agent-mux-abc", "main", "plain", "old"]
+        );
+        assert_eq!(
+            snap.cwds,
+            ["/w", "/x", "/y", "/z"].map(PathBuf::from).to_vec()
+        );
+        assert_eq!(
+            snap.titles,
+            vec!["[ ! ] Action Required | w", "a\tb | c", "", ""]
+        );
     }
 
     #[test]

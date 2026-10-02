@@ -227,6 +227,27 @@ pub trait AgentCli: Send + Sync {
     /// Command string that resumes an existing session by id, used by the
     /// tmux resume fallback (`claude --resume <id>`).
     fn resume_command(&self, id: &SessionId) -> String;
+
+    /// Interpret a live tmux pane's title (`#{pane_title}`, i.e. the OSC
+    /// 0/2 title the agent's TUI sets) as an out-of-band attention signal.
+    /// Some states never reach the transcript — Codex's approval prompts
+    /// are never persisted — but the agent advertises them in its terminal
+    /// title, which the pane poller already reads every tick on every host.
+    /// `None` (the default) means the title carries nothing this agent
+    /// recognises.
+    fn title_signal(&self, _title: &str) -> Option<TitleSignal> {
+        None
+    }
+}
+
+/// An attention signal read from a pane title (see
+/// [`AgentCli::title_signal`]). Applied through the same path as a hook
+/// event, so it pins and notifies exactly like one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleSignal {
+    /// The agent is blocked on the user (an approval prompt). `message` is
+    /// the toast body.
+    Blocked { message: &'static str },
 }
 
 static CLAUDE: crate::agents::claude::ClaudeAgent = crate::agents::claude::ClaudeAgent;

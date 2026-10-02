@@ -30,10 +30,18 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::agent::{
-    AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TranscriptMeta,
+    AgentCli, AgentDerivation, AgentKind, ListingSpec, SpawnPlan, TitleSignal, TranscriptMeta,
     bounded_last_message,
 };
 use crate::session::{Attention, EDITED_FILES_CAP, SessionId};
+
+/// Title prefixes codex's TUI sets while an approval prompt is pending (the
+/// `activity` item of `[tui] terminal_title`, on by default). The marker
+/// blinks between the two phases once a second
+/// (`TERMINAL_TITLE_ACTION_REQUIRED_PREFIX{,_HIDDEN}` in codex's
+/// `status_surfaces.rs`), so a pane poll lands on either; matching only
+/// the `!` phase reads every other sample as "cleared".
+const CODEX_ACTION_REQUIRED_TITLES: [&str; 2] = ["[ ! ] Action Required", "[ . ] Action Required"];
 
 /// Length of a canonical UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
 /// the trailing component of a codex rollout filename.
@@ -135,6 +143,30 @@ impl AgentCli for CodexAgent {
         // fallback wraps this in `tmux new-session -A -s agent-mux-<id>
         // -c <cwd> …` via the shared `tmux_resume_argv` machinery.
         format!("codex resume {}", id.0)
+    }
+
+    /// Codex's default `[tui] terminal_title` (`["activity", "project-name"]`)
+    /// prefixes the title with `[ ! ] Action Required` while an approval
+    /// prompt is open — verified 2026-10-02 against codex 0.142.5 (idle
+    /// `proj`, working `⠸ proj`, blocked `[ ! ] Action Required | proj`
+    /// blinking with `[ . ] Action Required | proj`).
+    /// It is the trust-free blocked signal: approvals never reach the
+    /// rollout, and the `PermissionRequest` hook only runs once trusted. A
+    /// user who drops `activity` from `terminal_title` loses it (the hook
+    /// still covers approvals for them). Per codex's source the title also
+    /// turns on for `request_user_input` questions, MCP elicitations and
+    /// app-link prompts (every bottom-pane view whose
+    /// `terminal_title_requires_action` is true) — states the
+    /// `PermissionRequest` hook never sees — so the toast wording stays
+    /// neutral rather than saying "approval".
+    fn title_signal(&self, title: &str) -> Option<TitleSignal> {
+        let title = title.trim_start();
+        CODEX_ACTION_REQUIRED_TITLES
+            .iter()
+            .any(|prefix| title.starts_with(prefix))
+            .then_some(TitleSignal::Blocked {
+                message: "Codex is waiting for your response",
+            })
     }
 }
 
@@ -667,6 +699,44 @@ mod tests {
         match plan {
             SpawnPlan::DiscoverAfterSpawn { argv } => assert_eq!(argv, vec!["codex".to_string()]),
             SpawnPlan::PinnedId { .. } => panic!("codex must not pin an id"),
+        }
+    }
+
+    #[test]
+    fn title_signal_detects_action_required_prefix() {
+        // Verbatim titles from a live codex 0.142.5 run (default
+        // `terminal_title`), 2026-10-02.
+        assert!(matches!(
+            codex().title_signal("[ ! ] Action Required | trust-work"),
+            Some(TitleSignal::Blocked { .. })
+        ));
+        assert!(
+            codex()
+                .title_signal("[ . ] Action Required | trust-work")
+                .is_some(),
+            "the blink's hidden phase is still blocked"
+        );
+        assert!(
+            codex().title_signal("  [ ! ] Action Required").is_some(),
+            "leading whitespace tolerated"
+        );
+        for title in [
+            "trust-work",
+            "⠸ trust-work",
+            "",
+            "proj [ ! ] Action Required",
+        ] {
+            assert_eq!(codex().title_signal(title), None, "{title:?}");
+        }
+    }
+
+    #[test]
+    fn non_codex_agents_ignore_titles() {
+        for kind in [AgentKind::Claude, AgentKind::Pi] {
+            assert_eq!(
+                crate::agent::agent(kind).title_signal("[ ! ] Action Required | x"),
+                None
+            );
         }
     }
 

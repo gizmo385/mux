@@ -143,10 +143,16 @@ pub enum WatcherEvent {
     /// command). Empty lists are a valid value (no live panes / no tmux server
     /// / ssh hiccup) — every session on the host transitions to
     /// `Some(false)` in that case.
+    ///
+    /// `titles` (index-aligned too) carries each pane's `#{pane_title}`,
+    /// which the main loop interprets per agent
+    /// ([`crate::agent::AgentCli::title_signal`]) for states the
+    /// transcript never records — Codex's approval prompt.
     LivePanes {
         host: HostId,
         cwds: Vec<PathBuf>,
         session_names: Vec<String>,
+        titles: Vec<String>,
     },
     /// An off-thread [`crate::discovery::build_session`] finished for
     /// `path` on `host` (see [`crate::session_builder`]). Emitted in
@@ -771,6 +777,7 @@ impl TranscriptWatcher {
                         host: host_id.clone(),
                         cwds: snap.cwds,
                         session_names: snap.session_names,
+                        titles: snap.titles,
                     })
                     .is_err()
                 {

@@ -210,7 +210,8 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
 /// shape was best-effort; the 0.142.5 binary's hook input struct carries
 /// `session_id`, `transcript_path`, `cwd`, `hook_event_name`,
 /// `permission_mode`, `turn_id`, `stop_hook_active`,
-/// `last_assistant_message`, `prompt`). agent-mux installs exactly two handlers:
+/// `last_assistant_message`, `prompt`). Two events are handled (the
+/// installer writes only the first since 2026-10-02):
 ///
 /// - `PermissionRequest` — the agent is blocked waiting on an approval →
 ///   normalise to a **blocking** marker (the `permission_prompt`
@@ -218,12 +219,18 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
 /// - `Stop` — the turn completed → normalise to a **non-blocking**
 ///   turn-complete marker (the `idle_prompt` equivalent).
 ///
-/// Codex 0.142.5 payloads do carry `transcript_path` (verified against
-/// the real binary 2026-10-02), but the caller still resolves `hooks_dir`
-/// from the configured codex transcript root
-/// (`~/.codex/sessions/.agent-mux-hooks/`) the same way config/agents do,
-/// and passes it in — config is the source of truth for where the
-/// consumer watches. The marker is written using the **existing** claude
+/// **Marker directory.** Codex 0.142.5 payloads carry `transcript_path`
+/// (the absolute rollout path), so — like the claude producer — the
+/// marker lands in `<root>/.agent-mux-hooks/` of the tree the rollout
+/// actually lives in, with `<root>` recovered through the codex
+/// [`crate::agent::AgentCli::transcripts_root_of`] (the tree depth is
+/// agent knowledge). That is the directory the dashboard drains for this
+/// session wherever it runs: on a remote host the dashboard's poller
+/// reads the root *its* config names for that host, and the rollout path
+/// is ground truth for it, whereas the remote machine's own agent-mux
+/// config may name nothing (or something else). `fallback_dir` (the
+/// producer machine's configured codex root) is used only when the
+/// payload has no usable `transcript_path`. The marker is written using the **existing** claude
 /// marker vocabulary (`session_id` + a synthesised `notification_type` +
 /// an optional `message`), so the consumer ([`parse_marker_content`],
 /// [`crate::watcher`]'s `poll_hooks_once`, and the catalog's
@@ -242,7 +249,7 @@ fn target_dir_from_payload(payload: &str) -> Option<PathBuf> {
 /// without a `session_id` returns [`io::ErrorKind::InvalidData`].
 pub fn receive_codex_hook_from_stdin<R: Read, W: Write>(
     stdin_reader: &mut R,
-    hooks_dir: &Path,
+    fallback_dir: Option<&Path>,
     now: SystemTime,
     stderr_log: &mut W,
 ) -> io::Result<Option<PathBuf>> {
@@ -250,6 +257,14 @@ pub fn receive_codex_hook_from_stdin<R: Read, W: Write>(
     stdin_reader.read_to_string(&mut buf)?;
     let session_id = parse_session_id(&buf)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing session_id field"))?;
+    let hooks_dir = codex_target_dir_from_payload(&buf)
+        .or_else(|| fallback_dir.map(Path::to_path_buf))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no transcript_path in payload and no codex transcript root configured",
+            )
+        })?;
     let event_name = parse_hook_event_name(&buf);
     let label = event_name.as_deref().unwrap_or("<missing>");
     let last_assistant_message = parse_string_field(&buf, "last_assistant_message");
@@ -268,8 +283,22 @@ pub fn receive_codex_hook_from_stdin<R: Read, W: Write>(
         "agent-mux: codex hook hook_event_name={label} session_id={session_id} \u{2192} writing marker to {}",
         hooks_dir.display()
     );
-    let path = persist_marker(hooks_dir, &session_id, now, &marker)?;
+    let path = persist_marker(&hooks_dir, &session_id, now, &marker)?;
     Ok(Some(path))
+}
+
+/// The hook dir for a codex payload's `transcript_path`: the rollout's
+/// transcript-tree root (via the codex agent's tree shape) plus
+/// [`HOOK_SUBDIR`]. `None` when the field is absent, relative, or not a
+/// top-level codex rollout path.
+fn codex_target_dir_from_payload(payload: &str) -> Option<PathBuf> {
+    let transcript = PathBuf::from(parse_string_field(payload, "transcript_path")?);
+    if !transcript.is_absolute() {
+        return None;
+    }
+    let root =
+        crate::agent::agent(crate::agent::AgentKind::Codex).transcripts_root_of(&transcript)?;
+    Some(hook_dir_for_transcripts_root(&root))
 }
 
 /// Map a codex `hook_event_name` to the `(notification_type, message)` the
@@ -689,11 +718,70 @@ mod tests {
         let mut log = Vec::new();
         let result = receive_codex_hook_from_stdin(
             &mut input,
-            hooks_dir,
+            Some(hooks_dir),
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_234_567),
             &mut log,
         );
         (result, String::from_utf8(log).unwrap())
+    }
+
+    #[test]
+    fn codex_marker_lands_under_the_rollouts_own_root_from_transcript_path() {
+        // A remote dashboard drains `<root it configured>/.agent-mux-hooks`;
+        // the payload's rollout path names that root exactly, so it wins
+        // over this machine's (possibly different/absent) configured root.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("custom-codex-root");
+        let rollout = root.join(
+            "2026/10/02/rollout-2026-10-02T00-34-16-01a0fb89-084f-74f0-b001-3ab060227f2e.jsonl",
+        );
+        let fallback = tmp.path().join("elsewhere/.agent-mux-hooks");
+        let payload = serde_json::json!({
+            "session_id": "01a0fb89-084f-74f0-b001-3ab060227f2e",
+            "hook_event_name": "PermissionRequest",
+            "transcript_path": rollout,
+        })
+        .to_string();
+        let (result, _) = dispatch_codex(&payload, &fallback);
+        let path = result.unwrap().expect("marker written");
+        assert_eq!(path.parent(), Some(root.join(HOOK_SUBDIR).as_path()));
+        assert!(
+            !fallback.exists(),
+            "fallback unused when transcript_path is usable"
+        );
+    }
+
+    #[test]
+    fn codex_marker_falls_back_when_transcript_path_is_not_a_rollout() {
+        let tmp = TempDir::new().unwrap();
+        for bad in [
+            "relative/rollout-x.jsonl",
+            "/too/shallow.jsonl",
+            "/a/b/c/d/notes.txt",
+        ] {
+            let payload = serde_json::json!({
+                "session_id": "cx-f",
+                "hook_event_name": "PermissionRequest",
+                "transcript_path": bad,
+            })
+            .to_string();
+            let (result, _) = dispatch_codex(&payload, tmp.path());
+            let path = result.unwrap().expect("marker written");
+            assert_eq!(path.parent(), Some(tmp.path()), "fell back for {bad}");
+        }
+    }
+
+    #[test]
+    fn codex_hook_without_transcript_path_or_fallback_is_invalid_data() {
+        let mut input = Cursor::new(br#"{"session_id":"cx","hook_event_name":"Stop"}"#.to_vec());
+        let err = receive_codex_hook_from_stdin(
+            &mut input,
+            None,
+            SystemTime::UNIX_EPOCH,
+            &mut Vec::new(),
+        )
+        .expect_err("nowhere to write");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

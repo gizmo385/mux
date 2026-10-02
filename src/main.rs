@@ -28,7 +28,7 @@ use agent_mux::attachment::{
     find_pane_local, pending_spawn_nonce, probe_live_writer,
 };
 use agent_mux::cache;
-use agent_mux::catalog::SessionCatalog;
+use agent_mux::catalog::{PendingHook, SessionCatalog};
 use agent_mux::cli;
 use agent_mux::config::{self, Config, Theme, ToolBinding};
 use agent_mux::dashboard::{
@@ -247,22 +247,20 @@ fn main() -> io::Result<()> {
     }
 }
 
-/// Codex hook producer body: resolve the marker dir from the codex
-/// transcript root (config override → agent default) — exactly what the
-/// local hook watcher + remote poller drain — and write the marker. The
-/// payload's own `transcript_path` is deliberately not used: config is the
-/// source of truth for where the consumer watches. Best-effort config load
-/// — the hook is a short-lived fire-and-forget subprocess.
+/// Codex hook producer body. The marker dir comes from the payload's
+/// `transcript_path` (the rollout's own tree — what the dashboard drains
+/// for that session, local or remote); this machine's configured codex
+/// root (config override → agent default) is only the fallback for a
+/// payload without one. Best-effort config load — the hook is a
+/// short-lived fire-and-forget subprocess.
 fn run_codex_hook(stderr: &mut impl Write) -> io::Result<()> {
     let cfg = Config::load().unwrap_or_default();
-    let root = cfg
+    let fallback = cfg
         .transcript_root_for(None, AgentKind::Codex)
-        .map(|r| config::expand_tilde(&r))
-        .ok_or_else(|| io::Error::other("no codex transcript root resolved on this platform"))?;
-    let hooks_dir = agent_mux::hook_ingest::hook_dir_for_transcripts_root(&root);
+        .map(|r| agent_mux::hook_ingest::hook_dir_for_transcripts_root(&config::expand_tilde(&r)));
     agent_mux::hook_ingest::receive_codex_hook_from_stdin(
         &mut io::stdin().lock(),
-        &hooks_dir,
+        fallback.as_deref(),
         SystemTime::now(),
         stderr,
     )?;
@@ -2250,22 +2248,20 @@ impl App {
                     // — the catalog still applies the transition, but
                     // a stack of pre-launch hook events doesn't fire
                     // a stack of OS toasts at the user.
-                    let prev = self
-                        .catalog
-                        .apply_hook_event(&id, blocking_prompt, received_at);
-                    if let Some(prev) = prev {
-                        self.fire_attention_notification(
-                            &id,
-                            prev,
-                            agent_mux::session::Attention::NeedsInput,
-                            Some(received_at),
-                            message.as_deref(),
+                    //
+                    // A hook for a session the catalog doesn't know yet
+                    // (it out-raced discovery) is held, not dropped — the
+                    // marker is already consumed — and applied by
+                    // `apply_ready_pending_hooks` once the session lands.
+                    if !self.apply_hook(&id, blocking_prompt, received_at, message.as_deref()) {
+                        self.catalog.defer_hook_event(
+                            id,
+                            PendingHook {
+                                blocking_prompt,
+                                received_at,
+                                message,
+                            },
                         );
-                        // A hook (permission prompt / turn-end nudge)
-                        // that moves the session into NeedsInput is the
-                        // same "agent stopped, user may act" boundary the
-                        // heuristic arm refreshes on.
-                        self.maybe_refresh_git_on_needs_input(&id, prev, Attention::NeedsInput);
                     }
                 }
                 WatcherEvent::NewTranscript {
@@ -2347,8 +2343,58 @@ impl App {
                 }
             }
         }
+        // Sessions may have entered the catalog during this drain (or via
+        // a remote discovery since the last one); apply any hook events
+        // that arrived ahead of them.
+        self.apply_ready_pending_hooks();
         self.refresh_favorite_metadata();
         self.reseat_selection_to(prior.as_ref());
+    }
+
+    /// Apply one hook event through the normal path: pin + force
+    /// `NeedsInput` in the catalog, fire the notifier transition (with
+    /// `received_at` as `source_at` for the startup-replay gate), and kick
+    /// the turn-end git refresh. Returns `false` when the session isn't in
+    /// the catalog (the caller defers the event).
+    fn apply_hook(
+        &mut self,
+        id: &SessionId,
+        blocking_prompt: bool,
+        received_at: SystemTime,
+        message: Option<&str>,
+    ) -> bool {
+        let Some(prev) = self
+            .catalog
+            .apply_hook_event(id, blocking_prompt, received_at)
+        else {
+            return false;
+        };
+        self.fire_attention_notification(
+            id,
+            prev,
+            Attention::NeedsInput,
+            Some(received_at),
+            message,
+        );
+        // A hook (permission prompt / turn-end nudge) that moves the
+        // session into NeedsInput is the same "agent stopped, user may
+        // act" boundary the heuristic arm refreshes on.
+        self.maybe_refresh_git_on_needs_input(id, prev, Attention::NeedsInput);
+        true
+    }
+
+    /// Apply held hook events (see `SessionCatalog::defer_hook_event`)
+    /// whose sessions have since surfaced — a no-op on the common path
+    /// where nothing is pending.
+    fn apply_ready_pending_hooks(&mut self) {
+        for (id, hook) in self.catalog.take_ready_pending_hooks(SystemTime::now()) {
+            self.apply_hook(
+                &id,
+                hook.blocking_prompt,
+                hook.received_at,
+                hook.message.as_deref(),
+            );
+        }
     }
 
     /// Route an attention transition to the notifier with the session's

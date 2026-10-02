@@ -170,7 +170,7 @@ When two or more agents are enabled, the dashboard marks each session row (and q
 
 ### Setup: Codex hooks
 
-Codex's "blocked on approval" state is never written to its transcript, so without a hook a blocked Codex session reads as *working*. Install Codex's `PermissionRequest` hook — on your local machine and every remote host that runs Codex — to surface it (writes `~/.codex/hooks.json`; idempotent; `--dry-run` previews):
+Codex's "blocked on approval" state is never written to its transcript, so without a hook a blocked Codex session reads as *working*. Install Codex's `PermissionRequest` hook — on your local machine and every remote host that runs Codex (the remote needs the `agent-mux` binary for the hook to call) — to surface it (writes `~/.codex/hooks.json`; idempotent; `--dry-run` previews). The hook writes its marker next to the session's own rollout tree, so a remote's markers land exactly where your dashboard polls for that host, even if you relocated its Codex root in your local `[hosts.<name>.agents.codex]` config:
 
 ```bash
 agent-mux install-hooks --agent codex

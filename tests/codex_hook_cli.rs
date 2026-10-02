@@ -76,3 +76,26 @@ fn malformed_payload_still_exits_zero_with_error_on_stderr_only() {
     );
     assert_eq!(marker_count(home.path()), 0);
 }
+
+#[test]
+fn marker_follows_the_payload_transcript_path_not_the_default_root() {
+    // Remote-host case: the dashboard drains the hooks dir under the codex
+    // root *it* configured for the host, which the rollout path names; this
+    // machine's default `~/.codex/sessions` must not win.
+    let home = tempfile::TempDir::new().unwrap();
+    let root = home.path().join("relocated-codex-sessions");
+    let rollout = root
+        .join("2026/10/02/rollout-2026-10-02T00-34-16-01a0fb89-084f-74f0-b001-3ab060227f2e.jsonl");
+    let payload = serde_json::json!({
+        "session_id": "01a0fb89-084f-74f0-b001-3ab060227f2e",
+        "hook_event_name": "PermissionRequest",
+        "transcript_path": rollout,
+    })
+    .to_string();
+    let out = run_hook(home.path(), &payload);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty(), "stdout must stay empty: {out:?}");
+    assert_eq!(marker_count(home.path()), 0, "default root untouched");
+    let markers = std::fs::read_dir(root.join(".agent-mux-hooks")).map_or(0, Iterator::count);
+    assert_eq!(markers, 1, "marker lands beside the rollout's own tree");
+}

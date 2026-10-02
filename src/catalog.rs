@@ -1,12 +1,36 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::session::{Attention, EDITED_FILES_CAP, HostId, Session, SessionId};
+
+/// How long a hook event for a not-yet-known session is held waiting for
+/// that session to surface (see [`SessionCatalog::defer_hook_event`]).
+/// Generous against a remote poll tick or a slow first discovery, short
+/// enough that a marker for a session that never appears can't resurface
+/// as a stale "blocked" much later.
+pub const PENDING_HOOK_TTL: Duration = Duration::from_secs(180);
+
+/// Upper bound on held hook events — a flood of markers for ids that never
+/// surface can't grow the map without bound. The oldest entry is dropped.
+pub const PENDING_HOOK_CAP: usize = 64;
+
+/// A hook event that arrived before its session was in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHook {
+    pub blocking_prompt: bool,
+    pub received_at: SystemTime,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Default)]
 pub struct SessionCatalog {
     sessions: Vec<Session>,
+    /// Hook events whose session wasn't known yet, keyed by session id
+    /// (latest event per id wins). Drained by
+    /// [`SessionCatalog::take_ready_pending_hooks`] once the session
+    /// surfaces. Ephemeral — never persisted.
+    pending_hooks: HashMap<SessionId, PendingHook>,
 }
 
 impl SessionCatalog {
@@ -176,6 +200,79 @@ impl SessionCatalog {
             }
         }
         None
+    }
+
+    /// Hold a hook event whose session isn't in the catalog yet — the
+    /// [`Self::apply_hook_event`] `None` case. The marker file is already
+    /// consumed by then, so dropping the event would lose the "blocked"
+    /// signal for good: a hook can out-race discovery (a codex
+    /// `PermissionRequest` firing before its new rollout is discovered, a
+    /// remote tick draining the marker ahead of the transcript, a root
+    /// that wasn't watched yet). Keeps the latest event per id; bounded by
+    /// [`PENDING_HOOK_CAP`] (oldest dropped). Agent-neutral.
+    pub fn defer_hook_event(&mut self, id: SessionId, hook: PendingHook) {
+        if self
+            .pending_hooks
+            .get(&id)
+            .is_some_and(|held| held.received_at > hook.received_at)
+        {
+            return;
+        }
+        self.pending_hooks.insert(id, hook);
+        while self.pending_hooks.len() > PENDING_HOOK_CAP {
+            let Some(oldest) = self
+                .pending_hooks
+                .iter()
+                .min_by_key(|(_, h)| h.received_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.pending_hooks.remove(&oldest);
+        }
+    }
+
+    /// Drain held hook events whose session has since surfaced, oldest
+    /// first, for the caller to apply through the normal hook path
+    /// ([`Self::apply_hook_event`] + notifier). Also prunes events older
+    /// than [`PENDING_HOOK_TTL`] (relative to `now`) whose session never
+    /// appeared.
+    ///
+    /// An event whose session surfaced *past* it is dropped rather than
+    /// returned — the late-applied pin must still mean something. The rule
+    /// mirrors the pin-release rule in [`Self::apply_heuristic_attention`]:
+    /// a session whose transcript mtime (`last_activity`) is newer than the
+    /// hook *and* whose derived state isn't `Working` has moved on (a
+    /// finished/answered turn), so the hook is stale. `Working` keeps the
+    /// hook: an open turn is exactly how a blocked prompt reads from the
+    /// transcript (codex never persists approvals; claude's `tool_use`).
+    pub fn take_ready_pending_hooks(&mut self, now: SystemTime) -> Vec<(SessionId, PendingHook)> {
+        if self.pending_hooks.is_empty() {
+            return Vec::new();
+        }
+        self.pending_hooks.retain(|_, h| {
+            now.duration_since(h.received_at)
+                .map_or(true, |age| age <= PENDING_HOOK_TTL)
+        });
+        let mut ready: Vec<(SessionId, PendingHook)> = Vec::new();
+        for session in &self.sessions {
+            let Some(hook) = self.pending_hooks.remove(&session.id) else {
+                continue;
+            };
+            let moved_on =
+                session.last_activity > hook.received_at && session.attention != Attention::Working;
+            if !moved_on {
+                ready.push((session.id.clone(), hook));
+            }
+        }
+        ready.sort_by_key(|(_, h)| h.received_at);
+        ready
+    }
+
+    /// Number of hook events currently held for unknown sessions.
+    #[must_use]
+    pub fn pending_hook_count(&self) -> usize {
+        self.pending_hooks.len()
     }
 
     /// Bump a session's `last_activity` to `mtime`, but only if the
@@ -641,6 +738,104 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    fn pending(blocking: bool, secs: u64) -> PendingHook {
+        PendingHook {
+            blocking_prompt: blocking,
+            received_at: at(secs),
+            message: Some(format!("m{secs}")),
+        }
+    }
+
+    fn session_at(id: &str, attention: Attention, last_activity_secs: u64) -> Session {
+        let mut s = session(id);
+        s.attention = attention;
+        s.last_activity = at(last_activity_secs);
+        s
+    }
+
+    #[test]
+    fn deferred_hook_applies_once_its_session_surfaces() {
+        // The live 2026-10-02 race: a codex PermissionRequest hook landed
+        // before its rollout was discovered. It's held, then released when
+        // the session arrives with an open turn (Working).
+        let mut c = SessionCatalog::new();
+        let id = SessionId("late".into());
+        assert_eq!(c.apply_hook_event(&id, true, at(100)), None);
+        c.defer_hook_event(id.clone(), pending(true, 100));
+        assert!(
+            c.take_ready_pending_hooks(at(101)).is_empty(),
+            "still unknown"
+        );
+        assert_eq!(c.pending_hook_count(), 1);
+
+        c.add(session_at("late", Attention::Working, 101));
+        let ready = c.take_ready_pending_hooks(at(102));
+        assert_eq!(ready, vec![(id.clone(), pending(true, 100))]);
+        assert_eq!(c.pending_hook_count(), 0, "drained");
+        // The caller applies it through the normal path.
+        assert_eq!(
+            c.apply_hook_event(&id, true, at(100)),
+            Some(Attention::Working)
+        );
+        assert!(c.sessions()[0].blocking_prompt);
+    }
+
+    #[test]
+    fn deferred_hook_is_dropped_when_the_session_already_moved_past_it() {
+        // Session surfaced with a finished turn written after the hook: the
+        // prompt was answered; a late "blocked" pin would be wrong.
+        let mut c = SessionCatalog::new();
+        c.defer_hook_event(SessionId("done".into()), pending(true, 100));
+        c.add(session_at("done", Attention::NeedsInput, 150));
+        assert!(c.take_ready_pending_hooks(at(151)).is_empty());
+        assert_eq!(c.pending_hook_count(), 0, "consumed, not re-held");
+    }
+
+    #[test]
+    fn deferred_hook_kept_when_transcript_is_not_newer() {
+        let mut c = SessionCatalog::new();
+        c.defer_hook_event(SessionId("s".into()), pending(false, 100));
+        c.add(session_at("s", Attention::NeedsInput, 90));
+        assert_eq!(c.take_ready_pending_hooks(at(101)).len(), 1);
+    }
+
+    #[test]
+    fn deferred_hook_expires_after_ttl() {
+        let mut c = SessionCatalog::new();
+        c.defer_hook_event(SessionId("ghost".into()), pending(true, 100));
+        let later = at(100) + PENDING_HOOK_TTL + std::time::Duration::from_secs(1);
+        assert!(c.take_ready_pending_hooks(later).is_empty());
+        assert_eq!(c.pending_hook_count(), 0, "expired entry pruned");
+        // Even if the session shows up afterwards, nothing is applied.
+        c.add(session_at("ghost", Attention::Working, 100));
+        assert!(c.take_ready_pending_hooks(later).is_empty());
+    }
+
+    #[test]
+    fn deferred_hook_keeps_latest_per_id_and_is_bounded() {
+        let mut c = SessionCatalog::new();
+        let id = SessionId("x".into());
+        c.defer_hook_event(id.clone(), pending(true, 200));
+        c.defer_hook_event(id.clone(), pending(false, 150)); // older: ignored
+        c.add(session_at("x", Attention::Working, 0));
+        assert_eq!(
+            c.take_ready_pending_hooks(at(201)),
+            vec![(id, pending(true, 200))]
+        );
+
+        let mut c = SessionCatalog::new();
+        for i in 0..(PENDING_HOOK_CAP as u64 + 5) {
+            c.defer_hook_event(SessionId(format!("n{i}")), pending(true, 1_000 + i));
+        }
+        assert_eq!(c.pending_hook_count(), PENDING_HOOK_CAP);
+        // The oldest were the ones dropped.
+        c.add(session_at("n0", Attention::Working, 0));
+        c.add(session_at("n60", Attention::Working, 0));
+        let ready = c.take_ready_pending_hooks(at(1_100));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, SessionId("n60".into()));
     }
 
     #[test]

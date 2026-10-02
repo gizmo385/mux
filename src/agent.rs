@@ -187,6 +187,23 @@ pub trait AgentCli: Send + Sync {
     /// `root`? Filters out sidechain/subagent transcripts nested deeper.
     fn is_transcript(&self, path: &Path, root: &Path) -> bool;
 
+    /// The transcript-tree root a top-level transcript at `path` lives
+    /// under — the inverse of [`Self::listing`]'s fixed depth (Claude's
+    /// `<root>/<bucket>/<id>.jsonl` → two levels up; Codex's
+    /// `<root>/YYYY/MM/DD/rollout-*.jsonl` → four). Used where only a
+    /// transcript path is known (a hook payload's `transcript_path`) to
+    /// find the per-root `.agent-mux-hooks/` directory. `None` for a
+    /// variable-depth tree, a path too shallow to have one, or a path the
+    /// agent doesn't recognise as a top-level transcript.
+    fn transcripts_root_of(&self, path: &Path) -> Option<PathBuf> {
+        let spec = self.listing();
+        if spec.mindepth != spec.maxdepth {
+            return None;
+        }
+        let root = path.ancestors().nth(spec.maxdepth)?;
+        self.is_transcript(path, root).then(|| root.to_path_buf())
+    }
+
     /// Derive a [`SessionId`] from a transcript path (the file stem for
     /// Claude). `None` when the path yields no usable id.
     fn session_id_from_path(&self, path: &Path) -> Option<SessionId>;
@@ -232,6 +249,28 @@ pub fn agent(kind: AgentKind) -> &'static dyn AgentCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcripts_root_of_inverts_each_agents_tree_depth() {
+        let claude = agent(AgentKind::Claude);
+        assert_eq!(
+            claude.transcripts_root_of(Path::new("/r/-w-proj/abc.jsonl")),
+            Some(PathBuf::from("/r"))
+        );
+        let codex = agent(AgentKind::Codex);
+        assert_eq!(
+            codex.transcripts_root_of(Path::new(
+                "/h/.codex/sessions/2026/10/02/rollout-2026-10-02T00-34-16-01a0fb89-084f-74f0-b001-3ab060227f2e.jsonl"
+            )),
+            Some(PathBuf::from("/h/.codex/sessions"))
+        );
+        // Not a codex rollout shape → no root.
+        assert_eq!(
+            codex.transcripts_root_of(Path::new("/r/x/notes.jsonl")),
+            None
+        );
+        assert_eq!(codex.transcripts_root_of(Path::new("/a.jsonl")), None);
+    }
 
     #[test]
     fn label_round_trips_through_from_label() {

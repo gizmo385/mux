@@ -60,7 +60,7 @@ use agent_mux::session_builder::SessionBuilders;
 use agent_mux::session_names::{SessionNameStore, default_store_path};
 use agent_mux::tool_launches::{ToolLaunch, ToolLaunchRegistry};
 use agent_mux::watcher::{
-    LOCAL_POLL_INTERVAL, REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent,
+    AttentionUpdate, LOCAL_POLL_INTERVAL, REMOTE_POLL_INTERVAL, TranscriptWatcher, WatcherEvent,
 };
 use agent_mux::worktree::WorktreeManager;
 
@@ -2234,71 +2234,7 @@ impl App {
         let prior = self.selected_anchor_for_reseat();
         while let Ok(event) = self.updates.try_recv() {
             match event {
-                WatcherEvent::Attention(update) => {
-                    // Heuristic-derived attention routes through the
-                    // hook-aware catalog method: while a session is
-                    // hook-pinned (NeedsInput forced by a Notification
-                    // hook event), a heuristic update with an mtime
-                    // older than the pin is suppressed so the pinned
-                    // state survives until the transcript actually
-                    // advances. When mtime advances past the pin, the
-                    // pin clears and the heuristic is applied
-                    // normally.
-                    let prev = self.catalog.apply_heuristic_attention(
-                        &update.id,
-                        update.attention,
-                        update.mtime,
-                        update.from_tool_use,
-                        update.last_message.as_deref(),
-                    );
-                    if let Some(mtime) = update.mtime {
-                        // Keeps the sidebar's "last activity" cell live
-                        // across an active conversation; without this it
-                        // would freeze at the discovery-time mtime.
-                        self.catalog.touch_activity(&update.id, mtime);
-                    }
-                    // Union the tail-derived recent edits into the
-                    // session's tracked list, independent of whether the
-                    // attention update above was hook-suppressed — the
-                    // edit list is its own signal. Empty (the common
-                    // no-edits-in-tail case) is a cheap no-op.
-                    self.catalog
-                        .merge_edited_files(&update.id, update.edited_files);
-                    if let Some(prev) = prev {
-                        // `update.mtime` flows through to the notifier
-                        // as `source_at` so the startup-replay gate
-                        // catches both the watcher's prime event and
-                        // the first tick of a remote poller — each
-                        // produces transitions derived from bytes
-                        // written before this run began, and a toast
-                        // for them would be a replay of pre-launch
-                        // state. Live notify-driven and live poll-tick
-                        // events carry a post-startup mtime and fire
-                        // normally. `None` (rare: stat failure)
-                        // disables the gate for that event so a
-                        // transient filesystem hiccup doesn't silently
-                        // mute a real transition.
-                        self.fire_attention_notification(
-                            &update.id,
-                            prev,
-                            update.attention,
-                            update.mtime,
-                            // The agent's final assistant message (set
-                            // only on a NeedsInput derivation) is the
-                            // toast body — the transcript twin of the
-                            // hook path's `message`. `None` (mid-turn, or
-                            // a final entry with no text) falls back to
-                            // project context in the formatter.
-                            update.last_message.as_deref(),
-                        );
-                        // A turn-end (transition *into* NeedsInput) is
-                        // both the moment programmatic file changes have
-                        // landed and the moment the user reaches for the
-                        // `{file}` tool — refresh the git-changed set in
-                        // the background so the picker has it ready.
-                        self.maybe_refresh_git_on_needs_input(&update.id, prev, update.attention);
-                    }
-                }
+                WatcherEvent::Attention(update) => self.handle_attention_update(update),
                 WatcherEvent::Hook {
                     id,
                     received_at,
@@ -2642,6 +2578,76 @@ impl App {
                 changed,
             });
         });
+    }
+
+    /// Apply one heuristic (transcript-derived) attention update: the
+    /// hook-aware catalog transition, the live `last_activity` touch, the
+    /// tail's edited files, and — on a real transition — the notifier and
+    /// the turn-end git refresh.
+    fn handle_attention_update(&mut self, update: AttentionUpdate) {
+        // Heuristic-derived attention routes through the
+        // hook-aware catalog method: while a session is
+        // hook-pinned (NeedsInput forced by a Notification
+        // hook event), a heuristic update with an mtime
+        // older than the pin is suppressed so the pinned
+        // state survives until the transcript actually
+        // advances. When mtime advances past the pin, the
+        // pin clears and the heuristic is applied
+        // normally.
+        let prev = self.catalog.apply_heuristic_attention(
+            &update.id,
+            update.attention,
+            update.mtime,
+            update.from_tool_use,
+            update.last_message.as_deref(),
+        );
+        if let Some(mtime) = update.mtime {
+            // Keeps the sidebar's "last activity" cell live
+            // across an active conversation; without this it
+            // would freeze at the discovery-time mtime.
+            self.catalog.touch_activity(&update.id, mtime);
+        }
+        // Union the tail-derived recent edits into the
+        // session's tracked list, independent of whether the
+        // attention update above was hook-suppressed — the
+        // edit list is its own signal. Empty (the common
+        // no-edits-in-tail case) is a cheap no-op.
+        self.catalog
+            .merge_edited_files(&update.id, update.edited_files);
+        if let Some(prev) = prev {
+            // `update.mtime` flows through to the notifier
+            // as `source_at` so the startup-replay gate
+            // catches both the watcher's prime event and
+            // the first tick of a remote poller — each
+            // produces transitions derived from bytes
+            // written before this run began, and a toast
+            // for them would be a replay of pre-launch
+            // state. Live notify-driven and live poll-tick
+            // events carry a post-startup mtime and fire
+            // normally. `None` (rare: stat failure)
+            // disables the gate for that event so a
+            // transient filesystem hiccup doesn't silently
+            // mute a real transition.
+            self.fire_attention_notification(
+                &update.id,
+                prev,
+                update.attention,
+                update.mtime,
+                // The agent's final assistant message (set
+                // only on a NeedsInput derivation) is the
+                // toast body — the transcript twin of the
+                // hook path's `message`. `None` (mid-turn, or
+                // a final entry with no text) falls back to
+                // project context in the formatter.
+                update.last_message.as_deref(),
+            );
+            // A turn-end (transition *into* NeedsInput) is
+            // both the moment programmatic file changes have
+            // landed and the moment the user reaches for the
+            // `{file}` tool — refresh the git-changed set in
+            // the background so the picker has it ready.
+            self.maybe_refresh_git_on_needs_input(&update.id, prev, update.attention);
+        }
     }
 
     /// React to a watcher-emitted "previously-unknown transcript appeared"
